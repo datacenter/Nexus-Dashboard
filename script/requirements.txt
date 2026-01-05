@@ -1,0 +1,62 @@
+# Requirements for Nexus Dashboard Pre-upgrade Validation Script
+# 
+# This file lists all Python dependencies required to run the ND-Preupgrade-Validation.py script
+# and its worker functions. Most dependencies are part of Python's standard library.
+#
+# IMPORTANT SYSTEM DEPENDENCIES (NOT INSTALLABLE VIA PIP):
+# These are command-line tools that must be available in the system PATH:
+#
+# - sshpass: Required for SSH password authentication
+#   Installation:
+#     Linux (Ubuntu/Debian): sudo apt-get install sshpass
+#     Linux (RHEL/CentOS):   sudo yum install sshpass
+#     macOS (Homebrew):      brew install hudochenkov/sshpass/sshpass
+#     Windows:               Use WSL or Git Bash with sshpass
+#
+# - ssh: SSH client for secure remote connections (usually pre-installed)
+# - scp: Secure copy for file transfers (usually comes with ssh)
+# - tar: Archive extraction tool (usually pre-installed on Unix/Linux)
+# - gzip/gunzip: Compression utilities (usually pre-installed)
+# - find: File search utility (usually pre-installed on Unix/Linux)
+# - grep: Text search utility (usually pre-installed on Unix/Linux)
+# - awk: Text processing tool (usually pre-installed on Unix/Linux)
+# - ps: Process status utility (usually pre-installed on Unix/Linux)
+# - kill/pkill: Process termination utilities (usually pre-installed)
+# - hostname: System hostname utility (usually pre-installed)
+# - df: Disk space utility (usually pre-installed on Unix/Linux)
+# - netstat: Network statistics utility (usually pre-installed)
+# - which: Command location utility (usually pre-installed on Unix/Linux)
+#
+# Most of these tools are standard on Linux/Unix systems. On Windows, consider
+# using WSL (Windows Subsystem for Linux) for full compatibility.
+#
+# Python Package Dependencies:
+# For Python 2.7 compatibility (worker script on older ND nodes):
+ipaddr>=2.2.0; python_version<"3.0"
+
+# For Python 3+ compatibility (worker script on newer ND nodes):
+ipaddress; python_version>="3.0"
+
+# Note: The following modules are part of Python's standard library and don't need to be installed:
+# - re (regular expressions)
+# - subprocess (process management) 
+# - threading (threading support)
+# - platform (platform identification)
+# - socket (network sockets)
+# - time (time-related functions)
+# - sys (system parameters)
+# - os (operating system interface)
+# - json (JSON encoder/decoder)
+# - math (mathematical functions)
+# - shlex (shell-like lexical analysis)
+# - getpass (password input without echo)
+# - glob (Unix shell-style pathname pattern expansion)
+# - signal (signal handling)
+# - tempfile (temporary file/directory creation)
+# - traceback (exception traceback printing)
+# - argparse (command-line argument parsing)
+# - logging (flexible logging system)
+# - datetime (date and time handling)
+# - concurrent.futures (high-level threading interface)
+# - select (I/O multiplexing)
+# - atexit (exit handlers)
