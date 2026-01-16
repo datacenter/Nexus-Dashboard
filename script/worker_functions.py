@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.10 (Dec 3, 2025)
+Version: 1.0.11 (Jan 16, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -72,7 +72,8 @@ results = {
         "backup_failure_check": {"status": "PASS", "details": []},  # Backup job failure check CSCwq57968/CSCwm96512
         "nameserver_duplicate_check": {"status": "PASS", "details": []},  # Duplicate nameserver configuration check
         "legacy_ndi_elasticsearch_check": {"status": "PASS", "details": []},  # Legacy NDI ElasticSearch check CSCwr43810
-        "ntp_auth_check": {"status": "PASS", "details": []}  # NTP Authentication check CSCwr97181
+        "ntp_auth_check": {"status": "PASS", "details": []},  # NTP Authentication check CSCwr97181
+        "vnd_app_large_check": {"status": "PASS", "details": []}  # vND SAN App-Large profile check CSCws77374
     }
 }
 
@@ -3852,6 +3853,219 @@ def check_atom0_vg(tech_file):
     
     return True
 
+@robust_check("vnd_app_large_check")
+def check_vnd_app_large(tech_file):
+    """
+    Check for vND SAN App-Large profile (CSCws77374)
+    
+    This check verifies if a Virtual ND is running with App-Large profile configuration.
+    vND SAN App is only supported for Regular App Node (16 vCPUs/64GB RAM/500GB Disk)
+    and Data Node (32 vCPUs/128GB RAM/3TB Disk).
+    
+    The check:
+    1. Verifies ND version is 3.2.x
+    2. Checks if model contains "virtual" (case insensitive)
+    3. Checks if /dev/sdb1 atom0 has PSize <1.50t in lvm-pvs
+    
+    Reference: CSCws77374
+    """
+    print_section("Checking vND SAN App-Large Profile on {0}".format(NODE_NAME))
+    update_status("running", "Checking vND SAN App-Large Profile", 99.5)
+    
+    node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
+    cache = get_file_cache()
+    
+    # Step 1: Check ND version - only applicable for 3.2.x
+    version_files = cache.find_files("acs-checks/acs_version")
+    if not version_files:
+        print("[WARNING] acs_version file not found")
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to determine ND version to proceed with check"
+        ]
+        return False
+    
+    version_file = version_files[0]
+    nd_version = None
+    try:
+        with open(version_file, 'r') as f:
+            version_line = f.read().strip()
+            # Extract version (e.g., "Nexus Dashboard 3.2.2f" -> "3.2.2f")
+            if "Nexus Dashboard" in version_line:
+                nd_version = version_line.split("Nexus Dashboard")[1].strip()
+            else:
+                nd_version = version_line
+            print("ND Version: {0}".format(nd_version))
+    except Exception as e:
+        print("[WARNING] Error reading version file: {0}".format(str(e)))
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to determine ND version to proceed with check"
+        ]
+        return False
+    
+    # Check if version is 3.2.x
+    if not nd_version or not nd_version.startswith("3.2"):
+        print("[PASS] Version is not 3.2.x (current: {0})".format(nd_version))
+        results["checks"]["vnd_app_large_check"]["status"] = "PASS"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Version is not 3.2.x"
+        ]
+        return True
+    
+    print("Version is 3.2.x - proceeding with check")
+    
+    # Step 2: Check if model contains "virtual" (case insensitive)
+    system_config_files = cache.find_files("acs-checks/acs_system_config")
+    if not system_config_files:
+        print("[WARNING] acs_system_config file not found")
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to determine device type to proceed with check"
+        ]
+        return False
+    
+    system_config_file = system_config_files[0]
+    print("Reading model from: {0}".format(os.path.basename(system_config_file)))
+    
+    model = None
+    try:
+        with open(system_config_file, 'r') as f:
+            for line in f:
+                if 'model:' in line:
+                    model = line.split(':', 1)[1].strip()
+                    print("Found model: {0}".format(model))
+                    break
+    except Exception as e:
+        print("[WARNING] Error reading acs_system_config: {0}".format(str(e)))
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to determine device type to proceed with check"
+        ]
+        return False
+    
+    if not model:
+        print("[WARNING] model field not found in acs_system_config")
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to determine device type to proceed with check"
+        ]
+        return False
+    
+    # Check if model is SE-VIRTUAL-DATA (case insensitive)
+    if model.upper() == "SE-VIRTUAL-DATA":
+        print("[PASS] ND is a virtual Data Node (model: {0})".format(model))
+        results["checks"]["vnd_app_large_check"]["status"] = "PASS"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "ND is a virtual Data Node"
+        ]
+        return True
+    
+    # Check if model is SE-VIRTUAL-APP (case insensitive)
+    if model.upper() != "SE-VIRTUAL-APP":
+        print("[PASS] ND is not SE-VIRTUAL-APP (model: {0})".format(model))
+        results["checks"]["vnd_app_large_check"]["status"] = "PASS"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "ND is not SE-VIRTUAL-APP"
+        ]
+        return True
+    
+    print("SE-VIRTUAL-APP detected - checking disk configuration")
+    
+    # Step 3: Check lvm-pvs for /dev/sdb1 atom0 with PSize <1.50t
+    lvm_pvs_files = cache.find_files("lvm-pvs")
+    if not lvm_pvs_files:
+        print("[WARNING] lvm-pvs file not found")
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to verify disk configuration"
+        ]
+        return False
+    
+    lvm_pvs_file = lvm_pvs_files[0]
+    print("Checking lvm-pvs file: {0}".format(os.path.basename(lvm_pvs_file)))
+    
+    try:
+        sdb1_atom0_found = False
+        psize_value = None
+        
+        with open(lvm_pvs_file, 'r') as f:
+            for line in f:
+                line_stripped = line.strip()
+                
+                # Skip header and empty lines
+                if not line_stripped or "PV" in line_stripped and "VG" in line_stripped:
+                    continue
+                
+                # Look for /dev/sdb1 with atom0 VG
+                if "/dev/sdb1" in line and "atom0" in line:
+                    sdb1_atom0_found = True
+                    parts = line_stripped.split()
+                    
+                    # Find PSize column (typically 5th column)
+                    # Format: PV  VG  Fmt  Attr  PSize  PFree
+                    if len(parts) >= 5:
+                        psize_str = parts[4]
+                        print("Found /dev/sdb1 atom0 with PSize: {0}".format(psize_str))
+                        
+                        # Parse PSize (e.g., "<1.50t", "499.87g")
+                        psize_lower = psize_str.lower().replace('<', '').replace('>', '')
+                        
+                        # Convert to terabytes for comparison
+                        if 't' in psize_lower:
+                            psize_value = float(psize_lower.replace('t', ''))
+                        elif 'g' in psize_lower:
+                            psize_value = float(psize_lower.replace('g', '')) / 1024.0
+                        
+                        print("Parsed PSize: {0:.2f}T".format(psize_value if psize_value else 0))
+                        break
+        
+        if not sdb1_atom0_found:
+            print("[PASS] /dev/sdb1 atom0 not found in lvm-pvs")
+            results["checks"]["vnd_app_large_check"]["status"] = "PASS"
+            results["checks"]["vnd_app_large_check"]["details"] = [
+                "/dev/sdb1 atom0 configuration not detected"
+            ]
+            return True
+        
+        # Check if PSize is in the App-Large range (around 1.4T to 1.6T)
+        # Regular App is ~0.5T, Data Node is ~3T, App-Large is ~1.5T (unsupported)
+        if psize_value and 1.40 <= psize_value <= 1.60:
+            print("[FAIL] vND SAN App-Large profile detected (PSize: {0:.2f}T in App-Large range)".format(psize_value))
+            results["checks"]["vnd_app_large_check"]["status"] = "FAIL"
+            results["checks"]["vnd_app_large_check"]["details"] = [
+                "vND SAN App-Large profile detected"
+            ]
+            results["checks"]["vnd_app_large_check"]["explanation"] = (
+                "vND SAN App is not supported with App-Large profile\n\n"
+                "  vND SAN App is only supported for the following types:\n"
+                "  - Regular App Node (16 vCPUs/64GB RAM/500GB Disk)\n"
+                "  - Data Node (32 vCPUs/128GB RAM/3TB Disk)"
+            )
+            results["checks"]["vnd_app_large_check"]["recommendation"] = (
+                "If you are upgrading to 4.1, restore the ND cluster from a backup onto a Regular App node (16 vCPUs/64GB RAM/500GB Disk)\n"
+                "  or Data Node (32 vCPUs/128GB RAM/3TB Disk) before proceeding with upgrade."
+            )
+            results["checks"]["vnd_app_large_check"]["reference"] = (
+                "https://bst.cloudapps.cisco.com/bugsearch/bug/CSCws77374"
+            )
+            return False
+        else:
+            print("[PASS] vND SAN App-Large profile not detected (PSize: {0:.2f}T not in App-Large range)".format(psize_value if psize_value else 0))
+            results["checks"]["vnd_app_large_check"]["status"] = "PASS"
+            results["checks"]["vnd_app_large_check"]["details"] = [
+                "vND SAN App-Large profile not detected"
+            ]
+            return True
+            
+    except Exception as e:
+        print("[WARNING] Error reading lvm-pvs file: {0}".format(str(e)))
+        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+        results["checks"]["vnd_app_large_check"]["details"] = [
+            "Unable to verify disk configuration"
+        ]
+        return False
+
 ###############################################################
 # Tech Support Functions
 ###############################################################
@@ -4668,6 +4882,13 @@ def main():
                 print("[ERROR] atom0 VG check failed: {0}".format(str(e)))
                 results["checks"]["atom0_vg_check"]["status"] = "WARNING"
                 results["checks"]["atom0_vg_check"]["details"] = ["Unable to verify if atom0 vg has >50G free space"]
+                
+            try:
+                check_vnd_app_large(dest_path)
+            except Exception as e:
+                print("[ERROR] vND App-Large check failed: {0}".format(str(e)))
+                results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
+                results["checks"]["vnd_app_large_check"]["details"] = ["Unable to verify vND App-Large profile"]
                 
         except Exception as e:
             print("[ERROR] One or more checks failed to complete: {0}".format(str(e)))

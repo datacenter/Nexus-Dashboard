@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.10 (Dec 3, 2025)
+Version: 1.0.11 (Jan 16, 2026)
 """
 
 import re
@@ -3311,7 +3311,8 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             "iso_check",
             "lvm_pvs_check",
             "atom0_nvme_check",
-            "atom0_vg_check"
+            "atom0_vg_check",
+            "vnd_app_large_check"
         ]
         
         # Organize by check type instead of by node
