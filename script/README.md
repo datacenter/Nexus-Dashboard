@@ -96,21 +96,54 @@ Place the main script `ND-Preupgrade-Validation.py` and the worker script `worke
 
 ### Example Run:
 ```
-[root@localhost preupgrade]# python3 ND-Preupgrade-Validation.py
+## Step 1: Clone the repo
+
+user@host:~$ git clone https://github.com/datacenter/Nexus-Dashboard.git
+Cloning into 'Nexus-Dashboard'...
+remote: Enumerating objects: 17, done.
+remote: Counting objects: 100% (17/17), done.
+remote: Compressing objects: 100% (11/11), done.
+remote: Total 17 (delta 4), reused 17 (delta 4), pack-reused 0 (from 0)
+Receiving objects: 100% (17/17), 90.19 KiB | 1.64 MiB/s, done.
+Resolving deltas: 100% (4/4), done.
+
+user@host:~$ ls -lh
+total 12K
+drwxr-xr-x 5 user user 4.0K Jan 16 08:50 Nexus-Dashboard
+
+user@host:~$ ls -lh Nexus-Dashboard/
+total 12K
+-rw-r--r-- 1 user user  365 Jan 16 08:50 README.md
+drwxr-xr-x 2 user user 4.0K Jan 16 08:50 plugin
+drwxr-xr-x 2 user user 4.0K Jan 16 08:50 script
+
+## Step 2: Navigate to the /script directory
+
+user@host:~$ cd Nexus-Dashboard/script/
+user@host:~/Nexus-Dashboard/script$ ls -lh
+total 456K
+-rw-r--r-- 1 user user 204K Jan 16 08:50 ND-Preupgrade-Validation.py
+-rw-r--r-- 1 user user  21K Jan 16 08:50 README.md
+-rw-r--r-- 1 user user 2.9K Jan 16 08:50 requirements.txt
+-rw-r--r-- 1 user user 224K Jan 16 08:50 worker_functions.py
+
+## Step 3: Run the ND-Preupgrade-Validation.py script
+
+user@host:~/Nexus-Dashboard/script$ python3 ND-Preupgrade-Validation.py
 Nexus Dashboard Pre-upgrade Validation Script
 Running validation checks on 2026-01-16 11:13:58
-Enter Nexus Dashboard IP address: 14.2.29.130
+Enter Nexus Dashboard IP address: 1.1.1.1
 Enter password for rescue-user:
 
-Connecting to Nexus Dashboard at 14.2.29.130...
-Successfully connected to Nexus Dashboard at 14.2.29.130
+Connecting to Nexus Dashboard at 1.1.1.1...
+Successfully connected to Nexus Dashboard at 1.1.1.1
 Nexus Dashboard version: 3.2.2f
 Discovering Nexus Dashboard nodes...
 Found 3 Nexus Dashboard nodes
 ---------------------------------------
-        ND1 (14.2.29.130)
-        ND2 (14.2.29.131)
-        ND3 (14.2.29.132)
+        ND1 (1.1.1.1)
+        ND2 (1.1.1.2)
+        ND3 (1.1.1.3)
 ---------------------------------------
 
 Checking disk space on all nodes...
@@ -369,29 +402,30 @@ Report generated on: 2026-01-16 11:18:06
   ND3        PASS     ND is not SE-VIRTUAL-APP
 
 
-Detailed results are available in /root/Downloads/preupgrade/final-results/
+Detailed results are available in /home/user/Nexus-Dashboard/script/final-results/
 
-Results Bundle: /root/Downloads/preupgrade/nd-preupgrade-validation-results_2026-01-16T11-18-06.tgz
+Results Bundle: /home/user/Nexus-Dashboard/script/nd-preupgrade-validation-results_2026-01-16T11-18-06.tgz
 
-[root@localhost preupgrade]# ls -lh
+user@host:~/Nexus-Dashboard/script$ ls -lh
 total 516K
-drwxr-xr-x. 2 root root  236 Jan 16 11:18 final-results
--rw-r--r--. 1 root root 204K Jan 16 11:12 ND-Preupgrade-Validation.py
--rw-r--r--. 1 root root  14K Jan 16 11:18 nd-preupgrade-validation-results_2026-01-16T11-18-06.tgz
--rw-r--r--. 1 root root  69K Jan 16 11:18 nd_validation_debug.log
--rw-r--r--. 1 root root 224K Jan 16 11:13 worker_functions.py
+drwxr-xr-x. 2 user user  236 Jan 16 11:18 final-results
+-rw-r--r--. 1 user user 204K Jan 16 11:12 ND-Preupgrade-Validation.py
+-rw-r--r--. 1 user user  21K Jan 16 11:12 README.md
+-rw-r--r--. 1 user user  14K Jan 16 11:18 nd-preupgrade-validation-results_2026-01-16T11-18-06.tgz
+-rw-r--r--. 1 user user  69K Jan 16 11:18 nd_validation_debug.log
+-rw-r--r--. 1 user user 224K Jan 16 11:13 worker_functions.py
 
-[root@localhost preupgrade]# ls -lh final-results/
+user@host:~/Nexus-Dashboard/script$ ls -lh final-results/
 total 144K
--rw-r--r--. 1 root root  14K Jan 16 11:17 ND1_output.log
--rw-r--r--. 1 root root 2.8K Jan 16 11:17 ND1_results.json
--rw-r--r--. 1 root root  14K Jan 16 11:18 ND2_output.log
--rw-r--r--. 1 root root 2.8K Jan 16 11:18 ND2_results.json
--rw-r--r--. 1 root root  14K Jan 16 11:18 ND3_output.log
--rw-r--r--. 1 root root 2.8K Jan 16 11:18 ND3_results.json
--rw-r--r--. 1 root root  68K Jan 16 11:18 nd_validation_debug.log
--rw-r--r--. 1 root root 7.2K Jan 16 11:18 validation_details.json
--rw-r--r--. 1 root root 7.7K Jan 16 11:18 validation_summary.txt
+-rw-r--r--. 1 user user  14K Jan 16 11:17 ND1_output.log
+-rw-r--r--. 1 user user 2.8K Jan 16 11:17 ND1_results.json
+-rw-r--r--. 1 user user  14K Jan 16 11:18 ND2_output.log
+-rw-r--r--. 1 user user 2.8K Jan 16 11:18 ND2_results.json
+-rw-r--r--. 1 user user  14K Jan 16 11:18 ND3_output.log
+-rw-r--r--. 1 user user 2.8K Jan 16 11:18 ND3_results.json
+-rw-r--r--. 1 user user  68K Jan 16 11:18 nd_validation_debug.log
+-rw-r--r--. 1 user user 7.2K Jan 16 11:18 validation_details.json
+-rw-r--r--. 1 user user 7.7K Jan 16 11:18 validation_summary.txt
 ```
 
 ## Support
