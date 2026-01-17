@@ -9,6 +9,9 @@ The script can be run from any Linux server with the required dependencies. If A
 - If you have feedback or are encountering an issue running the script, please send an email to nd-preupgrade-validation@cisco.com
 
 <video src="https://github.com/user-attachments/assets/0bcbc1f0-98c0-4e8f-8cfe-20265f52779e" controls></video>
+Note: The cloning instructions differ slightly from the video now that the repo has moved. 
+- The clone command required is `git clone https://github.com/datacenter/Nexus-Dashboard.git`
+- See the [Example Run](#example-run) section for addition detail.
 
 ## Table of Contents
 

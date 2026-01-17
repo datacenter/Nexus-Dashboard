@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.11 (Jan 16, 2026)
+Version: 1.0.12 (Jan 17, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -42,6 +42,12 @@ except ImportError:
 # Optimization imports
 import contextlib
 import fnmatch
+
+# YAML support (used by config parsing)
+try:
+    import yaml
+except ImportError:
+    yaml = None  # Will handle gracefully in ConfigParser
 
 # Base directory for all operations
 BASE_DIR = "/tmp/ndpreupgradecheck"
@@ -162,6 +168,249 @@ def get_file_cache():
     if _file_cache is None or _file_cache.base_dir != node_dir:
         _file_cache = FileCache(node_dir)
     return _file_cache
+
+###############################################################
+# Validation Context - Eliminates Redundant File Reading
+###############################################################
+
+class ValidationContext:
+    """
+    Shared context for all validation checks
+    Centralizes version, deployment mode, and node type reading
+    Eliminates 50+ redundant file read operations across checks
+    """
+    def __init__(self):
+        self.nd_version = None
+        self.nd_version_tuple = None
+        self.node_count = None
+        self.deployment_mode = None
+        self.node_type = None
+        self.cache = None
+        self._initialized = False
+    
+    def initialize(self):
+        """Initialize context once at start of validation"""
+        if self._initialized:
+            return
+        
+        self.cache = get_file_cache()
+        self._load_version()
+        self._load_deployment_mode()
+        self._load_node_type()
+        self._initialized = True
+    
+    def _load_version(self):
+        """Load and parse ND version once"""
+        version_files = self.cache.find_files("acs-checks/acs_version")
+        if not version_files:
+            return
+        
+        try:
+            with open(version_files[0], 'r') as f:
+                version_line = f.read().strip()
+                if "Nexus Dashboard" in version_line:
+                    self.nd_version = version_line.split("Nexus Dashboard")[1].strip()
+                else:
+                    self.nd_version = version_line
+                
+                # Parse version tuple for comparisons (e.g., "3.2.1f" -> (3, 2, 1))
+                parts = self.nd_version.replace('f', '').replace('e', '').split('.')
+                if len(parts) >= 2:
+                    try:
+                        self.nd_version_tuple = tuple(int(p) for p in parts[:3] if p.isdigit())
+                    except (ValueError, IndexError):
+                        # Fallback to major.minor only
+                        try:
+                            self.nd_version_tuple = (int(parts[0]), int(parts[1]))
+                        except:
+                            pass
+                print("[INFO] Loaded ND Version: {0}".format(self.nd_version))
+        except Exception as e:
+            print("[WARNING] Could not load version: {0}".format(str(e)))
+    
+    def _load_deployment_mode(self):
+        """Load deployment mode once from k8-releases.yaml"""
+        k8_releases_files = self.cache.find_files("k8-diag/kubectl/k8-releases.yaml")
+        if not k8_releases_files:
+            return
+        
+        try:
+            with open(k8_releases_files[0], 'r') as f:
+                for line in f:
+                    if "desiredDeploymentMode:" in line:
+                        self.deployment_mode = line.split(":")[1].strip()
+                        print("[INFO] Loaded deployment mode: {0}".format(self.deployment_mode))
+                        break
+        except Exception as e:
+            print("[WARNING] Could not load deployment mode: {0}".format(str(e)))
+    
+    def _load_node_type(self):
+        """Load node type once from acs_system_config"""
+        config_files = self.cache.find_files("acs-checks/acs_system_config")
+        if not config_files:
+            return
+        
+        try:
+            with open(config_files[0], 'r') as f:
+                content = f.read()
+                if "nodeType:" in content:
+                    for line in content.split('\n'):
+                        if line.strip().startswith("nodeType:"):
+                            self.node_type = line.split(":")[1].strip()
+                            print("[INFO] Loaded node type: {0}".format(self.node_type))
+                            break
+        except Exception as e:
+            print("[WARNING] Could not load node type: {0}".format(str(e)))
+    
+    def version_greater_or_equal(self, major, minor, patch=0):
+        """
+        Compare current version against required version
+        Returns True if current version >= required version
+        """
+        if not self.nd_version_tuple:
+            return False
+        
+        required = (major, minor, patch) if patch > 0 else (major, minor)
+        current = self.nd_version_tuple[:len(required)]
+        
+        return current >= required
+    
+    def is_version_applicable(self, min_major, min_minor, min_patch=0):
+        """Check if current version meets minimum requirement"""
+        return self.version_greater_or_equal(min_major, min_minor, min_patch)
+
+# Global context instance
+_validation_context = None
+
+def get_validation_context():
+    """Get or create global validation context"""
+    global _validation_context
+    if _validation_context is None:
+        _validation_context = ValidationContext()
+        _validation_context.initialize()
+    return _validation_context
+
+###############################################################
+# Result Management Helpers
+###############################################################
+
+class CheckResult:
+    """
+    Helper class for managing check results
+    Ensures consistency across all checks
+    """
+    
+    @staticmethod
+    def set_status(check_name, status, details=None):
+        """Set basic check status and details"""
+        if check_name not in results["checks"]:
+            results["checks"][check_name] = {}
+        
+        results["checks"][check_name]["status"] = status
+        if details:
+            if isinstance(details, list):
+                results["checks"][check_name]["details"] = details
+            else:
+                results["checks"][check_name]["details"] = [details]
+    
+    @staticmethod
+    def set_pass(check_name, message="Check passed"):
+        """Shorthand for PASS status"""
+        CheckResult.set_status(check_name, "PASS", [message])
+    
+    @staticmethod
+    def set_fail(check_name, details, explanation=None, recommendation=None, reference=None):
+        """Set FAIL status with all relevant fields"""
+        results["checks"][check_name]["status"] = "FAIL"
+        results["checks"][check_name]["details"] = details if isinstance(details, list) else [details]
+        
+        if explanation:
+            results["checks"][check_name]["explanation"] = explanation
+        if recommendation:
+            results["checks"][check_name]["recommendation"] = recommendation
+        if reference:
+            results["checks"][check_name]["reference"] = reference
+    
+    @staticmethod
+    def set_warning(check_name, details, explanation=None, recommendation=None, reference=None):
+        """Set WARNING status with all relevant fields"""
+        results["checks"][check_name]["status"] = "WARNING"
+        results["checks"][check_name]["details"] = details if isinstance(details, list) else [details]
+        
+        if explanation:
+            results["checks"][check_name]["explanation"] = explanation
+        if recommendation:
+            results["checks"][check_name]["recommendation"] = recommendation
+        if reference:
+            results["checks"][check_name]["reference"] = reference
+    
+    @staticmethod
+    def add_details(check_name, detail):
+        """Append detail to existing details list"""
+        if check_name in results["checks"]:
+            if "details" not in results["checks"][check_name]:
+                results["checks"][check_name]["details"] = []
+            if isinstance(detail, list):
+                results["checks"][check_name]["details"].extend(detail)
+            else:
+                results["checks"][check_name]["details"].append(detail)
+
+###############################################################
+# Configuration Parsing Helpers
+###############################################################
+
+class ConfigParser:
+    """Unified configuration file parser - reduces duplicate parsing code"""
+    
+    @staticmethod
+    def parse_yaml_field(filepath, field_path):
+        """
+        Parse YAML and extract field by path
+        field_path example: "nameServers" or "metadata.name"
+        Returns None if field not found
+        """
+        try:
+            with open(filepath, 'r') as f:
+                content = f.read()
+                data = yaml.safe_load(content)
+                
+                # Navigate field path
+                current = data
+                for part in field_path.split('.'):
+                    if isinstance(current, dict) and part in current:
+                        current = current[part]
+                    else:
+                        return None
+                return current
+        except Exception as e:
+            print("[WARNING] Error parsing YAML {0}: {1}".format(filepath, str(e)))
+            return None
+    
+    @staticmethod
+    def find_pattern_in_file(filepath, pattern, max_matches=None):
+        """Find all lines matching pattern in a file"""
+        matches = []
+        try:
+            with open(filepath, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    if pattern in line:
+                        matches.append((line_num, line.strip()))
+                        if max_matches and len(matches) >= max_matches:
+                            break
+            return matches
+        except Exception as e:
+            print("[WARNING] Error searching {0}: {1}".format(filepath, str(e)))
+            return []
+    
+    @staticmethod
+    def read_file_safe(filepath):
+        """Read file with consistent error handling"""
+        try:
+            with open(filepath, 'r') as f:
+                return f.read()
+        except Exception as e:
+            print("[WARNING] Error reading {0}: {1}".format(filepath, str(e)))
+            return None
 
 @contextlib.contextmanager
 def managed_process(cmd, **kwargs):
@@ -1582,102 +1831,44 @@ def check_nxos_discovery_service(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
     # Helper function to set WARNING status with consistent message
     def set_warning_status(reason):
         print("[WARNING] {0}".format(reason))
-        results["checks"]["nxos_discovery_service"]["status"] = "WARNING"
-        results["checks"]["nxos_discovery_service"]["details"] = [
-            "Unable to verify NXOS Discovery Service status"
-        ]
-        results["checks"]["nxos_discovery_service"]["recommendation"] = (
-            "1. Verify at least 10 External Service IPs configured in the Data Network.\n  "
-            "2. Contact Cisco TAC for further verification if required."
+        CheckResult.set_warning(
+            "nxos_discovery_service",
+            "Unable to verify NXOS Discovery Service status",
+            recommendation="1. Verify at least 10 External Service IPs configured in the Data Network.\n  "
+                          "2. Contact Cisco TAC for further verification if required.",
+            reference="https://bst.cisco.com/bugsearch/bug/CSCwm97680"
         )
-        results["checks"]["nxos_discovery_service"]["reference"] = "https://bst.cisco.com/bugsearch/bug/CSCwm97680"
         return False
     
     # Step 1: Check ND version - this check only applies to ND 3.1.1 and later
-    version_files = cache.find_files("acs-checks/acs_version")
-    if not version_files:
+    if not ctx.nd_version:
         return set_warning_status("acs_version file not found")
     
-    version_file = version_files[0]
-    nd_version = None
-    try:
-        with open(version_file, 'r') as f:
-            version_line = f.read().strip()
-            # Extract version (e.g., "Nexus Dashboard 3.1.1g" -> "3.1.1g")
-            if "Nexus Dashboard" in version_line:
-                nd_version = version_line.split("Nexus Dashboard")[1].strip()
-            else:
-                nd_version = version_line
-            print("ND Version: {0}".format(nd_version))
-    except Exception as e:
-        return set_warning_status("Error reading version file: {0}".format(str(e)))
+    # Version check using shared context
+    if not ctx.is_version_applicable(3, 1, 1):
+        print("[PASS] ND version {0} < 3.1.1 - NXOS Discovery Service check not applicable".format(ctx.nd_version))
+        CheckResult.set_pass("nxos_discovery_service", "Version below 3.1.1, check not applicable")
+        return True
     
-    # Parse version to check if < 3.1.1
-    if nd_version:
-        try:
-            version_parts = nd_version.split('.')
-            if len(version_parts) >= 3:
-                major = int(version_parts[0])
-                minor = int(version_parts[1])
-                # Extract patch number (e.g., "1g" -> 1)
-                patch_str = version_parts[2]
-                patch = int(''.join(filter(str.isdigit, patch_str))) if patch_str else 0
-                
-                # Check if version < 3.1.1
-                if major < 3 or (major == 3 and minor < 1) or (major == 3 and minor == 1 and patch < 1):
-                    print("[PASS] ND version {0} < 3.1.1 - NXOS Discovery Service check not applicable".format(nd_version))
-                    results["checks"]["nxos_discovery_service"]["status"] = "PASS"
-                    results["checks"]["nxos_discovery_service"]["details"] = [
-                        "Version below 3.1.1, check not applicable"
-                    ]
-                    return True
-                else:
-                    print("ND version {0} >= 3.1.1 - proceeding with NXOS Discovery Service check".format(nd_version))
-        except (ValueError, IndexError) as e:
-            print("[WARNING] Could not parse version for version check: {0}".format(str(e)))
-            # If we can't parse the version, continue with the check to be safe
+    print("ND version {0} >= 3.1.1 - proceeding with NXOS Discovery Service check".format(ctx.nd_version))
     
-    # Step 2: Check if this is an ndfc-fabric-ndi deployment by looking at k8-releases.yaml
-    k8_releases_files = cache.find_files("k8-diag/kubectl/k8-releases.yaml")
+    # Step 2: Check if this is an ndfc-fabric-ndi deployment (use cached value)
+    deployment_mode = ctx.deployment_mode
     
-    if not k8_releases_files:
-        return set_warning_status("k8-releases.yaml file not found in tech support")
-    
-    k8_releases_file = k8_releases_files[0]
-    print("Found k8-releases.yaml: {0}".format(k8_releases_file))
-    
-    # Read the file and check for desiredDeploymentMode
-    deployment_mode = None
-    try:
-        with open(k8_releases_file, 'r') as f:
-            for line in f:
-                if 'desiredDeploymentMode' in line:
-                    # Extract the value after the colon
-                    parts = line.split(':', 1)
-                    if len(parts) == 2:
-                        deployment_mode = parts[1].strip()
-                        print("Found desiredDeploymentMode: {0}".format(deployment_mode))
-                        break
-    except Exception as e:
-        return set_warning_status("Error reading k8-releases.yaml: {0}".format(str(e)))
-    
-    # Check if we found deployment mode
     if not deployment_mode:
         return set_warning_status("desiredDeploymentMode not found in k8-releases.yaml")
     
     # If not ndfc-fabric-ndi deployment, check passes
     if deployment_mode.lower() != "ndfc-fabric-ndi":
         print("[PASS] Deployment mode is '{0}' (not ndfc-fabric-ndi), check not applicable".format(deployment_mode))
-        results["checks"]["nxos_discovery_service"]["status"] = "PASS"
-        results["checks"]["nxos_discovery_service"]["details"] = [
-            "Deployment Mode is not ndfc-fabric-ndi"
-        ]
+        CheckResult.set_pass("nxos_discovery_service", "Deployment Mode is not ndfc-fabric-ndi")
         return True
     
     # Step 2: This is an ndfc-fabric-ndi deployment, check the k8-app file
@@ -1723,13 +1914,13 @@ def check_nxos_discovery_service(tech_file):
                         # Check if it's in Disable/Processing state (case insensitive)
                         if admin_state.lower() == 'disable' and operstate.lower() == 'processing':
                             print("[FAIL] cisco-ndfc is in Disable/Processing state")
-                            results["checks"]["nxos_discovery_service"]["status"] = "FAIL"
-                            results["checks"]["nxos_discovery_service"]["details"] = [
-                                "NXOS Discovery Service in Disable/Processing state"
-                            ]
-                            results["checks"]["nxos_discovery_service"]["explanation"] = "During upgrade to 3.1.1 and later, NXOS Discovery Service can enter problematic \n  state under certain conditions and result in subsequent upgrade failures."
-                            results["checks"]["nxos_discovery_service"]["recommendation"] = "1. Verify at least 10 External Service IPs configured in the Data Network.\n  2. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  3. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation."
-                            results["checks"]["nxos_discovery_service"]["reference"] = "https://bst.cisco.com/bugsearch/bug/CSCwm97680"
+                            CheckResult.set_fail(
+                                "nxos_discovery_service",
+                                "NXOS Discovery Service in Disable/Processing state",
+                                explanation="During upgrade to 3.1.1 and later, NXOS Discovery Service can enter problematic \n  state under certain conditions and result in subsequent upgrade failures.",
+                                recommendation="1. Verify at least 10 External Service IPs configured in the Data Network.\n  2. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  3. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation.",
+                                reference="https://bst.cisco.com/bugsearch/bug/CSCwm97680"
+                            )
                             return False
                     else:
                         print("[WARNING] Unexpected format in k8-app line for cisco-ndfc")
@@ -1743,11 +1934,7 @@ def check_nxos_discovery_service(tech_file):
     
     # If we got here, cisco-ndfc was found and is in a good state (Enable/Enabled)
     print("[PASS] cisco-ndfc is in a healthy state (Admin: {0}, OperState: {1})".format(admin_state, operstate))
-    results["checks"]["nxos_discovery_service"]["status"] = "PASS"
-    results["checks"]["nxos_discovery_service"]["details"] = [
-        "cisco-ndfc k8 App in Enabled state"
-    ]
-    
+    CheckResult.set_pass("nxos_discovery_service", "cisco-ndfc k8 App in Enabled state")
     return True
 
 def check_backup_failure(tech_file):
@@ -1769,75 +1956,32 @@ def check_backup_failure(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context
+    ctx = get_validation_context()
+    cache = ctx.cache
     
-    # Get ND version first to check applicability
-    version_files = cache.find_files("acs-checks/acs_version")
-    nd_version = None
-    if version_files:
-        try:
-            with open(version_files[0], 'r') as f:
-                version_line = f.read().strip()
-                if "Nexus Dashboard" in version_line:
-                    nd_version = version_line.split("Nexus Dashboard")[1].strip()
-                else:
-                    nd_version = version_line
-                print("ND Version: {0}".format(nd_version))
-        except Exception as e:
-            print("[WARNING] Could not read version file: {0}".format(str(e)))
+    # Check ND version applicability (only >= 3.2)
+    if not ctx.is_version_applicable(3, 2):
+        print("[PASS] ND version {0} < 3.2 - Backup Failure check not applicable".format(ctx.nd_version or "unknown"))
+        CheckResult.set_pass("backup_failure_check", "Version below 3.2, check not applicable")
+        return True
     
-    # Parse version to check if < 3.2
-    if nd_version:
-        try:
-            version_parts = nd_version.split('.')
-            if len(version_parts) >= 2:
-                major = int(version_parts[0])
-                minor = int(version_parts[1])
-                
-                # Check if version < 3.2
-                if major < 3 or (major == 3 and minor < 2):
-                    print("[PASS] ND version {0} < 3.2 - Backup Failure check not applicable".format(nd_version))
-                    results["checks"]["backup_failure_check"]["status"] = "PASS"
-                    results["checks"]["backup_failure_check"]["details"] = [
-                        "Version below 3.2, check not applicable"
-                    ]
-                    return True
-                else:
-                    print("ND version {0} >= 3.2 - proceeding with Backup Failure check".format(nd_version))
-        except (ValueError, IndexError) as e:
-            print("[WARNING] Could not parse version for version check: {0}".format(str(e)))
-            # If we can't parse the version, continue with the check to be safe
+    print("ND version {0} >= 3.2 - proceeding with Backup Failure check".format(ctx.nd_version))
     
     # Find k8-lifecycle.yaml file
     lifecycle_files = cache.find_files("k8-diag/kubectl/k8-lifecycle.yaml")
     
     if not lifecycle_files:
         print("[WARNING] k8-lifecycle.yaml file not found in tech support")
-        results["checks"]["backup_failure_check"]["status"] = "WARNING"
-        results["checks"]["backup_failure_check"]["details"] = [
-            "Unable to verify backup job status"
-        ]
-        results["checks"]["backup_failure_check"]["recommendation"] = "Contact Cisco TAC for further verification."
+        CheckResult.set_warning(
+            "backup_failure_check",
+            "Unable to verify backup job status",
+            recommendation="Contact Cisco TAC for further verification."
+        )
         return False
     
     lifecycle_file = lifecycle_files[0]
     print("Found k8-lifecycle.yaml: {0}".format(lifecycle_file))
-    
-    # Get ND version for MSO-specific logic
-    version_files = cache.find_files("acs-checks/acs_version")
-    nd_version = None
-    if version_files:
-        try:
-            with open(version_files[0], 'r') as f:
-                version_line = f.read().strip()
-                if "Nexus Dashboard" in version_line:
-                    nd_version = version_line.split("Nexus Dashboard")[1].strip()
-                else:
-                    nd_version = version_line
-                print("ND Version: {0}".format(nd_version))
-        except Exception as e:
-            print("[WARNING] Could not read version file: {0}".format(str(e)))
     
     # Parse the YAML file to extract backup jobs per namespace
     # Structure: items[] -> namespace -> workflows[] -> name: Backup -> status.state.status
@@ -1915,20 +2059,17 @@ def check_backup_failure(tech_file):
     
     except Exception as e:
         print("[WARNING] Error parsing k8-lifecycle.yaml: {0}".format(str(e)))
-        results["checks"]["backup_failure_check"]["status"] = "WARNING"
-        results["checks"]["backup_failure_check"]["details"] = [
-            "Unable to verify backup job status: {0}".format(str(e))
-        ]
-        results["checks"]["backup_failure_check"]["recommendation"] = "Contact Cisco TAC for further verification."
+        CheckResult.set_warning(
+            "backup_failure_check",
+            "Unable to verify backup job status: {0}".format(str(e)),
+            recommendation="Contact Cisco TAC for further verification."
+        )
         return False
     
     # Check if we found any backup jobs
     if not backup_jobs:
         print("[PASS] No backup jobs found in k8-lifecycle.yaml")
-        results["checks"]["backup_failure_check"]["status"] = "PASS"
-        results["checks"]["backup_failure_check"]["details"] = [
-            "No backup jobs found"
-        ]
+        CheckResult.set_pass("backup_failure_check", "No backup jobs found")
         return True
     
     # Evaluate each namespace's most recent backup job
@@ -1956,7 +2097,6 @@ def check_backup_failure(tech_file):
     
     # Generate results based on findings
     if failed_namespaces or inprogress_namespaces:
-        results["checks"]["backup_failure_check"]["status"] = "FAIL"
         details = []
         
         if failed_namespaces:
@@ -1965,34 +2105,27 @@ def check_backup_failure(tech_file):
         if inprogress_namespaces:
             # Check if any InProgress is MSO and if version < 3.2.2f
             mso_inprogress = 'cisco-mso' in inprogress_namespaces
-            if mso_inprogress and nd_version:
+            if mso_inprogress and ctx.nd_version:
                 details.append("MSO backup job stuck in InProgress state (CSCwm96512)")
             
             details.append("Backup jobs stuck in InProgress: {0}".format(", ".join(inprogress_namespaces)))
         
-        results["checks"]["backup_failure_check"]["details"] = details
-        results["checks"]["backup_failure_check"]["explanation"] = (
-            "Backup jobs in Failed or InProgress state can cause upgrade failures. \n"
-            "  These jobs must be resolved before proceeding with upgrade."
-        )
-        results["checks"]["backup_failure_check"]["recommendation"] = (
-            "1. Generate a new backup job and confirm completion success.\n  "
-            "2. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
-            "3. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation."
-        )
-        results["checks"]["backup_failure_check"]["reference"] = (
-            "https://bst.cisco.com/bugsearch/bug/CSCwq57968"
+        CheckResult.set_fail(
+            "backup_failure_check",
+            details,
+            explanation="Backup jobs in Failed or InProgress state can cause upgrade failures. \n"
+                       "  These jobs must be resolved before proceeding with upgrade.",
+            recommendation="1. Generate a new backup job and confirm completion success.\n  "
+                           "2. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
+                           "3. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation.",
+            reference="https://bst.cisco.com/bugsearch/bug/CSCwq57968"
         )
         
         return False
     
     # All backup jobs are in Completed state
     print("[PASS] All backup jobs completed successfully")
-    results["checks"]["backup_failure_check"]["status"] = "PASS"
-    results["checks"]["backup_failure_check"]["details"] = [
-        "All backup jobs completed successfully"
-    ]
-    
+    CheckResult.set_pass("backup_failure_check", "All backup jobs completed successfully")
     return True
 
 def ping(host):
@@ -2040,8 +2173,9 @@ def check_nameserver_duplicates(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
     # Find acs_system_config file
     config_pattern = "acs-checks/acs_system_config"
@@ -2290,26 +2424,19 @@ def check_legacy_ndi_elasticsearch(tech_file):
     # Step 2a: If elasticsearch.nir is detected, this is a FAIL
     if elasticsearch_nir_found:
         print("[FAIL] Legacy NDI ElasticSearch volume detected")
-        results["checks"]["legacy_ndi_elasticsearch_check"]["status"] = "FAIL"
-        results["checks"]["legacy_ndi_elasticsearch_check"]["details"] = [
-            "Legacy NDI ElasticSearch volume detected"
-        ]
-        results["checks"]["legacy_ndi_elasticsearch_check"]["explanation"] = (
-            "If NDI was deployed before version 2.2.x, ElasticSearch volumes can fail to migrate to new OpenSearch format.\n"
-            "  This problematic volume will cause upgrade to 4.1 and later to fail."
+        CheckResult.set_fail(
+            "legacy_ndi_elasticsearch_check",
+            "Legacy NDI ElasticSearch volume detected",
+            explanation="If NDI was deployed before version 2.2.x, ElasticSearch volumes can fail to migrate to new OpenSearch format.\n"
+                       "  This problematic volume will cause upgrade to 4.1 and later to fail.",
+            recommendation="Contact Cisco TAC for help in remediation before proceeding with upgrade.",
+            reference="https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr43810"
         )
-        results["checks"]["legacy_ndi_elasticsearch_check"]["recommendation"] = (
-            "Contact Cisco TAC for help in remediation before proceeding with upgrade."
-        )
-        results["checks"]["legacy_ndi_elasticsearch_check"]["reference"] = "https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr43810"
         return False
     
     # Step 2b: No elasticsearch.nir found, this is a PASS
     print("[PASS] No Legacy NDI ElasticSearch volume detected")
-    results["checks"]["legacy_ndi_elasticsearch_check"]["status"] = "PASS"
-    results["checks"]["legacy_ndi_elasticsearch_check"]["details"] = [
-        "No Legacy NDI ElasticSearch volume detected"
-    ]
+    CheckResult.set_pass("legacy_ndi_elasticsearch_check", "No Legacy NDI ElasticSearch volume detected")
     return True
 
 def check_ntp_authentication(tech_file):
@@ -2333,59 +2460,20 @@ def check_ntp_authentication(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
-    # Step 1: Check ND version - this check only applies to ND 3.2 and later
-    version_files = cache.find_files("acs-checks/acs_version")
-    if not version_files:
-        print("[WARNING] acs_version file not found in tech support")
-        results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-        results["checks"]["ntp_auth_check"]["details"] = [
-            "Unable to determine ND version"
-        ]
-        return False
+    # Check ND version - this check only applies to ND 3.2 and later
+    if not ctx.nd_version:
+        return CheckResult.set_warning("ntp_auth_check", "Unable to determine ND version")
     
-    version_file = version_files[0]
-    nd_version = None
-    try:
-        with open(version_file, 'r') as f:
-            version_line = f.read().strip()
-            # Extract version (e.g., "Nexus Dashboard 3.2.1e" -> "3.2.1e")
-            if "Nexus Dashboard" in version_line:
-                nd_version = version_line.split("Nexus Dashboard")[1].strip()
-            else:
-                nd_version = version_line
-            print("ND Version: {0}".format(nd_version))
-    except Exception as e:
-        print("[WARNING] Error reading version file: {0}".format(str(e)))
-        results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-        results["checks"]["ntp_auth_check"]["details"] = [
-            "Unable to determine ND version"
-        ]
-        return False
+    # Version check using shared context
+    if not ctx.is_version_applicable(3, 2):
+        print("[PASS] ND version {0} < 3.2 - NTP Authentication check not applicable".format(ctx.nd_version))
+        return CheckResult.set_pass("ntp_auth_check", "Version below 3.2, check not applicable")
     
-    # Parse version to check if < 3.2
-    if nd_version:
-        try:
-            version_parts = nd_version.split('.')
-            if len(version_parts) >= 2:
-                major = int(version_parts[0])
-                minor = int(version_parts[1])
-                
-                # Check if version < 3.2
-                if major < 3 or (major == 3 and minor < 2):
-                    print("[PASS] ND version {0} < 3.2 - NTP Authentication check not applicable".format(nd_version))
-                    results["checks"]["ntp_auth_check"]["status"] = "PASS"
-                    results["checks"]["ntp_auth_check"]["details"] = [
-                        "Version below 3.2, check not applicable"
-                    ]
-                    return True
-                else:
-                    print("ND version {0} >= 3.2 - proceeding with NTP Authentication check".format(nd_version))
-        except (ValueError, IndexError) as e:
-            print("[WARNING] Could not parse version for version check: {0}".format(str(e)))
-            # If we can't parse the version, continue with the check to be safe
+    print("ND version {0} >= 3.2 - proceeding with NTP Authentication check".format(ctx.nd_version))
     
     # Step 2: Find ntpq-peers file
     ntpq_pattern = "network-diag/ntpq-peers"
@@ -2404,11 +2492,7 @@ def check_ntp_authentication(tech_file):
     
     if not ntpq_files:
         print("[WARNING] ntpq-peers file not found in tech support")
-        results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-        results["checks"]["ntp_auth_check"]["details"] = [
-            "ntpq-peers file not found in the tech support"
-        ]
-        return False
+        return CheckResult.set_warning("ntp_auth_check", "ntpq-peers file not found in the tech support")
     
     # Use the first found ntpq-peers file
     ntpq_file = ntpq_files[0]
@@ -2439,11 +2523,7 @@ def check_ntp_authentication(tech_file):
         
         if header_idx == -1:
             print("[WARNING] Could not find header line with 'auth' column in ntpq-peers")
-            results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-            results["checks"]["ntp_auth_check"]["details"] = [
-                "Could not parse ntpq-peers file - header line not found"
-            ]
-            return False
+            return CheckResult.set_warning("ntp_auth_check", "Could not parse ntpq-peers file - header line not found")
         
         # Find the separator line (should be all '=' characters)
         separator_idx = -1
@@ -2454,11 +2534,7 @@ def check_ntp_authentication(tech_file):
         
         if separator_idx == -1:
             print("[WARNING] Could not find separator line in ntpq-peers")
-            results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-            results["checks"]["ntp_auth_check"]["details"] = [
-                "Could not parse ntpq-peers file - separator line not found"
-            ]
-            return False
+            return CheckResult.set_warning("ntp_auth_check", "Could not parse ntpq-peers file - separator line not found")
         
         # Parse the header to find auth column position
         header = lines[header_idx]
@@ -2468,11 +2544,7 @@ def check_ntp_authentication(tech_file):
             auth_col_idx = header_parts.index('auth')
         except ValueError:
             print("[WARNING] 'auth' column not found in header")
-            results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-            results["checks"]["ntp_auth_check"]["details"] = [
-                "Could not locate 'auth' column in ntpq-peers header"
-            ]
-            return False
+            return CheckResult.set_warning("ntp_auth_check", "Could not locate 'auth' column in ntpq-peers header")
         
         # Extract the top table (between separator and empty line or second table)
         top_table_lines = []
@@ -2489,11 +2561,7 @@ def check_ntp_authentication(tech_file):
         
         if not top_table_lines:
             print("[WARNING] No NTP peer data found in ntpq-peers")
-            results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-            results["checks"]["ntp_auth_check"]["details"] = [
-                "No NTP peer data found in ntpq-peers file"
-            ]
-            return False
+            return CheckResult.set_warning("ntp_auth_check", "No NTP peer data found in ntpq-peers file")
         
         # Check auth column for each data line and track indices with auth enabled
         auth_enabled = False
@@ -2563,40 +2631,24 @@ def check_ntp_authentication(tech_file):
                     if idx < len(top_table_lines):
                         details.append(top_table_lines[idx])
             
-            results["checks"]["ntp_auth_check"]["details"] = details
-            
-            results["checks"]["ntp_auth_check"]["explanation"] = (
-                "Due to a defect, if a configured NTP server has authentication enabled\n  "
-                "upgrade to Nexus Dashboard Version 4.1 or later will fail."
+            return CheckResult.set_fail(
+                "ntp_auth_check",
+                details,
+                explanation="Due to a defect, if a configured NTP server has authentication enabled\n  "
+                           "upgrade to Nexus Dashboard Version 4.1 or later will fail.",
+                recommendation="Remove authentication requirements from the identified NTP servers,\n  "
+                              "then rerun the ND Pre-upgrade Validation script to confirm this check passes.\n  "
+                              "Alternatively, you can run the command `acs ntp` and confirm the \"auth\" column reports \"none\".",
+                reference="https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr97181"
             )
-            
-            results["checks"]["ntp_auth_check"]["recommendation"] = (
-                "Remove authentication requirements from the identified NTP servers,\n  "
-                "then rerun the ND Pre-upgrade Validation script to confirm this check passes.\n  "
-                "Alternatively, you can run the command `acs ntp` and confirm the \"auth\" column reports \"none\"." 
-            )
-            
-            results["checks"]["ntp_auth_check"]["reference"] = (
-                "https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr97181"
-            )
-            
-            return False
         else:
             # PASS - NTP authentication not enabled
             print("[PASS] NTP Authentication not enabled")
-            results["checks"]["ntp_auth_check"]["status"] = "PASS"
-            results["checks"]["ntp_auth_check"]["details"] = [
-                "NTP Authentication not enabled"
-            ]
-            return True
+            return CheckResult.set_pass("ntp_auth_check", "NTP Authentication not enabled")
     
     except Exception as e:
         print("[ERROR] Error checking NTP authentication: {0}".format(str(e)))
-        results["checks"]["ntp_auth_check"]["status"] = "WARNING"
-        results["checks"]["ntp_auth_check"]["details"] = [
-            "Error checking NTP authentication: {0}".format(str(e))
-        ]
-        return False
+        return CheckResult.set_warning("ntp_auth_check", "Error checking NTP authentication: {0}".format(str(e)))
 
 def check_ping_reachability():
     """Check if nodes can ping each other"""
@@ -2609,9 +2661,7 @@ def check_ping_reachability():
     
     if not output:
         print("[WARNING] Could not retrieve node information")
-        results["checks"]["ping_check"]["status"] = "WARNING"
-        results["checks"]["ping_check"]["details"].append("Could not retrieve node information")
-        return
+        return CheckResult.set_warning("ping_check", "Could not retrieve node information")
     
     # Extract IPs from node output
     node_ips = []
@@ -2704,21 +2754,19 @@ def check_ping_reachability():
     
     # Set final status based on results
     if failed_pings:
-        results["checks"]["ping_check"]["status"] = "FAIL"
+        # Add explanation and recommendation to details
+        details = failed_pings.copy()
+        details.append("")
+        details.append("Explanation:")
+        details.append("Network reachability must be in place between Nexus Dashboard nodes to ensure a successful upgrade.")
+        details.append("")
+        details.append("Recommendation:")
+        details.append("Debug connectivity issues between any affected nodes and contact Cisco TAC for assistance if required.")
         
-        # Add explanation and recommendation for ping failures
-        explanation = "  Explanation:\n  Network reachability must be in place between Nexus Dashboard nodes to ensure a successful upgrade."
-        recommendation = "  Recommendation:\n  Debug connectivity issues between any affected nodes and contact Cisco TAC for\n  assistance if required."
-        
-        # First add the specific ping failures
-        results["checks"]["ping_check"]["details"] = failed_pings.copy()
-        # Then add explanation and recommendation
-        results["checks"]["ping_check"]["details"].append("\n{0}".format(explanation))
-        results["checks"]["ping_check"]["details"].append("\n{0}".format(recommendation))
+        CheckResult.set_fail("ping_check", details)
     else:
         print("[PASS] All nodes are reachable")
-        # Add the specific PASS details
-        results["checks"]["ping_check"]["details"] = ["Node can ping all mgmt and data ips in the cluster"]
+        CheckResult.set_pass("ping_check", "Node can ping all mgmt and data ips in the cluster")
 
 ###############################################################
 # Signature Checks
@@ -3160,45 +3208,19 @@ def check_persistent_ip_config(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
-    # Get ND version first to check applicability
-    version_files = cache.find_files("acs-checks/acs_version")
-    nd_version = None
-    if version_files:
-        try:
-            with open(version_files[0], 'r') as f:
-                version_line = f.read().strip()
-                if "Nexus Dashboard" in version_line:
-                    nd_version = version_line.split("Nexus Dashboard")[1].strip()
-                else:
-                    nd_version = version_line
-                print("ND Version: {0}".format(nd_version))
-        except Exception as e:
-            print("[WARNING] Could not read version file: {0}".format(str(e)))
-    
-    # Parse version to check if < 3.2
-    if nd_version:
-        try:
-            version_parts = nd_version.split('.')
-            if len(version_parts) >= 2:
-                major = int(version_parts[0])
-                minor = int(version_parts[1])
-                
-                # Check if version < 3.2
-                if major < 3 or (major == 3 and minor < 2):
-                    print("[PASS] ND version {0} < 3.2 - Persistent IP check not applicable".format(nd_version))
-                    results["checks"]["persistent_ip_check"]["status"] = "PASS"
-                    results["checks"]["persistent_ip_check"]["details"] = [
-                        "Version below 3.2, check not applicable"
-                    ]
-                    return True
-                else:
-                    print("ND version {0} >= 3.2 - proceeding with Persistent IP check".format(nd_version))
-        except (ValueError, IndexError) as e:
-            print("[WARNING] Could not parse version for version check: {0}".format(str(e)))
-            # If we can't parse the version, continue with the check to be safe
+    # Check ND version - this check only applies to ND 3.2 and later
+    if not ctx.nd_version:
+        print("[WARNING] Could not determine ND version")
+        # Continue with check to be safe
+    elif not ctx.is_version_applicable(3, 2):
+        print("[PASS] ND version {0} < 3.2 - Persistent IP check not applicable".format(ctx.nd_version))
+        return CheckResult.set_pass("persistent_ip_check", "Version below 3.2, check not applicable")
+    else:
+        print("ND version {0} >= 3.2 - proceeding with Persistent IP check".format(ctx.nd_version))
     
     # Determine cluster size and required persistent IP count
     node_count = get_cluster_node_count()
@@ -3251,23 +3273,16 @@ def check_persistent_ip_config(tech_file):
     
     if not config_files:
         print("[WARNING] External IP config file not found in tech support")
-        results["checks"]["persistent_ip_check"]["status"] = "WARNING"
-        results["checks"]["persistent_ip_check"]["details"] = [
-            "Could not locate externalipconfigs.yaml file in tech support",
-            "Checked paths: falcon-diag/externalipconfigs.yaml, k8-diag/kubectl/k8-externalipconfigs.yaml"
-        ]
-        results["checks"]["persistent_ip_check"]["explanation"] = (
-            "Unable to determine persistent IP configuration - external IP config file not found.\n  "
-            "This could indicate no persistent IPs are configured, or the tech support is incomplete."
+        return CheckResult.set_warning(
+            "persistent_ip_check",
+            ["Could not locate externalipconfigs.yaml file in tech support",
+             "Checked paths: falcon-diag/externalipconfigs.yaml, k8-diag/kubectl/k8-externalipconfigs.yaml"],
+            explanation="Unable to determine persistent IP configuration - external IP config file not found.\n  "
+                       "This could indicate no persistent IPs are configured, or the tech support is incomplete.",
+            recommendation="Verify that at least {0} persistent IP addresses are properly configured before proceeding with upgrade.".format(required_ip_count),
+            reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                     "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
         )
-        results["checks"]["persistent_ip_check"]["recommendation"] = (
-            "Verify that at least {0} persistent IP addresses are properly configured before proceeding with upgrade.".format(required_ip_count)
-        )
-        results["checks"]["persistent_ip_check"]["reference"] = (
-            "https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
-            "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
-        )
-        return False
     
     # Use the first found config file
     config_file = config_files[0]
@@ -3290,22 +3305,15 @@ def check_persistent_ip_config(tech_file):
         if "items" not in file_content:
             print("[WARNING] External IP config file does not contain expected 'items' section")
             print("File content preview: {0}".format(file_content[:200]))
-            results["checks"]["persistent_ip_check"]["status"] = "WARNING"
-            results["checks"]["persistent_ip_check"]["details"] = [
+            return CheckResult.set_warning(
+                "persistent_ip_check",
                 "Persistent IP config could not be validated.",
-            ]
-            results["checks"]["persistent_ip_check"]["explanation"] = (
-                "The Persistent IP configuration file exists but does not contain the expected YAML structure."
+                explanation="The Persistent IP configuration file exists but does not contain the expected YAML structure.",
+                recommendation="Verify that at least {0} persistent IP addresses are properly configured before proceeding with upgrade.\n  "
+                              "Check the Nexus Dashboard configuration for external IP settings.".format(required_ip_count),
+                reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                         "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
             )
-            results["checks"]["persistent_ip_check"]["recommendation"] = (
-                "Verify that at least {0} persistent IP addresses are properly configured before proceeding with upgrade.\n  "
-                "Check the Nexus Dashboard configuration for external IP settings.".format(required_ip_count)
-            )
-            results["checks"]["persistent_ip_check"]["reference"] = (
-                "https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
-                "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
-            )
-            return False
         
         # Stream processing to handle large config files efficiently
         with open(config_file, 'r') as f:
@@ -3382,29 +3390,24 @@ def check_persistent_ip_config(tech_file):
         # Analyze results - Only count data-external-services IPs for requirements
         if data_external_ips == 0:
             print("[FAIL] Found 0 persistent IP addresses in data-external-services")
-            results["checks"]["persistent_ip_check"]["status"] = "FAIL"
-            results["checks"]["persistent_ip_check"]["details"] = [
+            return CheckResult.set_fail(
+                "persistent_ip_check",
                 "Found 0 persistent IP addresses in data-external-services configuration (required: {0})".format(required_ip_count),
-            ]
-            results["checks"]["persistent_ip_check"]["explanation"] = (
-                "The Nexus Dashboard data-external-services configuration has ZERO Persistent IP addresses.\n  "
-                "This will likely result in upgrade failure as persistent IPs are required for data services.\n  "
-                "Required: {0} persistent IPs for a {1}-node cluster.".format(required_ip_count, node_count if node_count else "unknown")
-            )
-            results["checks"]["persistent_ip_check"]["recommendation"] = (
-                "1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
-                "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
-                "3. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
-                "4. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation.".format(required_ip_count)
-            )
-            results["checks"]["persistent_ip_check"]["reference"] = (
-                "https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
-                "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
+                explanation="The Nexus Dashboard data-external-services configuration has ZERO Persistent IP addresses.\n  "
+                           "This will likely result in upgrade failure as persistent IPs are required for data services.\n  "
+                           "Required: {0} persistent IPs for a {1}-node cluster.".format(required_ip_count, node_count if node_count else "unknown"),
+                recommendation="1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
+                              "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
+                              "3. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
+                              "4. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation.".format(required_ip_count),
+                reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                         "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
             )
         elif data_external_ips < required_ip_count:
             print("[FAIL] Found {0} persistent IP addresses in data-external-services (less than the required minimum of {1})".format(data_external_ips, required_ip_count))
-            results["checks"]["persistent_ip_check"]["status"] = "FAIL"
-            results["checks"]["persistent_ip_check"]["details"] = [
+            
+            # Build details with IP list
+            details = [
                 "Found {0} persistent IP addresses in data-external-services (required: {1} for {2}-node cluster)".format(
                     data_external_ips, required_ip_count, node_count if node_count else "unknown")
             ]
@@ -3412,62 +3415,43 @@ def check_persistent_ip_config(tech_file):
             # Add details about data-external-services configuration
             for config in external_ip_configs:
                 if config["name"] == "data-external-services" and config["externalIPs"]:
-                    results["checks"]["persistent_ip_check"]["details"].append(
+                    details.append(
                         "data-external-services IPs: {0}".format(", ".join(config["externalIPs"]))
                     )
             
-            results["checks"]["persistent_ip_check"]["explanation"] = (
-                "The Nexus Dashboard data-external-services is configured with {0} Persistent IP addresses,\n  "
-                "which is less than the required minimum of {1} for a {2}-node cluster.\n  "
-                "This will likely result in upgrade failure.".format(data_external_ips, required_ip_count, node_count if node_count else "unknown")
-            )
-            results["checks"]["persistent_ip_check"]["recommendation"] = (
-                "1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
-                "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
-                "3. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
-                "4. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation.".format(required_ip_count)
-            )
-            results["checks"]["persistent_ip_check"]["reference"] = (
-                "https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
-                "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
+            return CheckResult.set_fail(
+                "persistent_ip_check",
+                details,
+                explanation="The Nexus Dashboard data-external-services is configured with {0} Persistent IP addresses,\n  "
+                           "which is less than the required minimum of {1} for a {2}-node cluster.\n  "
+                           "This will likely result in upgrade failure.".format(data_external_ips, required_ip_count, node_count if node_count else "unknown"),
+                recommendation="1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
+                              "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
+                              "3. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
+                              "4. If the check is still a FAIL, contact Cisco TAC for assistance in verification/remediation.".format(required_ip_count),
+                reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                         "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
             )
         else:
             print("[PASS] Found {0} persistent IP addresses (meets minimum requirement of {1} for {2}-node cluster)".format(
                 data_external_ips, required_ip_count, node_count if node_count else "unknown"))
-            results["checks"]["persistent_ip_check"]["status"] = "PASS"
-            results["checks"]["persistent_ip_check"]["details"] = [
+            return CheckResult.set_pass(
+                "persistent_ip_check",
                 "Found {0} persistent IP addresses (required: {1} for {2}-node cluster)".format(
                     data_external_ips, required_ip_count, node_count if node_count else "unknown")
-            ]
-        
-        # Add common fields for WARNING cases only (FAIL cases have specific recommendations above)
-        if results["checks"]["persistent_ip_check"]["status"] in ["WARN", "WARNING"]:
-            results["checks"]["persistent_ip_check"]["recommendation"] = (
-                "1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
-                "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
-                "3. Contact Cisco TAC for assistance in verification/remediation if required.".format(required_ip_count)
-            )
-            results["checks"]["persistent_ip_check"]["reference"] = (
-                "https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
-                "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
             )
         
     except Exception as e:
         print("[ERROR] Failed to parse external IP config file: {0}".format(str(e)))
-        results["checks"]["persistent_ip_check"]["status"] = "FAIL"
-        results["checks"]["persistent_ip_check"]["details"] = [
-            "Failed to parse external IP config file: {0}".format(str(e)),
-            "File: {0}".format(os.path.basename(config_file))
-        ]
-        results["checks"]["persistent_ip_check"]["explanation"] = (
-            "Could not determine persistent IP configuration due to parsing error"
+        return CheckResult.set_fail(
+            "persistent_ip_check",
+            ["Failed to parse external IP config file: {0}".format(str(e)),
+             "File: {0}".format(os.path.basename(config_file))],
+            explanation="Could not determine persistent IP configuration due to parsing error",
+            recommendation="1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
+                          "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
+                          "3. Contact Cisco TAC for assistance in verification/remediation if required.".format(required_ip_count)
         )
-        results["checks"]["persistent_ip_check"]["recommendation"] = (
-            "1. Configure at least {0} persistent IP addresses for data-external-services before attempting upgrade.\n  "
-            "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
-            "3. Contact Cisco TAC for assistance in verification/remediation if required.".format(required_ip_count)
-        )
-        return False
     
     return True
 
@@ -3484,106 +3468,39 @@ def check_atom0_nvme(tech_file):
     update_status("running", "Checking NVME drive health", 97)
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
-    cache = get_file_cache()
     
-    # Step 1: Determine nodeType (Physical or Virtual)
-    system_config_files = cache.find_files("acs-checks/acs_system_config")
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
-    if not system_config_files:
-        print("[WARNING] acs_system_config file not found")
-        results["checks"]["atom0_nvme_check"]["status"] = "WARNING"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "Unable to determine if nodeType is Physical or Virtual to proceed with check."
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "nodeType is required to determine whether atom0_nvme should be present in PVS file or not."
+    # Check nodeType - if not available, show warning
+    if not ctx.node_type:
+        return CheckResult.set_warning(
+            "atom0_nvme_check",
+            "Unable to determine if nodeType is Physical or Virtual to proceed with check.",
+            explanation="nodeType is required to determine whether atom0_nvme should be present in PVS file or not.",
+            recommendation="If the ND is Virtual, you can safely ignore this check.\n"
+                          "If the ND is Physical, verify the NVME drive health of all ND nodes via CIMC, or contact Cisco TAC for assistance."
         )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "If the ND is Virtual, you can safely ignore this check.\n"
-            "If the ND is Physical, verify the NVME drive health of all ND nodes via CIMC, or contact Cisco TAC for assistance."
-        )
-        return False
     
-    system_config_file = system_config_files[0]
-    print("Reading nodeType from: {0}".format(os.path.basename(system_config_file)))
-    
-    node_type = None
-    try:
-        with open(system_config_file, 'r') as f:
-            for line in f:
-                if 'nodeType:' in line:
-                    node_type = line.split(':', 1)[1].strip()
-                    print("Found nodeType: {0}".format(node_type))
-                    break
-    except Exception as e:
-        print("[WARNING] Error reading acs_system_config: {0}".format(str(e)))
-        results["checks"]["atom0_nvme_check"]["status"] = "WARNING"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "Unable to determine if nodeType is Physical or Virtual to proceed with check."
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "nodeType is required to determine whether atom0_nvme should be present in PVS file or not."
-        )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "If the ND is Virtual, you can safely ignore this check.\n"
-            "If the ND is Physical, verify the NVME drive health of all ND nodes via CIMC, or contact Cisco TAC for assistance."
-        )
-        return False
-    
-    if not node_type:
-        print("[WARNING] nodeType field not found in acs_system_config")
-        results["checks"]["atom0_nvme_check"]["status"] = "WARNING"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "Unable to determine if nodeType is Physical or Virtual to proceed with check."
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "nodeType is required to determine whether atom0_nvme should be present in PVS file or not."
-        )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "If the ND is Virtual, you can safely ignore this check.\n"
-            "If the ND is Physical, verify the NVME drive health of all ND nodes via CIMC, or contact Cisco TAC for assistance."
-        )
-        return False
-    
-    # Step 2: If Virtual, skip the check (PASS)
-    if node_type == "Virtual":
+    # If Virtual, skip the check (PASS)
+    if ctx.node_type == "Virtual":
         print("[PASS] Virtual ND node - NVME check not applicable")
-        results["checks"]["atom0_nvme_check"]["status"] = "PASS"
-        results["checks"]["atom0_nvme_check"]["details"] = ["Virtual ND (check not applicable)"]
-        return True
+        return CheckResult.set_pass("atom0_nvme_check", "Virtual ND (check not applicable)")
     
-    # Step 3: Physical node - determine version and check appropriate PVS file
+    # Physical node - determine version and check appropriate PVS file
     print("Physical ND node detected - checking for NVME drive presence")
     
-    # Get ND version
-    version_files = cache.find_files("acs-checks/acs_version")
-    if not version_files:
+    # Use version from context
+    nd_version = ctx.nd_version
+    if not nd_version:
         print("[WARNING] acs_version file not found")
-        results["checks"]["atom0_nvme_check"]["status"] = "WARNING"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "PVS file not found in the tech support to confirm atom0_nvme presence"
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "NVME drive operability needs to be confirmed to ensure successful upgrade."
+        return CheckResult.set_warning(
+            "atom0_nvme_check",
+            "PVS file not found in the tech support to confirm atom0_nvme presence",
+            explanation="NVME drive operability needs to be confirmed to ensure successful upgrade.",
+            recommendation="Verify NVME drive health in CIMC or contact Cisco TAC for assistance if required."
         )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "Verify NVME drive health in CIMC or contact Cisco TAC for assistance if required."
-        )
-        return False
-    
-    version_file = version_files[0]
-    nd_version = None
-    try:
-        with open(version_file, 'r') as f:
-            version_line = f.read().strip()
-            # Extract version (e.g., "Nexus Dashboard 4.1.1g" -> "4.1.1g")
-            if "Nexus Dashboard" in version_line:
-                nd_version = version_line.split("Nexus Dashboard")[1].strip()
-            else:
-                nd_version = version_line
-            print("ND Version: {0}".format(nd_version))
-    except Exception as e:
-        print("[WARNING] Error reading version file: {0}".format(str(e)))
     
     # Step 4: Determine which PVS file to check based on version
     pvs_file_to_check = None
@@ -3619,17 +3536,12 @@ def check_atom0_nvme(tech_file):
         print("Using pvs file: {0}".format(os.path.basename(pvs_file_to_check)))
     else:
         print("[WARNING] Neither pvdisplay nor pvs file found in tech support")
-        results["checks"]["atom0_nvme_check"]["status"] = "WARNING"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "PVS file not found in the tech support to confirm atom0_nvme presence"
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "NVME drive operability needs to be confirmed to ensure successful upgrade."
+        return CheckResult.set_warning(
+            "atom0_nvme_check",
+            "PVS file not found in the tech support to confirm atom0_nvme presence",
+            explanation="NVME drive operability needs to be confirmed to ensure successful upgrade.",
+            recommendation="Verify NVME drive health in CIMC or contact Cisco TAC for assistance if required."
         )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "Verify NVME drive health in CIMC or contact Cisco TAC for assistance if required."
-        )
-        return False
     
     # Step 5: Search for atom0_nvme in the PVS file
     print("Searching for atom0_nvme in PVS file...")
@@ -3644,37 +3556,25 @@ def check_atom0_nvme(tech_file):
                     break
     except Exception as e:
         print("[WARNING] Error reading PVS file: {0}".format(str(e)))
-        results["checks"]["atom0_nvme_check"]["status"] = "WARNING"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "PVS file not found in the tech support to confirm atom0_nvme presence"
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "NVME drive operability needs to be confirmed to ensure successful upgrade."
+        return CheckResult.set_warning(
+            "atom0_nvme_check",
+            "PVS file not found in the tech support to confirm atom0_nvme presence",
+            explanation="NVME drive operability needs to be confirmed to ensure successful upgrade.",
+            recommendation="Verify NVME drive health in CIMC or contact Cisco TAC for assistance if required."
         )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "Verify NVME drive health in CIMC or contact Cisco TAC for assistance if required."
-        )
-        return False
     
-    # Step 6: Report results
+    # Report results
     if atom0_nvme_found:
         print("[PASS] NVME drive confirmed operational")
-        results["checks"]["atom0_nvme_check"]["status"] = "PASS"
-        results["checks"]["atom0_nvme_check"]["details"] = ["NVME drive seen by ND in PVS file"]
-        return True
+        return CheckResult.set_pass("atom0_nvme_check", "NVME drive seen by ND in PVS file")
     else:
         print("[FAIL] atom0_nvme NOT found in PVS file")
-        results["checks"]["atom0_nvme_check"]["status"] = "FAIL"
-        results["checks"]["atom0_nvme_check"]["details"] = [
-            "atom0_nvme doesn't exist in PVS file"
-        ]
-        results["checks"]["atom0_nvme_check"]["explanation"] = (
-            "NVME drive on the node may be inoperable which will result in upgrade failure."
+        return CheckResult.set_fail(
+            "atom0_nvme_check",
+            "atom0_nvme doesn't exist in PVS file",
+            explanation="NVME drive on the node may be inoperable which will result in upgrade failure.",
+            recommendation="Contact TAC for further investigation and potential disk or appliance replacement prior to upgrade."
         )
-        results["checks"]["atom0_nvme_check"]["recommendation"] = (
-            "Contact TAC for further investigation and potential disk or appliance replacement prior to upgrade."
-        )
-        return False
 
 @robust_check("atom0_vg_check")
 def check_atom0_vg(tech_file):
@@ -3690,47 +3590,14 @@ def check_atom0_vg(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
-    # Step 1: Check ND version - bypass check for 4.1.1g and later
-    version_files = cache.find_files("acs-checks/acs_version")
-    if version_files:
-        version_file = version_files[0]
-        nd_version = None
-        try:
-            with open(version_file, 'r') as f:
-                version_line = f.read().strip()
-                # Extract version (e.g., "Nexus Dashboard 4.1.1g" -> "4.1.1g")
-                if "Nexus Dashboard" in version_line:
-                    nd_version = version_line.split("Nexus Dashboard")[1].strip()
-                else:
-                    nd_version = version_line
-                print("ND Version: {0}".format(nd_version))
-                
-                # Parse version to check if >= 4.1.1
-                if nd_version:
-                    version_parts = nd_version.split('.')
-                    if len(version_parts) >= 3:
-                        try:
-                            major = int(version_parts[0])
-                            minor = int(version_parts[1])
-                            # Extract patch number (e.g., "1g" -> 1)
-                            patch_str = version_parts[2]
-                            patch = int(''.join(filter(str.isdigit, patch_str))) if patch_str else 0
-                            
-                            # Check if version >= 4.1.1
-                            if major > 4 or (major == 4 and minor > 1) or (major == 4 and minor == 1 and patch >= 1):
-                                print("[PASS] ND version {0} >= 4.1.1 - atom0 VG check bypassed".format(nd_version))
-                                results["checks"]["atom0_vg_check"]["status"] = "PASS"
-                                results["checks"]["atom0_vg_check"]["details"] = [
-                                    "atom0 vg check bypassed for ND nodes on 4.1.1 and later"
-                                ]
-                                return True
-                        except (ValueError, IndexError) as e:
-                            print("[WARNING] Could not parse version for bypass check: {0}".format(str(e)))
-        except Exception as e:
-            print("[WARNING] Error reading version file for bypass check: {0}".format(str(e)))
+    # Check ND version - bypass check for 4.1.1 and later
+    if ctx.nd_version and ctx.is_version_applicable(4, 1, 1):
+        print("[PASS] ND version {0} >= 4.1.1 - atom0 VG check bypassed".format(ctx.nd_version))
+        return CheckResult.set_pass("atom0_vg_check", "atom0 vg check bypassed for ND nodes on 4.1.1 and later")
     
     # Look for lvm-vgs files in storage-diag or similar directories
     vgs_patterns = [
@@ -3750,11 +3617,7 @@ def check_atom0_vg(tech_file):
     
     if not vgs_files:
         print("[WARNING] LVM VGS file not found in tech support")
-        results["checks"]["atom0_vg_check"]["status"] = "WARNING"
-        results["checks"]["atom0_vg_check"]["details"] = [
-            "Unable to verify if atom0 vg has >50G free space"
-        ]
-        return False
+        return CheckResult.set_warning("atom0_vg_check", "Unable to verify if atom0 vg has >50G free space")
     
     # Use the first found VGS file
     vgs_file = vgs_files[0]
@@ -3810,46 +3673,27 @@ def check_atom0_vg(tech_file):
         # Analyze results
         if not atom0_found:
             print("[WARNING] atom0 VG not found in VGS output")
-            results["checks"]["atom0_vg_check"]["status"] = "WARNING"
-            results["checks"]["atom0_vg_check"]["details"] = [
-                "Unable to verify if atom0 vg has >50G free space"
-            ]
+            return CheckResult.set_warning("atom0_vg_check", "Unable to verify if atom0 vg has >50G free space")
         elif atom0_free_space is None:
             print("[WARNING] Could not parse atom0 free space")
-            results["checks"]["atom0_vg_check"]["status"] = "WARNING"
-            results["checks"]["atom0_vg_check"]["details"] = [
-                "Unable to verify if atom0 vg has >50G free space"
-            ]
+            return CheckResult.set_warning("atom0_vg_check", "Unable to verify if atom0 vg has >50G free space")
         elif atom0_free_space < 50.0:
             print("[FAIL] atom0 VG has {0:.2f}G free space (less than 50G required)".format(atom0_free_space))
-            results["checks"]["atom0_vg_check"]["status"] = "FAIL"
-            results["checks"]["atom0_vg_check"]["details"] = [
-                "atom0 vg has less than 50G free space"
-            ]
-            results["checks"]["atom0_vg_check"]["explanation"] = (
-                "The atom0 virtual group requires 50G free space when performing an upgrade.\n  "
-                "Otherwise, upgrade may fail at 'Deploy Kubernetes Stack' stage."
-            )
-            results["checks"]["atom0_vg_check"]["recommendation"] = (
-                "Contact Cisco TAC to help resize the atom0 virtual group before upgrade."
-            )
-            results["checks"]["atom0_vg_check"]["reference"] = (
-                "https://bst.cisco.com/quickview/bug/CSCwr43515"
+            return CheckResult.set_fail(
+                "atom0_vg_check",
+                "atom0 vg has less than 50G free space",
+                explanation="The atom0 virtual group requires 50G free space when performing an upgrade.\n  "
+                           "Otherwise, upgrade may fail at 'Deploy Kubernetes Stack' stage.",
+                recommendation="Contact Cisco TAC to help resize the atom0 virtual group before upgrade.",
+                reference="https://bst.cisco.com/quickview/bug/CSCwr43515"
             )
         else:
             print("[PASS] atom0 VG has {0:.2f}G free space (meets 50G requirement)".format(atom0_free_space))
-            results["checks"]["atom0_vg_check"]["status"] = "PASS"
-            results["checks"]["atom0_vg_check"]["details"] = [
-                "atom0 vg has more than 50G free space"
-            ]
+            return CheckResult.set_pass("atom0_vg_check", "atom0 vg has more than 50G free space")
         
     except Exception as e:
         print("[ERROR] Failed to parse VGS file: {0}".format(str(e)))
-        results["checks"]["atom0_vg_check"]["status"] = "WARNING"
-        results["checks"]["atom0_vg_check"]["details"] = [
-            "Unable to verify if atom0 vg has >50G free space"
-        ]
-        return False
+        return CheckResult.set_warning("atom0_vg_check", "Unable to verify if atom0 vg has >50G free space")
     
     return True
 
@@ -3864,10 +3708,16 @@ def check_vnd_app_large(tech_file):
     
     The check:
     1. Verifies ND version is 3.2.x
-    2. Checks if model contains "virtual" (case insensitive)
-    3. Checks if /dev/sdb1 atom0 has PSize <1.50t in lvm-pvs
+    2. Checks if model is SE-VIRTUAL-APP
+    3. Checks if /dev/sdb1 atom0 has PSize ~1.5T in lvm-pvs
+    4. Checks deploymentMode for "ndfc" presence
     
-    Reference: CSCws77374
+    Results:
+    - FAIL: SE-VIRTUAL-APP + deploymentMode contains "ndfc" + disk size 1.5T
+    - WARNING: SE-VIRTUAL-APP + deploymentMode does NOT contain "ndfc" + disk size 1.5T
+    - PASS: All other scenarios
+    
+    Reference: CSCws77374 and ND Deployment Guide 4.1.x
     """
     print_section("Checking vND SAN App-Large Profile on {0}".format(NODE_NAME))
     update_status("running", "Checking vND SAN App-Large Profile", 99.5)
@@ -3875,112 +3725,69 @@ def check_vnd_app_large(tech_file):
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     cache = get_file_cache()
     
-    # Step 1: Check ND version - only applicable for 3.2.x
-    version_files = cache.find_files("acs-checks/acs_version")
-    if not version_files:
-        print("[WARNING] acs_version file not found")
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to determine ND version to proceed with check"
-        ]
-        return False
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
     
-    version_file = version_files[0]
-    nd_version = None
-    try:
-        with open(version_file, 'r') as f:
-            version_line = f.read().strip()
-            # Extract version (e.g., "Nexus Dashboard 3.2.2f" -> "3.2.2f")
-            if "Nexus Dashboard" in version_line:
-                nd_version = version_line.split("Nexus Dashboard")[1].strip()
-            else:
-                nd_version = version_line
-            print("ND Version: {0}".format(nd_version))
-    except Exception as e:
-        print("[WARNING] Error reading version file: {0}".format(str(e)))
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to determine ND version to proceed with check"
-        ]
-        return False
+    # Step 1: Check ND version - only applicable for 3.2.x
+    if not ctx.nd_version:
+        return CheckResult.set_warning("vnd_app_large_check", "Unable to determine ND version")
     
     # Check if version is 3.2.x
-    if not nd_version or not nd_version.startswith("3.2"):
-        print("[PASS] Version is not 3.2.x (current: {0})".format(nd_version))
-        results["checks"]["vnd_app_large_check"]["status"] = "PASS"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Version is not 3.2.x"
-        ]
-        return True
+    if not ctx.nd_version.startswith("3.2"):
+        print("[PASS] Version is not 3.2.x (current: {0})".format(ctx.nd_version))
+        return CheckResult.set_pass("vnd_app_large_check", "Version is not 3.2.x")
     
     print("Version is 3.2.x - proceeding with check")
     
-    # Step 2: Check if model contains "virtual" (case insensitive)
+    # Step 2: Check model and deploymentMode from acs_system_config
     system_config_files = cache.find_files("acs-checks/acs_system_config")
     if not system_config_files:
         print("[WARNING] acs_system_config file not found")
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to determine device type to proceed with check"
-        ]
-        return False
+        return CheckResult.set_warning("vnd_app_large_check", "Unable to determine device type")
     
     system_config_file = system_config_files[0]
-    print("Reading model from: {0}".format(os.path.basename(system_config_file)))
+    print("Reading model and deploymentMode from: {0}".format(os.path.basename(system_config_file)))
     
     model = None
+    deployment_mode = None
     try:
         with open(system_config_file, 'r') as f:
             for line in f:
                 if 'model:' in line:
                     model = line.split(':', 1)[1].strip()
                     print("Found model: {0}".format(model))
+                if 'deploymentMode:' in line:
+                    deployment_mode = line.split(':', 1)[1].strip()
+                    print("Found deploymentMode: {0}".format(deployment_mode))
+                # Continue reading to get both fields
+                if model and deployment_mode:
                     break
     except Exception as e:
         print("[WARNING] Error reading acs_system_config: {0}".format(str(e)))
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to determine device type to proceed with check"
-        ]
-        return False
+        return CheckResult.set_warning("vnd_app_large_check", "Unable to determine device type")
     
     if not model:
         print("[WARNING] model field not found in acs_system_config")
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to determine device type to proceed with check"
-        ]
-        return False
+        return CheckResult.set_warning("vnd_app_large_check", "Unable to determine device type")
     
     # Check if model is SE-VIRTUAL-DATA (case insensitive)
     if model.upper() == "SE-VIRTUAL-DATA":
         print("[PASS] ND is a virtual Data Node (model: {0})".format(model))
-        results["checks"]["vnd_app_large_check"]["status"] = "PASS"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "ND is a virtual Data Node"
-        ]
-        return True
+        return CheckResult.set_pass("vnd_app_large_check", "ND is a virtual Data Node")
     
     # Check if model is SE-VIRTUAL-APP (case insensitive)
     if model.upper() != "SE-VIRTUAL-APP":
         print("[PASS] ND is not SE-VIRTUAL-APP (model: {0})".format(model))
-        results["checks"]["vnd_app_large_check"]["status"] = "PASS"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "ND is not SE-VIRTUAL-APP"
-        ]
-        return True
+        return CheckResult.set_pass("vnd_app_large_check", "ND is not SE-VIRTUAL-APP")
     
     print("SE-VIRTUAL-APP detected - checking disk configuration")
     
-    # Step 3: Check lvm-pvs for /dev/sdb1 atom0 with PSize <1.50t
+    # Step 3: Check lvm-pvs for /dev/sdb1 atom0 with PSize ~1.5T
     lvm_pvs_files = cache.find_files("lvm-pvs")
     if not lvm_pvs_files:
         print("[WARNING] lvm-pvs file not found")
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to verify disk configuration"
-        ]
-        return False
+        return CheckResult.set_warning("vnd_app_large_check", "Unable to verify disk configuration")
     
     lvm_pvs_file = lvm_pvs_files[0]
     print("Checking lvm-pvs file: {0}".format(os.path.basename(lvm_pvs_file)))
@@ -4022,49 +3829,54 @@ def check_vnd_app_large(tech_file):
         
         if not sdb1_atom0_found:
             print("[PASS] /dev/sdb1 atom0 not found in lvm-pvs")
-            results["checks"]["vnd_app_large_check"]["status"] = "PASS"
-            results["checks"]["vnd_app_large_check"]["details"] = [
-                "/dev/sdb1 atom0 configuration not detected"
-            ]
-            return True
+            return CheckResult.set_pass("vnd_app_large_check", "/dev/sdb1 atom0 configuration not detected")
         
         # Check if PSize is in the App-Large range (around 1.4T to 1.6T)
         # Regular App is ~0.5T, Data Node is ~3T, App-Large is ~1.5T (unsupported)
         if psize_value and 1.40 <= psize_value <= 1.60:
-            print("[FAIL] vND SAN App-Large profile detected (PSize: {0:.2f}T in App-Large range)".format(psize_value))
-            results["checks"]["vnd_app_large_check"]["status"] = "FAIL"
-            results["checks"]["vnd_app_large_check"]["details"] = [
-                "vND SAN App-Large profile detected"
-            ]
-            results["checks"]["vnd_app_large_check"]["explanation"] = (
-                "vND SAN App is not supported with App-Large profile\n\n"
-                "  vND SAN App is only supported for the following types:\n"
-                "  - Regular App Node (16 vCPUs/64GB RAM/500GB Disk)\n"
-                "  - Data Node (32 vCPUs/128GB RAM/3TB Disk)"
-            )
-            results["checks"]["vnd_app_large_check"]["recommendation"] = (
-                "If you are upgrading to 4.1, restore the ND cluster from a backup onto a Regular App node (16 vCPUs/64GB RAM/500GB Disk)\n"
-                "  or Data Node (32 vCPUs/128GB RAM/3TB Disk) before proceeding with upgrade."
-            )
-            results["checks"]["vnd_app_large_check"]["reference"] = (
-                "https://bst.cloudapps.cisco.com/bugsearch/bug/CSCws77374"
-            )
-            return False
+            print("[INFO] vND SAN App-Large profile detected (PSize: {0:.2f}T in App-Large range)".format(psize_value))
+            
+            # Check if deploymentMode contains "ndfc"
+            is_ndfc_deployment = deployment_mode and "ndfc" in deployment_mode.lower()
+            
+            if is_ndfc_deployment:
+                # FAIL: SE-VIRTUAL-APP + ndfc deployment + 1.5T disk
+                print("[FAIL] SE-VIRTUAL-APP with NDFC deployment and App-Large profile detected")
+                return CheckResult.set_fail(
+                    "vnd_app_large_check",
+                    "vND SAN App-Large profile detected with NDFC deployment",
+                    explanation=(
+                        "vND SAN App is not supported with App-Large profile in NDFC deployments\n\n"
+                        "  vND SAN App is only supported for the following types:\n"
+                        "  - Regular App Node (16 vCPUs/64GB RAM/500GB Disk)\n"
+                        "  - Data Node (32 vCPUs/128GB RAM/3TB Disk)"
+                    ),
+                    recommendation=(
+                        "If you are upgrading to 4.1, restore the ND cluster from a backup onto a Regular App node (16 vCPUs/64GB RAM/500GB Disk)\n"
+                        "  or Data Node (32 vCPUs/128GB RAM/3TB Disk) before proceeding with upgrade."
+                    ),
+                    reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc"
+                )
+            else:
+                # WARNING: SE-VIRTUAL-APP + non-ndfc deployment + 1.5T disk
+                print("[WARNING] SE-VIRTUAL-APP with Large profile requires profile conversion after upgrade")
+                return CheckResult.set_warning(
+                    "vnd_app_large_check",
+                    "vND is Large Profile and requires profile conversion after upgrade",
+                    explanation="vND Large Profile requires profile conversion after upgrade to ND 4.1 or later",
+                    recommendation=(
+                        "After upgrading to ND 4.1, convert the Large Profile to Regular App Node profile\n"
+                        "  following the post-upgrade tasks documentation."
+                    ),
+                    reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc"
+                )
         else:
             print("[PASS] vND SAN App-Large profile not detected (PSize: {0:.2f}T not in App-Large range)".format(psize_value if psize_value else 0))
-            results["checks"]["vnd_app_large_check"]["status"] = "PASS"
-            results["checks"]["vnd_app_large_check"]["details"] = [
-                "vND SAN App-Large profile not detected"
-            ]
-            return True
+            return CheckResult.set_pass("vnd_app_large_check", "vND SAN App-Large profile not detected")
             
     except Exception as e:
         print("[WARNING] Error reading lvm-pvs file: {0}".format(str(e)))
-        results["checks"]["vnd_app_large_check"]["status"] = "WARNING"
-        results["checks"]["vnd_app_large_check"]["details"] = [
-            "Unable to verify disk configuration"
-        ]
-        return False
+        return CheckResult.set_warning("vnd_app_large_check", "Unable to verify disk configuration")
 
 ###############################################################
 # Tech Support Functions
