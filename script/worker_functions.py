@@ -2861,7 +2861,7 @@ def check_CA_CSCwm35992(tech_file):
     if not matches:
         # Check if we tried but couldn't find any SM log files to search
         if not files_found:
-            print("[ERROR] No SM log files found to search for certificate check")
+            print("[WARNING] No SM log files found to search for certificate check")
             
             # Additional diagnostic output
             find_cmd = "find {0} | grep -i sm".format(node_dir)
@@ -2869,7 +2869,7 @@ def check_CA_CSCwm35992(tech_file):
             if find_result:
                 print("Available paths with 'sm' in the name:\n{0}".format(find_result))
                 
-            results["checks"]["certificate_check"]["status"] = "ERROR"
+            results["checks"]["certificate_check"]["status"] = "WARNING"
             results["checks"]["certificate_check"]["details"] = ["Unable to find SM log files for certificate bug check"]
             return False
             
@@ -2961,8 +2961,8 @@ def check_ISOs_CSCwn94394(tech_file):
     if not matches:
         # Check if we tried but couldn't find any boot-hook files to search
         if not files_examined:
-            print("[ERROR] No boot-hook log files found to search for ISO check")
-            results["checks"]["iso_check"]["status"] = "ERROR"
+            print("[WARNING] No boot-hook log files found to search for ISO check")
+            results["checks"]["iso_check"]["status"] = "WARNING"
             results["checks"]["iso_check"]["details"] = ["Unable to find boot-hook logs for multiple ISO check"]
             return False
             

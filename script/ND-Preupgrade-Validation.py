@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.11 (Jan 16, 2026)
+Version: 1.0.12 (Jan 17, 2026)
 """
 
 import re
@@ -2821,6 +2821,7 @@ def process_all_nodes(node_manager, tech_choice, debug_mode=False, skipped_nodes
     }
     
     # First, handle tech supports for all nodes based on user choice
+    print("")  # Extra blank line before section
     print_section("Tech Support Selection/Generation")
     tech_support_paths = {}
     
@@ -2924,6 +2925,8 @@ def process_all_nodes(node_manager, tech_choice, debug_mode=False, skipped_nodes
     if not tech_support_paths:
         print(f"{FAIL} No tech supports were selected or generated. Exiting.")
         return {}
+    
+    print("")  # Extra blank line after tech support selection
     
     # PRE-FLIGHT CHECK: Verify /tmp space on all nodes before proceeding
     print_section("Pre-Flight /tmp Space Validation")
@@ -3114,6 +3117,8 @@ def process_all_nodes(node_manager, tech_choice, debug_mode=False, skipped_nodes
                     logger.exception(f"Error cleaning up node {node['name']}: {exc}")
                     print(f"{WARNING} Error cleaning up temporary files on {node['name']}: {str(exc)}")
     
+    print("")  # Extra blank line after cleanup section
+    
     # Calculate timing info
     total_time = time.time() - process_start_time
     timing_info = {
@@ -3170,7 +3175,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             total_time = timing_info.get("total_time", 0)
             total_minutes = int(total_time // 60)
             total_seconds = int(total_time % 60)
-            timing_message = f"Total validation time: {total_minutes} min {total_seconds} sec\n"
+            timing_message = f"Total validation time: {total_minutes} min {total_seconds} sec"
             print(timing_message)
             summary_file.write(timing_message + "\n")
             
@@ -3187,8 +3192,6 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                     summary_file.write(node_timing)
                 
                 summary_file.write("\n")  # Add blank line
-            
-            print("")  # Add blank line
         
         if version:
             version_info = f"Nexus Dashboard Version: {version}\n"
@@ -3413,29 +3416,25 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             summary_line += f"{' ' * right_padding}{status_indicator_txt}\n"
             summary_file.write(summary_line)
             
-            # Always show node details table, even for PASS status
-            node_indent = "  "  # 2 spaces indent for Node column
-            header_line = f"{node_indent}{'Node':<10} {'Status':<8} {'Details'}"
-            separator_line = f"{node_indent}{'-'*10} {'-'*8} {'-'*50}"
-            
-            # Only print the header if there are any nodes with results to show
-            if check_info["nodes"]:
-                # Always show table headers
+            # Only show details if check is not PASS
+            if check_status != "PASS" and check_info["nodes"]:
+                node_indent = "  "  # 2 spaces indent for Node column
+                header_line = f"{node_indent}{'Node':<10} {'Status':<8} {'Details'}"
+                separator_line = f"{node_indent}{'-'*10} {'-'*8} {'-'*50}"
+                
+                # Show table headers
                 print(header_line)
                 print(separator_line)
                 summary_file.write(header_line + "\n")
                 summary_file.write(separator_line + "\n")
                 
-                # Track if any failures or warnings were detected for this check
-                failures_detected = False
-                
-                # Print all nodes and their details
+                # Only print nodes with FAIL or WARNING status (filter out PASS nodes)
                 for node_name, node_result in sorted(check_info["nodes"].items()):
                     status = node_result["status"]
                     
-                    # Track if there are failures or warnings in this check
-                    if status == "FAIL" or status == "WARNING":
-                        failures_detected = True
+                    # Skip PASS nodes - only show affected nodes
+                    if status == "PASS":
+                        continue
                     
                     # Format status for console
                     if status == "FAIL":
@@ -3445,6 +3444,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                         status_str = WARNING
                         status_str_txt = WARNING_TXT
                     else:
+                        # This shouldn't happen since we filtered PASS above
                         status_str = PASS
                         status_str_txt = PASS_TXT
                     
@@ -3456,10 +3456,6 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                                detail.strip().startswith("\n  Reference:")):
                             filtered_details.append(detail)
                     
-                    # For PASS status with no details, show empty string (no details)
-                    if status == "PASS" and not filtered_details:
-                        filtered_details = [""]
-                    
                     # Display first detail line with properly aligned details
                     if filtered_details:
                         # Calculate padding needed for status column alignment
@@ -3469,7 +3465,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                             status_padding = 4  # "FAIL" is 4 chars, need 4 more spaces to reach 8
                         elif status == "WARNING":
                             status_padding = 1  # "WARNING" is 7 chars, need 1 more space to reach 8
-                        else:  # PASS
+                        else:  # PASS (shouldn't happen)
                             status_padding = 4  # "PASS" is 4 chars, need 4 more spaces to reach 8
                         
                         # First line includes node name and status with proper padding
@@ -3491,7 +3487,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                             status_padding = 4
                         elif status == "WARNING":
                             status_padding = 1
-                        else:  # PASS
+                        else:  # PASS (shouldn't happen)
                             status_padding = 4
                         
                         # For console
@@ -3500,23 +3496,50 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                         # For text file
                         summary_file.write(f"{node_indent}{node_name:<10} {status_str_txt:<8} No details available\n")
                 
-                # AFTER displaying all nodes, print the explanation, recommendation, and reference once
-                if failures_detected:
-                    # Add explanations and recommendations after all nodes are printed
-                    if check_info["explanation"]:
-                        print(f"\n{check_info['explanation']}")
-                        summary_file.write(f"\n{check_info['explanation']}\n")
-                        
-                    if check_info["recommendation"]:
-                        print(f"\n{check_info['recommendation']}")
-                        summary_file.write(f"\n{check_info['recommendation']}\n")
-                        
-                    if check_info["reference"]:
-                        print(f"\n{check_info['reference']}")
-                        summary_file.write(f"\n{check_info['reference']}\n")
+                # Print the explanation, recommendation, and reference (with reduced spacing)
+                if check_info["explanation"]:
+                    print(f"{check_info['explanation']}")
+                    summary_file.write(f"{check_info['explanation']}\n")
+                    
+                if check_info["recommendation"]:
+                    print(f"{check_info['recommendation']}")
+                    summary_file.write(f"{check_info['recommendation']}\n")
+                    
+                if check_info["reference"]:
+                    print(f"{check_info['reference']}")
+                    summary_file.write(f"{check_info['reference']}\n")
                 
                 print("")  # Add blank line after details
                 summary_file.write("\n")  # Add blank line to summary
+        
+        # Generate summary section
+        print("")  # First blank line after last check
+        print("")  # Second blank line after last check
+        print("="*80)
+        print("REPORT SUMMARY")
+        print("="*80)
+        print("")
+        
+        summary_file.write("\n")  # Extra blank line in summary file
+        summary_file.write("="*80 + "\n")
+        summary_file.write("REPORT SUMMARY\n")
+        summary_file.write("="*80 + "\n")
+        summary_file.write("\n")
+        
+        # Count statuses
+        pass_count = sum(1 for check_info in all_checks.values() if check_info["status"] == "PASS")
+        warning_count = sum(1 for check_info in all_checks.values() if check_info["status"] == "WARNING")
+        fail_count = sum(1 for check_info in all_checks.values() if check_info["status"] == "FAIL")
+        
+        # Display counts with color coding (manually padded for alignment)
+        print(f"{PASS}{' '*25}: {pass_count}")
+        print(f"{WARNING} - ATTENTION REQUIRED : {warning_count}")
+        print(f"{FAIL} - UPGRADE FAILURE!!{' '*5}: {fail_count}")
+        
+        # Write to summary file (without color codes, manually padded)
+        summary_file.write(f"PASS{' '*25}: {pass_count}\n")
+        summary_file.write(f"WARNING - ATTENTION REQUIRED : {warning_count}\n")
+        summary_file.write(f"FAIL - UPGRADE FAILURE!!{' '*5}: {fail_count}\n")
         
         # Final success message about where results are stored
         print(f"\nDetailed results are available in {results_dir}/\n")
