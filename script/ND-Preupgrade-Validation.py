@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.12 (Jan 17, 2026)
+Version: 1.0.13 (Jan 21, 2026)
 """
 
 import re
@@ -2790,7 +2790,7 @@ class MultipleFileManager:
             return self.files[index]
         return None
     
-def process_all_nodes(node_manager, tech_choice, debug_mode=False, skipped_nodes_info=None):
+def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None):
     """Process all nodes with validation script using optimal resource-based concurrency"""
     # Record process start time
     process_start_time = time.time()
@@ -3008,6 +3008,88 @@ def process_all_nodes(node_manager, tech_choice, debug_mode=False, skipped_nodes
     
     logger.info(f"Processing {len(nodes_to_process)} nodes in {len(nodes_batches)} batches")
     
+    # Start API check in background thread (will run in parallel with worker nodes)
+    api_check_result = {"status": "NOTRUN"}  # Default status
+    api_check_thread = None
+    
+    # Helper function to run API check
+    def run_api_check():
+        try:
+            # Use the same password as rescue-user (admin and rescue-user share the same password)
+            admin_password = password
+            
+            if not admin_password:
+                logger.warning("No password provided for API check")
+                result = APICheckResult.set_warning(
+                    "telemetry_inband_epg",
+                    "Password not provided for API check",
+                    recommendation="Ensure password is provided to run API validation"
+                )
+                api_check_result.update(result)
+                return
+            
+            if not version:
+                logger.warning("[API] ND version not available for API check")
+                result = APICheckResult.set_warning(
+                    "telemetry_inband_epg",
+                    "Could not determine ND version for API check",
+                    recommendation="Verify ND version and run check manually if needed"
+                )
+                api_check_result.update(result)
+                return
+            
+            # Create API client and authenticate
+            logger.info(f"[API] Initializing ND API client for checks")
+            api_client = NDAPIClient(node_manager.nd_ip, "admin", admin_password)
+            
+            if not api_client.authenticate():
+                logger.error("[API] Failed to authenticate API client")
+                result = APICheckResult.set_warning(
+                    "telemetry_inband_epg",
+                    "Failed to authenticate to ND API",
+                    explanation="Could not authenticate to ND management interface",
+                    recommendation="Verify admin credentials and API accessibility"
+                )
+                api_check_result.update(result)
+                return
+            
+            # Run the API check using the authenticated client
+            logger.info(f"[API] Starting API check for Telemetry Inband EPG with ND version {version}")
+            result = check_telemetry_inband_epg(api_client, version)
+            api_check_result.update(result)
+            
+            # Log the result
+            if result["status"] == "FAIL":
+                logger.error(f"[API] API check FAILED: {result['details']}")
+            elif result["status"] == "WARNING":
+                logger.warning(f"[API] API check WARNING: {result['details']}")
+            else:
+                logger.info(f"[API] API check PASSED: {result['details']}")
+                
+        except KeyboardInterrupt:
+            logger.info("[API] API check interrupted by user")
+            result = APICheckResult.set_warning(
+                "telemetry_inband_epg",
+                "API check was interrupted",
+                recommendation="Re-run validation to complete API check"
+            )
+            api_check_result.update(result)
+        except Exception as e:
+            logger.exception(f"[API] Error during API check: {str(e)}")
+            result = APICheckResult.set_warning(
+                "telemetry_inband_epg",
+                f"API check error: {str(e)}",
+                explanation="An unexpected error occurred during API validation",
+                recommendation="Check logs and verify API connectivity",
+                reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            )
+            api_check_result.update(result)
+    
+    # Start API check thread
+    api_check_thread = threading.Thread(target=run_api_check, daemon=True)
+    api_check_thread.start()
+    logger.info("API check thread started")
+    
     # Helper function to deploy and execute for one node
     def deploy_and_execute_node(node, stagger_delay=0):
         node_name = node["name"]
@@ -3119,6 +3201,48 @@ def process_all_nodes(node_manager, tech_choice, debug_mode=False, skipped_nodes
     
     print("")  # Extra blank line after cleanup section
     
+    # Wait for API check to complete
+    if api_check_thread and api_check_thread.is_alive():
+        print_section("Waiting for API Check Completion")
+        print("Waiting for Telemetry Inband EPG API check to complete...")
+        api_check_thread.join(timeout=60)  # Wait up to 60 seconds
+        
+        if api_check_thread.is_alive():
+            logger.warning("API check did not complete within timeout period")
+            print(f"{WARNING} API check timed out")
+            api_check_result.update({
+                "status": "WARNING",
+                "details": ["API check did not complete within timeout period"],
+                "explanation": None,
+                "recommendation": "Run API check manually or increase timeout",
+                "reference": "http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            })
+        else:
+            print(f"{PASS} API check completed")
+    
+    # Add API check result to all_results if it was run
+    if api_check_result["status"] != "NOTRUN":
+        # Add as a special "api_checks" node in results
+        all_results["_api_checks"] = {
+            "node_name": "API Checks",
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "checks": {
+                "telemetry_inband_epg_check": {
+                    "status": api_check_result["status"],
+                    "details": api_check_result["details"],
+                    "explanation": api_check_result.get("explanation"),
+                    "recommendation": api_check_result.get("recommendation"),
+                    "reference": api_check_result.get("reference")
+                }
+            }
+        }
+        
+        # Update overall status if API check failed
+        if api_check_result["status"] == "FAIL":
+            overall_status = "FAIL"
+        elif api_check_result["status"] == "WARNING" and overall_status != "FAIL":
+            overall_status = "WARNING"
+    
     # Calculate timing info
     total_time = time.time() - process_start_time
     timing_info = {
@@ -3149,6 +3273,390 @@ def print_section(title):
     print(f"\n{'='*80}")
     print(f"  {title}")
     print(f"{'='*80}")
+
+###############################################################
+# API Check Helper Classes (Module Level)
+###############################################################
+
+class APICheckResult:
+    """
+    Lightweight result helper for API checks in main script.
+    Provides standardized result management for API-based validation checks.
+    """
+    @staticmethod
+    def set_pass(check_name, message):
+        """Create a PASS result"""
+        return {
+            "status": "PASS",
+            "details": [message],
+            "explanation": None,
+            "recommendation": None,
+            "reference": None
+        }
+    
+    @staticmethod
+    def set_fail(check_name, message, explanation=None, recommendation=None, reference=None):
+        """Create a FAIL result"""
+        return {
+            "status": "FAIL",
+            "details": [message],
+            "explanation": explanation,
+            "recommendation": recommendation,
+            "reference": reference
+        }
+    
+    @staticmethod
+    def set_warning(check_name, message, explanation=None, recommendation=None, reference=None):
+        """Create a WARNING result"""
+        return {
+            "status": "WARNING",
+            "details": [message],
+            "explanation": explanation,
+            "recommendation": recommendation,
+            "reference": reference
+        }
+
+def get_version_tuple(version_string):
+    """
+    Parse version string into (major, minor, patch) tuple.
+    Handles build suffixes like 'e' and 'f'.
+    
+    Args:
+        version_string: Version string like "3.2.1e"
+    
+    Returns:
+        tuple: (major, minor, patch) as integers
+    """
+    try:
+        # Remove build suffixes (e.g., 'f', 'e')
+        clean_version = version_string.replace('f', '').replace('e', '')
+        parts = clean_version.split('.')
+        major = int(parts[0]) if len(parts) > 0 else 0
+        minor = int(parts[1]) if len(parts) > 1 else 0
+        patch = int(parts[2]) if len(parts) > 2 else 0
+        return (major, minor, patch)
+    except (ValueError, IndexError):
+        return (0, 0, 0)
+
+###############################################################
+# API Client Infrastructure
+###############################################################
+
+class NDAPIClient:
+    """
+    Reusable API client for Nexus Dashboard management interface.
+    
+    Handles authentication, token management, and HTTP requests with Python 2/3 compatibility.
+    Designed to be used by multiple API-based validation checks.
+    
+    Security: Password is stored as private attribute and never logged or printed.
+    """
+    
+    def __init__(self, nd_ip, username, password):
+        """
+        Initialize API client with connection parameters.
+        
+        Args:
+            nd_ip: Nexus Dashboard management IP address
+            username: Username for API authentication (typically 'admin')
+            password: Password for API authentication (stored securely, never logged)
+        """
+        self.nd_ip = nd_ip
+        self.username = username
+        self._password = password  # Private - never log or print
+        self._token = None  # Bearer token obtained after authentication
+        self.logger = logging.getLogger(__name__)
+        
+        # Set up Python 2/3 compatibility for HTTP requests
+        try:
+            # Python 3
+            import urllib.request
+            import urllib.error
+            import ssl
+            self.urllib_request = urllib.request
+            self.urllib_error = urllib.error
+            self.ssl = ssl
+            self.python3 = True
+        except ImportError:
+            # Python 2
+            import urllib2
+            import ssl
+            self.urllib_request = urllib2
+            self.urllib_error = urllib2
+            self.ssl = ssl
+            self.python3 = False
+        
+        # Create SSL context that doesn't verify certificates (ND uses self-signed certs)
+        self.ssl_context = self.ssl.create_default_context()
+        self.ssl_context.check_hostname = False
+        self.ssl_context.verify_mode = self.ssl.CERT_NONE
+    
+    def authenticate(self):
+        """
+        Authenticate to ND API and obtain bearer token.
+        
+        Returns:
+            bool: True if authentication succeeded, False otherwise
+        """
+        login_url = f"https://{self.nd_ip}/login"
+        login_data = json.dumps({
+            "userName": self.username,
+            "userPasswd": self._password,  # Never log this
+            "domain": "DefaultAuth"
+        })
+        
+        # Log authentication attempt without password
+        self.logger.info(f"[API] Authenticating to ND API at {login_url} as {self.username}")
+        
+        try:
+            if self.python3:
+                login_req = self.urllib_request.Request(
+                    login_url,
+                    data=login_data.encode('utf-8'),
+                    headers={'Content-Type': 'application/json'}
+                )
+                login_response = self.urllib_request.urlopen(login_req, context=self.ssl_context, timeout=30)
+                login_result = json.loads(login_response.read().decode('utf-8'))
+            else:
+                login_req = self.urllib_request.Request(
+                    login_url,
+                    data=login_data,
+                    headers={'Content-Type': 'application/json'}
+                )
+                login_response = self.urllib_request.urlopen(login_req, context=self.ssl_context, timeout=30)
+                login_result = json.loads(login_response.read())
+            
+            # Extract and store bearer token
+            self._token = login_result.get('token')
+            if not self._token:
+                self.logger.error("[API] No token received from ND API authentication")
+                return False
+            
+            self.logger.info("[API] Successfully authenticated to ND API")
+            return True
+            
+        except Exception as e:
+            # Never include password in error messages
+            self.logger.error(f"[API] Authentication failed: {str(e)}")
+            return False
+    
+    def get(self, endpoint, timeout=30):
+        """
+        Make authenticated GET request to ND API.
+        
+        Args:
+            endpoint: API endpoint path (e.g., '/sedgeapi/v1/cisco-nir/api/api/v1/ndsites')
+            timeout: Request timeout in seconds (default: 30)
+        
+        Returns:
+            dict/list: Parsed JSON response from API
+        
+        Raises:
+            RuntimeError: If not authenticated
+            Exception: If request fails
+        """
+        if not self._token:
+            raise RuntimeError("Not authenticated - call authenticate() first")
+        
+        url = f"https://{self.nd_ip}{endpoint}"
+        self.logger.debug(f"[API] GET {endpoint}")
+        
+        try:
+            if self.python3:
+                req = self.urllib_request.Request(
+                    url,
+                    headers={'Authorization': f'Bearer {self._token}'}
+                )
+                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
+                data = json.loads(response.read().decode('utf-8'))
+            else:
+                req = self.urllib_request.Request(
+                    url,
+                    headers={'Authorization': f'Bearer {self._token}'}
+                )
+                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
+                data = json.loads(response.read())
+            
+            self.logger.debug(f"[API] GET {endpoint} succeeded")
+            return data
+            
+        except Exception as e:
+            self.logger.error(f"[API] GET {endpoint} failed: {str(e)}")
+            raise
+    
+    def post(self, endpoint, data, timeout=30):
+        """
+        Make authenticated POST request to ND API.
+        
+        Args:
+            endpoint: API endpoint path
+            data: Data to send (will be JSON-encoded)
+            timeout: Request timeout in seconds (default: 30)
+        
+        Returns:
+            dict/list: Parsed JSON response from API
+        
+        Raises:
+            RuntimeError: If not authenticated
+            Exception: If request fails
+        """
+        if not self._token:
+            raise RuntimeError("Not authenticated - call authenticate() first")
+        
+        url = f"https://{self.nd_ip}{endpoint}"
+        self.logger.debug(f"[API] POST {endpoint}")
+        
+        post_data = json.dumps(data)
+        
+        try:
+            if self.python3:
+                req = self.urllib_request.Request(
+                    url,
+                    data=post_data.encode('utf-8'),
+                    headers={
+                        'Authorization': f'Bearer {self._token}',
+                        'Content-Type': 'application/json'
+                    }
+                )
+                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
+                result = json.loads(response.read().decode('utf-8'))
+            else:
+                req = self.urllib_request.Request(
+                    url,
+                    data=post_data,
+                    headers={
+                        'Authorization': f'Bearer {self._token}',
+                        'Content-Type': 'application/json'
+                    }
+                )
+                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
+                result = json.loads(response.read())
+            
+            self.logger.debug(f"[API] POST {endpoint} succeeded")
+            return result
+            
+        except Exception as e:
+            self.logger.error(f"[API] POST {endpoint} failed: {str(e)}")
+            raise
+    
+    def is_authenticated(self):
+        """Check if client is currently authenticated"""
+        return self._token is not None
+
+def check_telemetry_inband_epg(api_client, version):
+    """
+    API-based check for blank Inband EPG DN on ACI sites with INBAND connection type (CSCws23607)
+    
+    Due to a software defect when re-registering an ACI fabric in NDI, the Inband EPG can
+    become blank. This state will cause Nexus Dashboard upgrade to fail.
+    
+    This check uses the NDAPIClient infrastructure to:
+    1. Call ndsites API to get all ACI sites (siteType = "Aci")
+    2. Call telemetry fabric API to get connection type for each site
+    3. For sites with connectionType = "INBAND", verify inbandEpgDN is not blank
+    
+    Only applies to ND version 3.2.x
+    
+    Args:
+        api_client: Authenticated NDAPIClient instance
+        version: ND version string (e.g., "3.2.1e")
+    
+    Returns:
+        dict: Check result with status, details, explanation, recommendation, reference
+    
+    Reference: CSCws23607
+    """
+    logger = logging.getLogger(__name__)
+    
+    # Check version applicability - only applies to 3.2.x (not 3.1.x or 4.0+)
+    major, minor, _ = get_version_tuple(version)
+    if major != 3 or minor != 2:
+        return APICheckResult.set_pass(
+            "telemetry_inband_epg",
+            f"ND version {version} != 3.2, check not applicable"
+        )
+    
+    # Version is 3.2.x - proceed with API check
+    logger.info(f"[API] ND version {version} is 3.2.x - running Telemetry Inband EPG API check")
+    
+    try:
+        # Verify API client is authenticated
+        if not api_client.is_authenticated():
+            logger.error("[API] API client is not authenticated")
+            return APICheckResult.set_warning(
+                "telemetry_inband_epg",
+                "API client not authenticated",
+                explanation="Could not authenticate to ND management interface",
+                recommendation="Verify admin credentials and API accessibility",
+                reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            )
+        
+        # Step 1: Get ndsites data
+        logger.info("[API] Fetching ndsites data")
+        ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true')
+        
+        # Step 2: Get fabric telemetry config
+        logger.info("[API] Fetching fabric telemetry config")
+        fabric_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default')
+        
+        # Step 3: Build mapping of site names to connection types
+        fabric_sites = {}
+        if isinstance(fabric_data, dict) and "value" in fabric_data and "data" in fabric_data["value"]:
+            for site in fabric_data["value"]["data"]:
+                site_name = site.get("name")
+                connection_type = site.get("connectionType", "")
+                if site_name:
+                    fabric_sites[site_name] = connection_type
+        
+        # Step 4: Check ACI sites for blank inbandEpgDN when connectionType is INBAND
+        problematic_sites = []
+        
+        if isinstance(ndsites_data, list):
+            for site in ndsites_data:
+                site_type = site.get("siteType", "")
+                site_name = site.get("name", "Unknown")
+                
+                # Only check ACI sites
+                if site_type == "Aci":
+                    # Get inbandEpgDN from aci section
+                    aci_section = site.get("aci", {})
+                    inband_epg_dn = aci_section.get("inbandEpgDN", "")
+                    
+                    # Check if this site has INBAND connection type in fabric config
+                    connection_type = fabric_sites.get(site_name, "")
+                    
+                    logger.info(f"[API] Checking ACI site '{site_name}': connectionType={connection_type}, inbandEpgDN='{inband_epg_dn}'")
+                    
+                    # Only flag as problematic if connectionType is INBAND and inbandEpgDN is blank
+                    if connection_type == "INBAND" and not inband_epg_dn:
+                        problematic_sites.append(site_name)
+                        logger.warning(f"[API] Site '{site_name}' has INBAND connection but blank inbandEpgDN")
+        
+        # Step 6: Return results
+        if problematic_sites:
+            return APICheckResult.set_fail(
+                "telemetry_inband_epg",
+                f"Inband EPG is blank for ACI NDI site(s): {', '.join(problematic_sites)}",
+                explanation="Due to a software defect when re-registering an ACI fabric in NDI, the Inband EPG can become blank.\n  This state will cause Nexus Dashboard upgrade to fail.",
+                recommendation="Contact Cisco TAC for assistance in remediating the issue prior to upgrade.",
+                reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            )
+        else:
+            logger.info("[API] All ACI sites with INBAND connection have valid inbandEpgDN")
+            return APICheckResult.set_pass(
+                "telemetry_inband_epg",
+                "All ACI sites validated successfully"
+            )
+    
+    except Exception as e:
+        logger.exception(f"[API] Error during Telemetry Inband EPG API check: {str(e)}")
+        return APICheckResult.set_warning(
+            "telemetry_inband_epg",
+            f"Error during API check: {str(e)}",
+            explanation="Could not complete API-based validation",
+            recommendation="Verify admin credentials and API accessibility, or perform manual verification:\n  1. Authenticate to https://<nd-ip>/login as admin\n  2. Check API: /sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true\n  3. Check API: /sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default\n  4. Verify all ACI sites with connectionType=INBAND have non-empty inbandEpgDN",
+            reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+        )
 
 def generate_report(all_results, version, overall_status, timing_info=None, skipped_nodes_info=None):
     """Generate a final report based on aggregated results with clear check-by-check output"""
@@ -3305,6 +3813,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             "disk_space", 
             "pod_status", 
             "system_health",
+            "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
             "nxos_discovery_service",
             "backup_failure_check",
             "nameserver_duplicate_check",
@@ -3321,6 +3830,10 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         # Organize by check type instead of by node
         all_checks = {}
         for node_name, node_results in all_results.items():
+            # Skip special _api_checks and _debug_info entries in main processing
+            if node_name.startswith("_"):
+                continue
+                
             for check_name, check_result in node_results["checks"].items():
                 if check_name not in all_checks:
                     all_checks[check_name] = {
@@ -3369,6 +3882,30 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                 if "reference" in check_result and check_result["reference"] and should_update_explanation:
                     reference_text = f"\n  Reference:\n  {check_result['reference']}"
                     all_checks[check_name]["reference"] = reference_text
+        
+        # Handle API checks separately (cluster-level, not node-specific)
+        if "_api_checks" in all_results:
+            api_results = all_results["_api_checks"]
+            for check_name, check_result in api_results["checks"].items():
+                if check_name not in all_checks:
+                    all_checks[check_name] = {
+                        "status": check_result["status"],
+                        "nodes": {},  # Empty for API checks
+                        "explanation": None,
+                        "recommendation": None,
+                        "reference": None
+                    }
+                
+                # Store as cluster-level check (no specific node)
+                all_checks[check_name]["nodes"]["API Check"] = check_result
+                
+                # Extract top-level explanation, recommendation, and reference
+                if check_result.get("explanation"):
+                    all_checks[check_name]["explanation"] = f"\n  Explanation:\n  {check_result['explanation']}"
+                if check_result.get("recommendation"):
+                    all_checks[check_name]["recommendation"] = f"\n  Recommendation:\n  {check_result['recommendation']}"
+                if check_result.get("reference"):
+                    all_checks[check_name]["reference"] = f"\n  Reference:\n  {check_result['reference']}"
         
         # Order the checks according to our defined sequence
         ordered_checks = []
@@ -4028,7 +4565,7 @@ def main():
         
         # Process all nodes - resource-optimized
         # Save the results to ensure we can access debug_data after the report is generated
-        results = process_all_nodes(node_manager, tech_choice, args.debug, skipped_nodes_info)
+        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info)
         
         # Display debug mode warning at the very end, after the report
         if args.debug and results and "_debug_info" in results:
