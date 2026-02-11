@@ -193,7 +193,7 @@ def check_environment():
 
 class SSHCommand:
     """Context manager for handling SSH commands with proper cleanup"""
-    
+
     def __init__(self, node_manager, node, command, mask_password=True):
         self.node_manager = node_manager
         self.node = node
@@ -203,18 +203,18 @@ class SSHCommand:
         self.stdout = None
         self.stderr = None
         self.returncode = None
-        
+
     def __enter__(self):
         """Start the SSH command when entering context"""
         try:
             # Use centralized SSH command builder with connection multiplexing
             full_cmd = self.node_manager.build_ssh_command(self.node['ip'], self.command)
-            
+
             # Create masked version for logs
             if self.mask_password:
                 masked_cmd = full_cmd.replace(self.node_manager.password, "********")
                 logger.debug(f"Executing SSH command (masked): {masked_cmd}")
-            
+
             # Execute the command
             self.process = subprocess.Popen(
                 full_cmd, 
@@ -222,12 +222,12 @@ class SSHCommand:
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE
             )
-            
+
             return self
         except Exception as e:
             logger.error(f"Error starting SSH command: {str(e)}")
             raise
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Clean up resources when exiting context"""
         if self.process:
@@ -241,21 +241,21 @@ class SSHCommand:
                         self.process.kill()
             except:
                 pass
-        
+
         return False  # Don't suppress exceptions
-    
+
     def get_results(self, timeout=None):
         """Get command results within the context"""
         if not self.process:
             return "", "", 1
-            
+
         try:
             self.stdout, self.stderr = self.process.communicate(timeout=timeout)
             self.returncode = self.process.returncode
-            
+
             stdout_str = self.stdout.decode('utf-8').strip()
             stderr_str = self.stderr.decode('utf-8').strip()
-            
+
             # If we got a failure with no error message, try to get the actual SSH error
             if self.returncode != 0 and not stderr_str and not stdout_str:
                 logger.debug(f"Empty error output from sshpass, attempting direct SSH diagnostic")
@@ -264,34 +264,34 @@ class SSHCommand:
                     ssh_opts = " ".join(self.node_manager.ssh_options)
                     if self.node_manager.legacy_ssh_mode:
                         ssh_opts += " -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
-                    
+
                     # Try SSH without sshpass to see the actual error
                     diagnostic_cmd = f"ssh {ssh_opts} -o BatchMode=yes {self.node_manager.username}@{self.node['ip']} 'echo test' 2>&1"
                     logger.debug(f"Running diagnostic: {diagnostic_cmd}")
-                    
+
                     diag_process = subprocess.Popen(diagnostic_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
                     diag_out, _ = diag_process.communicate(timeout=5)
                     diag_output = diag_out.decode('utf-8').strip()
-                    
+
                     if diag_output:
                         logger.debug(f"Diagnostic output: {diag_output}")
                         stderr_str = diag_output
                 except Exception as diag_e:
                     logger.debug(f"Diagnostic command failed: {str(diag_e)}")
-            
+
             return (stdout_str, stderr_str, self.returncode)
-            
+
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.stdout, self.stderr = self.process.communicate()
             self.returncode = self.process.returncode
-            
+
             return (
                 "Command timed out",
                 self.stderr.decode('utf-8').strip(),
                 self.returncode
             )
-        
+
 def is_valid_ip(ip):
     """Validate if the string is a valid IPv4 or IPv6 address"""
     try:
@@ -397,7 +397,7 @@ def check_system_resources():
 
 class NDNodeManager:
     """Manages Nexus Dashboard nodes and their information"""
-    
+
     def __init__(self, nd_ip, username="rescue-user", password=None):
         """Initialize with the Nexus Dashboard IP"""
         self.nd_ip = nd_ip
@@ -407,7 +407,7 @@ class NDNodeManager:
         self.connection = None
         self.version = None  # Store ND version for version-specific commands
         self.legacy_ssh_mode = False  # Track if we need ssh-rsa compatibility
-        
+
         # SSH Connection Multiplexing Options for 30-50% performance improvement
         # Start without ssh-rsa for security, add it only if needed
         self.ssh_options = [
@@ -419,49 +419,49 @@ class NDNodeManager:
             "-o ControlPath=/tmp/ssh-nd-%r@%h:%p",
             "-o ControlPersist=300"  # Keep connections alive for 5 minutes
         ]
-    
+
     def build_ssh_command(self, node_ip, command, timeout=30):
         """Centralized SSH command builder with connection multiplexing"""
         ssh_opts = self.ssh_options.copy()
-        
+
         # Add legacy SSH options if we've detected the need for them
         if self.legacy_ssh_mode:
             ssh_opts.extend([
                 "-o HostKeyAlgorithms=+ssh-rsa",
                 "-o PubkeyAcceptedKeyTypes=+ssh-rsa"
             ])
-        
+
         # Note: OpenSSH handles bare IPv6 addresses correctly in user@host format
         # No need to wrap in brackets - this works for both IPv4 and IPv6
         ssh_opts_str = " ".join(ssh_opts)
         # Use SSHPASS environment variable method which is more reliable than -p flag
         # This avoids issues with special characters in passwords and shell escaping
         return f"SSHPASS={shlex.quote(self.password)} sshpass -e ssh {ssh_opts_str} {self.username}@{node_ip} \"{command}\""
-    
+
     def build_scp_command(self, local_file, node_ip, remote_file):
         """Centralized SCP command builder with connection multiplexing"""
         ssh_opts = self.ssh_options.copy()
-        
+
         # Add legacy SSH options if we've detected the need for them
         if self.legacy_ssh_mode:
             ssh_opts.extend([
                 "-o HostKeyAlgorithms=+ssh-rsa",
                 "-o PubkeyAcceptedKeyTypes=+ssh-rsa"
             ])
-        
+
         # Note: OpenSSH handles bare IPv6 addresses correctly in user@host format
         # No need to wrap in brackets - this works for both IPv4 and IPv6
         ssh_opts_str = " ".join(ssh_opts)
         # Use SSHPASS environment variable method which is more reliable than -p flag
         return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {local_file} {self.username}@{node_ip}:{remote_file}"
-    
+
     def enable_legacy_ssh_mode(self):
         """Enable legacy SSH mode (ssh-rsa) for compatibility with older ND versions"""
         if not self.legacy_ssh_mode:
             self.legacy_ssh_mode = True
             logger.warning("Enabling legacy SSH mode (ssh-rsa) for compatibility with older Nexus Dashboard host keys")
             logger.warning("Note: ssh-rsa uses SHA-1 which has known weaknesses. Consider regenerating ND host keys with: ssh-keygen -A")
-    
+
     def _check_crypto_policy(self):
         """Check if system crypto policy is blocking ssh-rsa"""
         rhel_based = False
@@ -473,12 +473,12 @@ class NDNodeManager:
                 text=True,
                 timeout=5
             )
-            
+
             if result.returncode == 0:
                 rhel_based = True
                 policy = result.stdout.strip()
                 logger.info(f"Detected RHEL-based crypto policy: {policy}")
-                
+
                 if policy in ['DEFAULT', 'FUTURE', 'FIPS']:
                     # These policies block SHA-1/ssh-rsa
                     print(f"\n{FAIL} System crypto policy is blocking ssh-rsa connections")
@@ -493,15 +493,15 @@ class NDNodeManager:
                     print(f"\n      Alternative (more secure): Create custom policy for SSH only:")
                     print(f"        sudo update-crypto-policies --set DEFAULT:SHA1")
                     print(f"\n      See: https://access.redhat.com/articles/3642912")
-                    
+
                     logger.error(f"Crypto policy {policy} is blocking ssh-rsa. User must enable LEGACY policy.")
                     return True
-            
+
         except FileNotFoundError:
             logger.debug("update-crypto-policies not found - not a RHEL-based system")
         except Exception as e:
             logger.debug(f"Could not check RHEL crypto policy: {str(e)}")
-        
+
         # If not RHEL-based or policy check didn't trigger, show generic message
         if not rhel_based:
             logger.warning("Legacy SSH failed - may be crypto policy issue on non-RHEL system")
@@ -520,49 +520,49 @@ class NDNodeManager:
             print(f"        ssh -vvv -o HostKeyAlgorithms=+ssh-rsa rescue-user@{self.nd_ip}")
             print(f"        (Look for 'error in libcrypto' or similar crypto errors)")
             return True
-        
+
         return False
-    
+
     def connect(self):
         """Connect to the main Nexus Dashboard node with automatic legacy SSH fallback"""
         logger.info(f"Connecting to Nexus Dashboard at {self.nd_ip}")
-        
+
         try:
             # Create a node dict that SSHCommand expects
             node = {"name": "main_node", "ip": self.nd_ip}
-            
+
             # First attempt: Try with modern SSH (secure by default)
             with SSHCommand(self, node, "echo Connected", mask_password=True) as ssh:
                 output, error, returncode = ssh.get_results(timeout=10)
-                
+
                 if returncode == 0 and "Connected" in output:
                     logger.info(f"Successfully connected to Nexus Dashboard at {self.nd_ip}")
                     return True
-                
+
                 # Check if the error is specifically about host key negotiation
                 error_is_ssh_negotiation = (
                     "no matching host key type found" in error.lower() or 
                     "their offer: ssh-rsa" in error.lower() or 
                     "unable to negotiate" in error.lower()
                 )
-                
+
                 # If we got a connection failure, try legacy mode
                 if returncode != 0 and (error_is_ssh_negotiation or not error.strip()):
                     if error_is_ssh_negotiation:
                         logger.warning(f"Modern SSH failed due to host key mismatch: {error}")
                     else:
                         logger.warning(f"SSH connection failed (likely ssh-rsa compatibility issue)")
-                    
+
                     logger.info("Attempting connection with legacy ssh-rsa support...")
                     print(f"{WARNING} SSH connection failed - attempting legacy compatibility mode")
-                    
+
                     # Enable legacy mode and retry
                     self.enable_legacy_ssh_mode()
-                    
+
                     # Second attempt: Retry with legacy SSH support
                     with SSHCommand(self, node, "echo Connected", mask_password=True) as ssh_retry:
                         output_retry, error_retry, returncode_retry = ssh_retry.get_results(timeout=10)
-                        
+
                         if returncode_retry == 0 and "Connected" in output_retry:
                             logger.info(f"Successfully connected using legacy SSH mode")
                             print(f"{PASS} Successfully connected using legacy SSH mode")
@@ -572,13 +572,13 @@ class NDNodeManager:
                         else:
                             # Legacy SSH also failed - check for crypto policy issue
                             logger.error(f"Failed to connect even with legacy SSH: {error_retry}")
-                            
+
                             # Check if this is a crypto policy issue (RHEL 9+)
                             if "error in libcrypto" in error_retry.lower() or not error_retry.strip():
                                 crypto_policy_issue = self._check_crypto_policy()
                                 if crypto_policy_issue:
                                     return False
-                            
+
                             print(f"{FAIL} Failed to connect even with legacy SSH support")
                             if error_retry.strip():
                                 print(f"      Error: {error_retry}")
@@ -595,18 +595,18 @@ class NDNodeManager:
                     if error.strip():
                         print(f"      Error: {error}")
                     return False
-                    
+
         except Exception as e:
             logger.exception(f"Error connecting to Nexus Dashboard: {str(e)}")
             print(f"{FAIL} Exception during connection: {str(e)}")
             return False
-    
+
     def disconnect(self):
         """Disconnect from the main Nexus Dashboard node"""
         if self.connection:
             self.connection.close()
             self.connection = None
-    
+
     def get_techsupport_command(self):
         """
         Get the appropriate tech support command based on ND version.
@@ -616,14 +616,14 @@ class NDNodeManager:
         if not self.version:
             logger.warning("ND version not available, using legacy command")
             return "acs techsupport collect -s system"
-        
+
         try:
             # Parse version to get major version number
             version_parts = self.version.split('.')
-            
+
             if len(version_parts) >= 1:
                 major = int(version_parts[0])
-                
+
                 # Simple logic: version 4.x and later use new command
                 if major >= 4:
                     logger.info(f"Version {self.version} >= 4.x, using new command format")
@@ -634,11 +634,11 @@ class NDNodeManager:
             else:
                 logger.warning(f"Could not parse version {self.version}, using legacy command")
                 return "acs techsupport collect -s system"
-                
+
         except Exception as e:
             logger.warning(f"Error parsing version {self.version}: {str(e)}, using legacy command")
             return "acs techsupport collect -s system"
-    
+
     def check_tmp_space(self, node, tech_support_path):
         """
         Check if /tmp has sufficient space for tech support extraction.
@@ -652,30 +652,30 @@ class NDNodeManager:
             tuple: (bool, float, float, float, str) - (has_space, current_usage, projected_usage, ts_size_gb, error_msg)
         """
         import subprocess
-        
+
         try:
             # Step 1: Get current /tmp filesystem usage
             logger.info(f"Checking /tmp space on {node['name']}")
             df_cmd = self.build_ssh_command(node['ip'], "df -h /tmp | tail -1")
             process = subprocess.Popen(df_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate(timeout=30)
-            
+
             if process.returncode != 0:
                 error_msg = f"Failed to check /tmp space: {stderr.decode('utf-8')}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, 0, 0, 0, error_msg
-            
+
             # Parse df output
             # Example: /dev/mapper/vg--app-lv--app  500G  350G  125G  74% /tmp
             df_output = stdout.decode('utf-8').strip()
             logger.debug(f"{node['name']} df output: {df_output}")
-            
+
             parts = df_output.split()
             if len(parts) < 5:
                 error_msg = f"Unexpected df output format: {df_output}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, 0, 0, 0, error_msg
-            
+
             # Extract current usage percentage (column 4, includes % sign)
             current_usage_str = parts[4].rstrip('%')
             try:
@@ -684,19 +684,19 @@ class NDNodeManager:
                 error_msg = f"Failed to parse usage percentage: {parts[4]}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, 0, 0, 0, error_msg
-            
+
             logger.info(f"{node['name']}: Current /tmp usage: {current_usage_pct}%")
-            
+
             # Step 2: Get tech support file size
             size_cmd = self.build_ssh_command(node['ip'], f"stat -c %s {tech_support_path} 2>/dev/null || stat -f %z {tech_support_path}")
             process = subprocess.Popen(size_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate(timeout=30)
-            
+
             if process.returncode != 0:
                 error_msg = f"Failed to get tech support file size: {stderr.decode('utf-8')}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, current_usage_pct, current_usage_pct, 0, error_msg
-            
+
             try:
                 tech_support_size_bytes = int(stdout.decode('utf-8').strip())
                 tech_support_size_gb = tech_support_size_bytes / (1024**3)
@@ -705,50 +705,50 @@ class NDNodeManager:
                 error_msg = f"Failed to parse tech support file size: {stdout.decode('utf-8')}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, current_usage_pct, current_usage_pct, 0, error_msg
-            
+
             # Step 3: Parse total filesystem size and calculate projected usage
             # Extract total size (column 1) - need to handle units (G, T, M, etc.)
             total_size_str = parts[1]
             total_size_gb = self._parse_size_to_gb(total_size_str)
-            
+
             if total_size_gb == 0:
                 error_msg = f"Failed to parse total filesystem size: {total_size_str}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, current_usage_pct, current_usage_pct, tech_support_size_gb, error_msg
-            
+
             # Sanity check: Warn about abnormally large tech support files (>10GB is unusual)
             if tech_support_size_gb > 10:
                 logger.warning(f"{node['name']}: Tech support file is unusually large ({tech_support_size_gb:.2f} GB). "
                              f"This may indicate an issue with tech support generation (e.g., excessive logs).")
-            
+
             # Calculate current used space in GB
             current_used_gb = (total_size_gb * current_usage_pct) / 100
-            
+
             # Estimate extracted size (compressed .tgz typically expands 2-3x, use 3x to be safe)
             # NOTE: Worker script extracts directly from source (e.g., /techsupport/) to /tmp
             #       WITHOUT copying the .tgz file first, so we only account for extraction space
             estimated_extracted_size_gb = tech_support_size_gb * 3
-            
+
             # Calculate projected usage
             projected_used_gb = current_used_gb + estimated_extracted_size_gb
             projected_usage_pct = (projected_used_gb / total_size_gb) * 100
-            
+
             logger.info(f"{node['name']}: Total /tmp: {total_size_gb:.2f} GB, "
                        f"Currently used: {current_used_gb:.2f} GB ({current_usage_pct}%), "
                        f"Tech support: {tech_support_size_gb:.2f} GB, "
                        f"Est. extracted: {estimated_extracted_size_gb:.2f} GB, "
                        f"Projected usage: {projected_used_gb:.2f} GB ({projected_usage_pct:.1f}%)")
-            
+
             # Check against 70% threshold
             if projected_usage_pct > 70:
                 error_msg = (f"Insufficient /tmp space: current {current_usage_pct:.1f}%, "
                            f"projected {projected_usage_pct:.1f}% (would exceed 70% threshold)")
                 logger.warning(f"{node['name']}: {error_msg}")
                 return False, current_usage_pct, projected_usage_pct, tech_support_size_gb, error_msg
-            
+
             logger.info(f"{node['name']}: Space check PASSED - projected usage {projected_usage_pct:.1f}% is within limits")
             return True, current_usage_pct, projected_usage_pct, tech_support_size_gb, ""
-            
+
         except subprocess.TimeoutExpired:
             error_msg = "Command timeout while checking /tmp space"
             logger.error(f"{node['name']}: {error_msg}")
@@ -757,7 +757,7 @@ class NDNodeManager:
             error_msg = f"Unexpected error checking /tmp space: {str(e)}"
             logger.exception(f"{node['name']}: {error_msg}")
             return False, 0, 0, 0, error_msg
-    
+
     def _parse_size_to_gb(self, size_str):
         """
         Parse size string with unit (e.g., '500G', '1.5T', '256M') to GB.
@@ -770,10 +770,10 @@ class NDNodeManager:
             if not match:
                 logger.warning(f"Failed to parse size string: {size_str}")
                 return 0
-            
+
             value = float(match.group(1))
             unit = match.group(2).upper() if match.group(2) else ''
-            
+
             # Convert to GB
             if unit == 'K':
                 return value / (1024 * 1024)
@@ -789,7 +789,7 @@ class NDNodeManager:
         except Exception as e:
             logger.error(f"Error parsing size '{size_str}': {str(e)}")
             return 0
-    
+
     def check_node_disk_space(self, node):
         """
         Check all directory usage on a node and report any over 80%.
@@ -802,63 +802,63 @@ class NDNodeManager:
             tuple: (bool, list, str) - (is_healthy, list of (dir, usage) tuples, error_msg)
         """
         import subprocess
-        
+
         try:
             logger.info(f"Checking disk space on {node['name']}")
             df_cmd = self.build_ssh_command(node['ip'], "df -h")
             process = subprocess.Popen(df_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate(timeout=30)
-            
+
             if process.returncode != 0:
                 error_msg = f"Failed to check disk space: {stderr.decode('utf-8')}"
                 logger.error(f"{node['name']}: {error_msg}")
                 return False, [], error_msg
-            
+
             # Parse df output
             df_output = stdout.decode('utf-8').strip()
             logger.debug(f"{node['name']} df output:\n{df_output}")
-            
+
             over_threshold = []
-            
+
             for line in df_output.split('\n'):
                 # Skip header line and empty lines
                 if not line.strip() or line.startswith('Filesystem'):
                     continue
-                
+
                 parts = line.split()
                 if len(parts) < 6:
                     continue
-                
+
                 # Get usage percentage (column 4, includes % sign)
                 usage_str = parts[4].rstrip('%')
                 try:
                     usage_pct = float(usage_str)
                 except ValueError:
                     continue
-                
+
                 # Get mount point (last column)
                 mount_point = parts[5]
-                
+
                 # Skip /tmp/isomount* directories - these are temporary ISO mount points
                 # 100% usage is normal when an upgrade ISO is mounted
                 if mount_point.startswith('/tmp/isomount'):
                     logger.debug(f"{node['name']}: Skipping {mount_point} (ISO mount point)")
                     continue
-                
+
                 # Check if usage >= 80%
                 if usage_pct >= 80:
                     over_threshold.append((mount_point, usage_pct))
                     logger.warning(f"{node['name']}: {mount_point} is at {usage_pct}% usage")
-            
+
             if over_threshold:
                 # Sort by usage percentage (highest first)
                 over_threshold.sort(key=lambda x: x[1], reverse=True)
                 error_msg = f"Found {len(over_threshold)} director{'y' if len(over_threshold) == 1 else 'ies'} over 80% usage"
                 return False, over_threshold, error_msg
-            
+
             logger.info(f"{node['name']}: All directories under 80% usage threshold")
             return True, [], ""
-            
+
         except subprocess.TimeoutExpired:
             error_msg = "Command timeout while checking disk space"
             logger.error(f"{node['name']}: {error_msg}")
@@ -867,7 +867,7 @@ class NDNodeManager:
             error_msg = f"Unexpected error checking disk space: {str(e)}"
             logger.exception(f"{node['name']}: {error_msg}")
             return False, [], error_msg
-    
+
     def check_eventmonitoring_logs(self, node):
         """
         Check for large eventmonitoring log files (>= 1G).
@@ -881,29 +881,29 @@ class NDNodeManager:
             tuple: (bool, list, str) - (is_healthy, list of large file sizes, error_msg)
         """
         import subprocess
-        
+
         try:
             logger.info(f"Checking eventmonitoring logs on {node['name']}")
-            
+
             # Check for files >= 1G in /logs/k8_infra/eventmonitoring
             check_cmd = self.build_ssh_command(node['ip'], "ls -lh /logs/k8_infra/eventmonitoring | awk '{print $5}' | grep -E '^[0-9.]+G'")
             process = subprocess.Popen(check_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate(timeout=30)
-            
+
             # Parse output
             output = stdout.decode('utf-8').strip()
-            
+
             # If we got output, it means files >= 1G were found
             if output:
                 large_files = [line.strip() for line in output.split('\n') if line.strip()]
                 error_msg = f"Found {len(large_files)} eventmonitoring log file(s) >= 1G"
                 logger.warning(f"{node['name']}: {error_msg}: {', '.join(large_files)}")
                 return False, large_files, error_msg
-            
+
             # No large files found
             logger.info(f"{node['name']}: No eventmonitoring log files >= 1G detected")
             return True, [], ""
-            
+
         except subprocess.TimeoutExpired:
             error_msg = "Command timeout while checking eventmonitoring logs"
             logger.error(f"{node['name']}: {error_msg}")
@@ -912,19 +912,19 @@ class NDNodeManager:
             error_msg = f"Unexpected error checking eventmonitoring logs: {str(e)}"
             logger.exception(f"{node['name']}: {error_msg}")
             return False, [], error_msg
-    
+
     def discover_nodes(self):
         """Discover all nodes in the ND cluster using sshpass instead of pexpect"""
-        
+
         try:
             import subprocess
             import shlex
-            
+
             logger.info("Getting Nexus Dashboard version")
             cmd = self.build_ssh_command(self.nd_ip, "acs version")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
-            
+
             version = None
             if process.returncode == 0:
                 output = stdout.decode('utf-8')
@@ -946,59 +946,59 @@ class NDNodeManager:
             cmd = self.build_ssh_command(self.nd_ip, "acs show nodes")
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
-            
+
             node_output = ""
             if process.returncode == 0:
                 node_output = stdout.decode('utf-8')
-            
+
             # Parse the node output
             logger.debug("Node output to parse: " + node_output)
             self.nodes = self._parse_node_output(node_output)
-            
+
             # If we didn't get any nodes, inform the user instead of using hardcoded values
             if not self.nodes:
                 logger.warning("No nodes were discovered from the Nexus Dashboard")
                 print(f"{FAIL} Unable to discover nodes from Nexus Dashboard.")
                 print("Please check that the node discovery command 'acs show nodes' works correctly.")
                 print("If this issue persists, contact Cisco TAC for assistance.")
-            
+
             return self.nodes
-                
+
         except Exception as e:
             logger.error(f"Error discovering nodes: {str(e)}")
             logger.warning("Node discovery failed due to an error")
             print(f"{FAIL} Node discovery failed: {str(e)}")
             print("Please verify your SSH connection is working and you have proper permissions.")
             return []
-    
+
     def _parse_node_output(self, output):
         """Parse the output of 'acs show nodes' command in box-drawing format"""
         nodes = []
         logger.info("Parsing node information...")
-        
+
         # Parse line by line to handle multi-line format
         lines = output.strip().splitlines()
         node_dict = {}
         current_node_name = None
-        
+
         for line in lines:
             # Skip header line
             if "NAME (*=SELF)" in line:
                 logger.debug(f"Skipping header line: {line[:50]}...")
                 continue
-            
+
             # Skip table border lines (lines that are primarily + and - characters)
             # These look like: +--------------------+----------------+----------+
             stripped = line.strip()
             if stripped and all(c in '+-─═│┌┐└┘├┤┬┴┼' for c in stripped):
                 logger.debug(f"Skipping table border line: {line[:50]}...")
                 continue
-            
+
             # Skip horizontal separator lines between nodes
             if '──────────' in line or '----------' in line:
                 logger.debug(f"Skipping horizontal separator: {line[:50]}...")
                 continue
-                
+
             # Check if this line has node data (contains │ or ¦ or any vertical bar-like character)
             # Look for any character that could be a vertical separator (ord 166, 124, 9474, etc.)
             has_separator = False
@@ -1008,7 +1008,7 @@ class NDNodeManager:
                     has_separator = True
                     delimiter = char
                     break
-            
+
             if not has_separator:
                 # Try to find any vertical bar-like character by checking character codes
                 for char in line:
@@ -1016,29 +1016,29 @@ class NDNodeManager:
                         has_separator = True
                         delimiter = char
                         break
-            
+
             if not has_separator:
                 logger.debug(f"No separator found in line: {line[:50]}...")
                 continue
-            
+
             logger.debug(f"Processing line with delimiter '{delimiter}' (ord={ord(delimiter)}): {line[:60]}...")
-            
+
             # Split by the delimiter
             parts = [p.strip() for p in line.split(delimiter)]
-            
+
             # Filter out empty parts
             parts = [p for p in parts if p]
-            
+
             # Debug: log the parts after filtering
             if parts:
                 logger.debug(f"Filtered parts ({len(parts)}): {parts}")
-            
+
             # Skip lines that are all dashes (separator between nodes)
             # These look like: ¦ ------------------ ¦ -------------- ¦ -------- ¦
             if parts and all(all(c == '-' for c in p) for p in parts):
                 logger.debug(f"Skipping separator line with all dashes")
                 continue
-            
+
             # Need at least 7 parts: name, serial, version, role, datanet, mgmtnet, status
             # OR could be continuation line with just datanet and mgmtnet
             if len(parts) >= 7:
@@ -1050,14 +1050,14 @@ class NDNodeManager:
                 data_network = parts[4].strip()
                 mgmt_network = parts[5].strip()
                 status = parts[6].strip()
-                
+
                 logger.debug(f"Checking node: name={node_name}, role={role}, status={status}")
-                
+
                 # Check for Master role (case insensitive)
                 if role.lower() == "master":
                     current_node_name = node_name
                     logger.debug(f"Processing Master node: {node_name}")
-                    
+
                     # Create or update node record
                     if node_name not in node_dict:
                         node_dict[node_name] = {
@@ -1070,7 +1070,7 @@ class NDNodeManager:
                             "status": status
                         }
                         logger.debug(f"Created node entry for: {node_name}")
-                    
+
                     # Collect network addresses (skip placeholders like 0.0.0.0/0 and ::/0)
                     if data_network and data_network not in ["0.0.0.0/0", "::/0"]:
                         node_dict[node_name]["datanetwork"].append(data_network)
@@ -1078,12 +1078,12 @@ class NDNodeManager:
                     if mgmt_network and mgmt_network not in ["0.0.0.0/0", "::/0"]:
                         node_dict[node_name]["mgmtnetwork"].append(mgmt_network)
                         logger.debug(f"Added mgmt network {mgmt_network} to {node_name}")
-                        
+
             elif len(parts) >= 2 and current_node_name:
                 # This might be a continuation line with just network addresses
                 # These lines have empty fields followed by the IP addresses
                 # Format: │  │  │  │  │ 2001:6114:114::14/64 │ 2001:420:28e:2023::111:604/64 │  │
-                
+
                 # Find non-empty parts that look like IP addresses
                 for part in parts:
                     if part and ('.' in part or ':' in part) and '/' in part:
@@ -1106,7 +1106,7 @@ class NDNodeManager:
                                     node_dict[current_node_name]["datanetwork"].append(part)
                                 else:
                                     node_dict[current_node_name]["mgmtnetwork"].append(part)
-        
+
         # Convert node_dict to list and select primary IPs
         for node_name, node_data in node_dict.items():
             # Prefer IPv6 if available, fallback to IPv4
@@ -1115,25 +1115,153 @@ class NDNodeManager:
                 node_data["datanetwork"] = node_data["datanetwork"][0]
             else:
                 node_data["datanetwork"] = "unknown"
-            
+
             # For mgmtnetwork: use first non-placeholder address
             if node_data["mgmtnetwork"]:
                 node_data["mgmtnetwork"] = node_data["mgmtnetwork"][0]
             else:
                 node_data["mgmtnetwork"] = "unknown"
-            
+
             # Extract IP address from mgmt network field
             if '/' in node_data["mgmtnetwork"]:
                 node_data["ip"] = node_data["mgmtnetwork"].split('/')[0].strip()
             else:
                 node_data["ip"] = node_data["mgmtnetwork"].strip()
-            
+
             nodes.append(node_data)
             logger.debug(f"Added node: {node_data}")
-        
+
         logger.info(f"Parsed {len(nodes)} nodes from output")
         return nodes
-    
+
+    def get_node_model_and_role(self, node):
+        """
+        Get ND node model
+        Returns: (node_mode, node_role, error_message)
+
+        Args:
+            node: node IP
+
+        Returns:
+            tuple: (str, str, str) - (node_model, node_role, error_msg)
+        """
+        try:
+            logger.info(f"Checking node model and role on {node['name']}")
+            cmd = self.build_ssh_command(node["ip"], "acs system-config")
+            process = subprocess.Popen(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(timeout=30)
+
+            if process.returncode != 0:
+                error_msg = f"Failed to get system config: {stderr.decode('utf-8')}"
+                logger.error(f"{node['name']}: {error_msg}")
+                return "", error_msg
+
+            # Parse df output
+            sysconfig_output = stdout.decode("utf-8").strip()
+            logger.debug(f"{node['name']} system config:\n{sysconfig_output}")
+            model = None
+            role = None
+            for line in sysconfig_output.split("\n"):
+                # Skip header line and empty lines
+                if not line.strip():
+                    continue
+                if line.startswith("model:"):
+                    parts = line.split(":")
+                    if len(parts) != 2:
+                        continue
+                    model = parts[1]
+                if line.startswith("nodeRole:"):
+                    parts = line.split(":")
+                    if len(parts) != 2:
+                        continue
+                    role = parts[1]
+            if model is None or role is None:
+                return (
+                    "",
+                    "",
+                    f"failed to get node role or model role: {role}, model: {model}",
+                )
+            return model, role, ""
+
+        except subprocess.TimeoutExpired:
+            error_msg = "Command timeout while get system config"
+            logger.error(f"{node['name']}: {error_msg}")
+            return "", error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error while get system config: {str(e)}"
+            logger.exception(f"{node['name']}: {error_msg}")
+            return "", error_msg
+
+    def verify_node_storage(self, node):
+        """
+        Check if node has storage disks as per the hardware specification.
+        Returns: (is_healthy, error_message)
+
+        Args:
+            node: node IP
+
+        Returns:
+            tuple: (bool, str) - (is_healthy, error_msg)
+        """
+        model, role, error_msg = self.get_node_model_and_role(node)
+        if error_msg != "":
+            return False, error_msg
+        supported_models = [
+            m.casefold() for m in ["SE-NODE-G2", "ND-NODE-L4", "ND-NODE-L4T"]
+        ]
+
+        if model.strip().casefold() not in supported_models:
+            logger.info(f"Skipping node storage check for model {model}")
+            return True, ""
+
+        try:
+            logger.info(f"Checking node storage devices on {node['name']}")
+            cmd = self.build_ssh_command(node["ip"], "acs verify storage")
+            process = subprocess.Popen(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(timeout=30)
+            if process.returncode != 0:
+                error_msg = f"Failed to check storage devices: {stderr.decode('utf-8')}"
+                return False, error_msg
+            storage_output = stdout.decode("utf-8").strip()
+            logger.debug(f"{node['name']} storage output:\n{storage_output}")
+            failed = next(
+                (
+                    line
+                    for line in storage_output.splitlines()
+                    if line.startswith("Error:")
+                ),
+                None,
+            )
+            if failed:
+                error_msg = f"Storage device check failed. "
+                if "HDD" in failed:
+                    error_msg += "One or more HDD disks are missing"
+                if "SSD" in failed:
+                    error_msg += "One or more SSD disks are missing"
+                if "NVME" in failed:
+                    error_msg += "NVME disk is missing"
+
+                if role.strip().casefold() == "worker":
+                    error_msg += "\nYou can ignore this failure as its on secondary node but please note you MUST NOT use this node as primary node."
+                logger.error(f"{node['name']}: {error_msg}")
+                return False, error_msg
+
+            return True, ""
+
+        except subprocess.TimeoutExpired:
+            error_msg = "Command timeout while checking disk space"
+            logger.error(f"{node['name']}: {error_msg}")
+            return False, [], error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error checking disk space: {str(e)}"
+            logger.exception(f"{node['name']}: {error_msg}")
+            return False, [], error_msg
+
+
 class TechSupportManager:
     """Manages the selection and generation of tech supports"""
     
@@ -2758,14 +2886,14 @@ def display_check_results(nodes_to_monitor, script_manager):
 
 class MultipleFileManager:
     """Context manager for handling multiple file resources"""
-    
+
     def __init__(self):
         self.files = []
         self.paths = []
-        
+
     def __enter__(self):
         return self
-        
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Close all files when exiting context"""
         for f in self.files:
@@ -2774,22 +2902,22 @@ class MultipleFileManager:
                     f.close()
             except:
                 pass
-        
+
         return False  # Don't suppress exceptions
-        
+
     def open(self, path, mode='r'):
         """Open a file and track it for cleanup"""
         f = open(path, mode)
         self.files.append(f)
         self.paths.append(path)
         return f
-        
+
     def get_file(self, index):
         """Get file by index"""
         if 0 <= index < len(self.files):
             return self.files[index]
         return None
-    
+
 def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None):
     """Process all nodes with validation script using optimal resource-based concurrency"""
     # Record process start time
@@ -4153,7 +4281,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
 
 def main():
     """Main function for the ND validation script"""
-    
+
     # Set up logging first
     global logger
     logger = setup_logging()
@@ -4164,25 +4292,25 @@ def main():
         logger.warning("User interrupt (Ctrl+C) received. Initiating shutdown...")
         print("Please wait while we clean up active operations...")
         sys.exit(0)
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     logger.info("Signal handler registered for graceful shutdown")
 
     # Check environment dependencies first
     env_ready, missing_deps, install_instructions = check_environment()
-    
+
     if not env_ready:
         print("\n⚠️  Missing Dependencies  ⚠️")
         print("=" * 40)
         print("The following dependencies are required but not found:")
         for dep in missing_deps:
             print("  - {}".format(dep))
-        
+
         print("\nInstallation Instructions:")
         print("=" * 40)
         for instruction in install_instructions:
             print(instruction)
-        
+
         # Check if running in GitBash on Windows to provide specific guidance
         if platform.system() == "Windows" and "MINGW" in os.environ.get("MSYSTEM", ""):
             print("\nYou appear to be running in GitBash on Windows.")
@@ -4191,7 +4319,7 @@ def main():
             print("1. Use Windows Subsystem for Linux (WSL) instead")
             print("2. Run with --bash flag for limited Windows compatibility")
             print("   python nd-preupgrade-validation.py --bash")
-        
+
         return 1
 
     # Continue with main function execution
@@ -4201,12 +4329,12 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to console and preserve temp files")
     parser.add_argument("-b", "--bash", action="store_true", help="Run in GitBash/Windows mode (no sshpass)")
     parser.add_argument("--diagnose", action="store_true", help="Run diagnostic tests only (check Python interpreters and worker script execution)")
-    
+
     args = parser.parse_args()
-    
+
     print("Nexus Dashboard Pre-upgrade Validation Script")
     print(f"Running validation checks on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        
+
     # Get ND IP with validation
     nd_ip = args.ndip
     if not nd_ip:
@@ -4222,34 +4350,34 @@ def main():
             print(f"{FAIL} Invalid IP address format: {nd_ip}")
             print("Please enter a valid IPv4 address (e.g., 192.168.1.1)")
             return 1
-    
+
     # Get password
     password = args.password
     if not password:
         password = getpass.getpass("Enter password for rescue-user: ")
-    
+
     print()  # Add blank line
-    
+
     # Create ND node manager
     node_manager = NDNodeManager(nd_ip, "rescue-user", password)
-    
+
     try:
         # Connect to the Nexus Dashboard
         print(f"Connecting to Nexus Dashboard at {nd_ip}...")
         if not node_manager.connect():
             print(f"{FAIL} Failed to connect to Nexus Dashboard. Please check credentials and network connectivity.")
             return 1
-        
+
         # Get version information (connection already established, so legacy mode is set if needed)
         logger.info("Getting Nexus Dashboard version")
         try:
             import subprocess
-            
+
             # Use node_manager's SSH command builder which includes legacy mode if needed
             cmd = node_manager.build_ssh_command(nd_ip, "acs version") + " 2>/dev/null"
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
-            
+
             version = None
             if process.returncode == 0:
                 output = stdout.decode('utf-8')
@@ -4258,45 +4386,45 @@ def main():
                     version = match.group(1)
                     print(f"Successfully connected to Nexus Dashboard at {nd_ip}")
                     print(f"Nexus Dashboard version: {version}")
-            
+
         except Exception as e:
             logger.error(f"Error getting version: {str(e)}")
-        
+
         # Check for version 4.1.1x - if detected, switch to root user
         # This applies to all 4.1.1 variants (4.1.1, 4.1.1a, 4.1.1b, 4.1.1g, etc.)
         if version and version.startswith('4.1.1'):
             print(f"\n{WARNING} Detected ND version {version} - this version requires root access to run")
             print(f"\nExecuting 'acs debug-token' to retrieve the root password token...")
-            
+
             try:
                 # Execute acs debug-token command
                 token_cmd = node_manager.build_ssh_command(nd_ip, "acs debug-token") + " 2>/dev/null"
                 process = subprocess.Popen(token_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, stderr = process.communicate()
-                
+
                 if process.returncode == 0:
                     debug_token = stdout.decode('utf-8').strip()
                     # Remove any extra whitespace or newlines
                     debug_token = debug_token.split('\n')[-1].strip() if '\n' in debug_token else debug_token
-                    
+
                     if debug_token:
                         print(f"\nRoot password token: {debug_token}")
                         print(f"\nPlease enter the root password for Nexus Dashboard.")
-                        
+
                         # Prompt for root password
                         root_password = getpass.getpass("Enter root password: ")
-                        
+
                         if root_password:
                             # Update node_manager to use root credentials
                             node_manager.username = "root"
                             node_manager.password = root_password
-                            
+
                             # Test the root credentials
                             print(f"\nVerifying root credentials...")
                             test_cmd = node_manager.build_ssh_command(nd_ip, "echo 'Root access verified'") + " 2>/dev/null"
                             process = subprocess.Popen(test_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                             stdout, stderr = process.communicate()
-                            
+
                             if process.returncode == 0 and 'Root access verified' in stdout.decode('utf-8'):
                                 print(f"{PASS} Successfully switched to root user")
                                 print(f"All subsequent operations will use root credentials\n")
@@ -4316,40 +4444,40 @@ def main():
                     print(f"{FAIL} Failed to execute 'acs debug-token' command")
                     logger.error(f"acs debug-token failed: {stderr.decode('utf-8')}")
                     return 1
-                    
+
             except Exception as e:
                 print(f"{FAIL} Error retrieving debug token: {str(e)}")
                 logger.exception(f"Error in debug token retrieval")
                 return 1
-        
+
         # Discover nodes
         print("Discovering Nexus Dashboard nodes...")
         nodes = node_manager.discover_nodes()
-        
+
         if not nodes:
             print(f"{FAIL} No nodes found in the Nexus Dashboard cluster")
             return 1
-        
+
         print(f"Found {len(nodes)} Nexus Dashboard nodes")
         print("---------------------------------------")
         for node in nodes:
             print(f"\t{node['name']} ({node['ip']})")
         print("---------------------------------------")
-        
+
         # Check disk space on all nodes before proceeding
         print("\nChecking disk space on all nodes...")
         nodes_with_space_issues = []
         nodes_healthy = []
-        
+
         for node in nodes:
             # Skip inactive nodes
             if node.get('status', '').lower() != 'active':
                 logger.info(f"Skipping disk space check for inactive node {node['name']}")
                 continue
-            
+
             print(f"Checking {node['name']}...", end=" ")
             is_healthy, over_threshold_dirs, error_msg = node_manager.check_node_disk_space(node)
-            
+
             if is_healthy:
                 print(f"{PASS}")
                 nodes_healthy.append(node['name'])
@@ -4360,25 +4488,69 @@ def main():
                     'directories': over_threshold_dirs,
                     'error': error_msg
                 })
-        
+        # Check storage devices
+        print("\nChecking storage disks on all nodes...")
+        nodes_with_issues = []
+        nodes_healthy = []
+
+        for node in nodes:
+            # Skip inactive nodes
+            if node.get("status", "").lower() != "active":
+                logger.info(
+                    f"Skipping storage disks check for inactive node {node['name']}"
+                )
+                continue
+
+            print(f"Checking {node['name']}...", end=" ")
+            is_healthy, error_msg = node_manager.verify_node_storage(node)
+
+            if is_healthy:
+                print(f"{PASS}")
+                nodes_healthy.append(node["name"])
+            else:
+                print(f"{FAIL}")
+                nodes_with_issues.append(
+                    {
+                        "node": node,
+                        "error": error_msg,
+                    }
+                )
+        if nodes_with_issues:
+            while True:
+                choice = (
+                    input(
+                        f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): "
+                    )
+                    .lower()
+                    .strip()
+                )
+                if choice in ["y", "yes"]:
+                    print("Proceeding with validation...")
+                    break
+                elif choice in ["n", "no"]:
+                    print("Validation cancelled by user.")
+                    return 0
+                else:
+                    print("Please enter 'y' for yes or 'n' for no.")
+
         # For versions below 4.1.1, check for large eventmonitoring log files
         nodes_with_large_logs = []
         if version and not version.startswith('4.1.1'):
             print("\nChecking for large eventmonitoring log files...")
-            
+
             for node in nodes:
                 # Skip inactive nodes
                 if node.get('status', '').lower() != 'active':
                     logger.info(f"Skipping eventmonitoring check for inactive node {node['name']}")
                     continue
-                
+
                 # Skip nodes that already failed disk space check
                 if any(issue['node']['name'] == node['name'] for issue in nodes_with_space_issues):
                     continue
-                
+
                 print(f"Checking {node['name']}...", end=" ")
                 is_healthy, large_files, error_msg = node_manager.check_eventmonitoring_logs(node)
-                
+
                 if is_healthy:
                     print(f"{PASS}")
                 else:
@@ -4388,41 +4560,41 @@ def main():
                         'large_files': large_files,
                         'error': error_msg
                     })
-        
+
         # If any nodes have large log files, report them and exclude from validation
         if nodes_with_large_logs:
             print(f"\n{FAIL} Large Eventmonitoring Log Files Detected")
             print("="*80)
             print("The following nodes have eventmonitoring log files >= 1G:\n")
-            
+
             for issue in nodes_with_large_logs:
                 node = issue['node']
                 large_files = issue['large_files']
-                
+
                 print(f"{node['name']} ({node['ip']}):")
                 if large_files:
                     for file_size in large_files:
                         print(f"  • File size: {file_size}")
                 else:
                     print(f"  • {issue['error']}")
-                
+
                 print(f"  {WARNING} Tech support will not be collected for {node['name']}")
                 print(f"  Recommendation: Contact TAC to help resolve this issue before")
                 print(f"                  collecting tech support on {node['name']}\n")
-            
+
             # Filter out nodes with large log files from the nodes list
             failed_node_names = [issue['node']['name'] for issue in nodes_with_large_logs]
             nodes = [node for node in nodes if node['name'] not in failed_node_names]
-            
+
             if not nodes:
                 print(f"\n{FAIL} All nodes have large eventmonitoring log files. Cannot proceed with validation.")
                 print("Please resolve the eventmonitoring log issues and rerun the script.\n")
                 return 1
-            
+
             print(f"{WARNING} Proceeding with validation on {len(nodes)} node(s) that passed the eventmonitoring check:")
             for node in nodes:
                 print(f"  - {node['name']} ({node['ip']})")
-            
+
             # Ask user for confirmation
             while True:
                 choice = input(f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): ").lower().strip()
@@ -4437,41 +4609,41 @@ def main():
                 else:
                     print("Please enter 'y' for yes or 'n' for no.")
             print()
-        
+
         # If any nodes have space issues, report them and exclude from validation
         if nodes_with_space_issues:
             print(f"\n{FAIL} Disk Space Issues Detected")
             print("="*80)
             print("The following nodes have directories with usage >= 80%:\n")
-            
+
             for issue in nodes_with_space_issues:
                 node = issue['node']
                 directories = issue['directories']
-                
+
                 print(f"{node['name']} ({node['ip']}):")
                 if directories:
                     for mount_point, usage_pct in directories:
                         print(f"  • {mount_point}: {usage_pct:.0f}% full")
                 else:
                     print(f"  • {issue['error']}")
-                
+
                 print(f"  {WARNING} Script will not run on {node['name']}")
                 print(f"  Recommendation: Contact TAC to help clear these directories before")
                 print(f"                  rerunning the script against {node['name']}\n")
-            
+
             # Filter out nodes with space issues from the nodes list
             failed_node_names = [issue['node']['name'] for issue in nodes_with_space_issues]
             nodes = [node for node in nodes if node['name'] not in failed_node_names]
-            
+
             if not nodes:
                 print(f"\n{FAIL} All nodes have disk space issues. Cannot proceed with validation.")
                 print("Please resolve the disk space issues and rerun the script.\n")
                 return 1
-            
+
             print(f"{WARNING} Proceeding with validation on {len(nodes)} node(s) that passed disk space check:")
             for node in nodes:
                 print(f"  - {node['name']} ({node['ip']})")
-            
+
             # Ask user for confirmation
             while True:
                 choice = input(f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): ").lower().strip()
@@ -4486,11 +4658,11 @@ def main():
                 else:
                     print("Please enter 'y' for yes or 'n' for no.")
             print()
-        
+
         # Check for inactive nodes and get user confirmation
         inactive_nodes = [node for node in nodes if node.get('status', '').lower() != 'active']
         active_nodes = [node for node in nodes if node.get('status', '').lower() == 'active']
-        
+
         if inactive_nodes:
             print(f"\n{WARNING} Inactive Nodes Detected")
             print("="*50)
@@ -4498,18 +4670,18 @@ def main():
             for node in inactive_nodes:
                 status = node.get('status', 'Unknown')
                 print(f"  - {node['name']} ({node['ip']}) - Status: {status}")
-            
+
             print(f"\nActive nodes available for validation: {len(active_nodes)}")
             for node in active_nodes:
                 print(f"  - {node['name']} ({node['ip']})")
-            
+
             if not active_nodes:
                 print(f"\n{FAIL} No active nodes available for validation. Cannot proceed.")
                 return 1
-            
+
             print(f"\n{WARNING} Inactive nodes will be skipped during validation operations.")
             print("Tech support operations and validations will only run on active nodes.")
-            
+
             while True:
                 choice = input(f"\nDo you want to continue with validation on {len(active_nodes)} active node(s)? (y/n): ").lower().strip()
                 if choice in ['y', 'yes']:
@@ -4527,18 +4699,18 @@ def main():
             print(f"\n{PASS} All {len(nodes)} nodes are active and have healthy disk space (<80% usage).")
             print(f"{PASS} All nodes are ready for validation.")
             active_nodes = nodes
-        
+
         # Run diagnostic mode if requested
         if args.diagnose:
             print("\n" + "="*80)
             print("  DIAGNOSTIC MODE")
             print("="*80)
             return run_diagnostic_mode(node_manager, nodes)
-        
+
         # Check system resources for optimal concurrency
         resources = check_system_resources()
         max_concurrent = resources.get("recommended_parallelism", 2)
-        
+
         # Only display resource info when more than one node is detected
         if len(nodes) > 1:
             print(f"\nSystem resource assessment:")
@@ -4549,24 +4721,24 @@ def main():
             if len(nodes) > max_concurrent:
                 print(f"  Note: Nodes will be processed in {math.ceil(len(nodes)/max_concurrent)} batches for optimal performance")
             print()
-        
+
         # Normal mode - ask about tech support generation
         print("Do you want to generate new tech supports for analysis?")
         print("1. Generate new tech supports for analysis")
         print("2. Use existing tech supports on all nodes")
-        
+
         tech_choice = input("\nEnter your choice (1/2): ")
-        
+
         # Store skipped nodes information for final report
         skipped_nodes_info = {
             'disk_space_issues': nodes_with_space_issues if nodes_with_space_issues else [],
             'large_log_files': nodes_with_large_logs if nodes_with_large_logs else []
         }
-        
+
         # Process all nodes - resource-optimized
         # Save the results to ensure we can access debug_data after the report is generated
         results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info)
-        
+
         # Display debug mode warning at the very end, after the report
         if args.debug and results and "_debug_info" in results:
             # Get debug info from results
@@ -4576,9 +4748,9 @@ def main():
                 warning_message = f"\n{WARNING} Debug mode enabled: Temporary files were NOT removed from nodes."
                 warning_message += f"\nTemporary files remain in {debug_info['base_dir']} on each node for debugging purposes."
                 print(warning_message)
-        
+
         return 0 if results else 1
-        
+
     except Exception as e:
         print(f"{FAIL} An error occurred: {str(e)}")
         logger.exception("Unhandled exception in main")
@@ -4720,4 +4892,3 @@ def run_diagnostic_mode(node_manager, nodes):
 
 if __name__ == "__main__":
     sys.exit(main())
-    
