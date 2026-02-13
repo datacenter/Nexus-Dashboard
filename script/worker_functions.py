@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.13 (Jan 21, 2026)
+Version: 1.0.14 (Feb 13, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -1268,6 +1268,11 @@ def check_disk_space(tech_file):
                     if mount_point.startswith('/tmp/isomount'):
                         continue
                     
+                    # Skip /data/services/oci_repo/boot-disk - used for upgrade ISO mapping
+                    # High usage is expected when ISOs are mapped for subsequent upgrades
+                    if mount_point.startswith('/data/services/oci_repo/boot-disk'):
+                        continue
+                    
                     try:
                         use_percent_int = int(use_percent)
                         
@@ -1340,6 +1345,16 @@ def check_disk_space(tech_file):
                 if use_percent is None or mount_point is None:
                     continue
                 
+                # Skip /tmp/isomount* directories - these are temporary ISO mount points
+                # 100% usage is normal when an upgrade ISO is mounted
+                if mount_point.startswith('/tmp/isomount'):
+                    continue
+                
+                # Skip /data/services/oci_repo/boot-disk - used for upgrade ISO mapping
+                # High usage is expected when ISOs are mapped for subsequent upgrades
+                if mount_point.startswith('/data/services/oci_repo/boot-disk'):
+                    continue
+                
                 try:
                     use_percent_int = int(use_percent)
                     
@@ -1395,6 +1410,11 @@ def check_disk_space(tech_file):
                 # Skip /tmp/isomount* directories - these are temporary ISO mount points
                 # 100% usage is normal when an upgrade ISO is mounted
                 if mount_point.startswith('/tmp/isomount'):
+                    continue
+                
+                # Skip /data/services/oci_repo/boot-disk - used for upgrade ISO mapping
+                # High usage is expected when ISOs are mapped for subsequent upgrades
+                if mount_point.startswith('/data/services/oci_repo/boot-disk'):
                     continue
                 
                 try:
@@ -3527,6 +3547,8 @@ def check_atom0_nvme(tech_file):
     # Check for pvdisplay first (if both exist, prefer this one per requirement 6c)
     pvdisplay_files = cache.find_files("coreos-diag/storage/pvdisplay")
     pvs_files = cache.find_files("storage-diag/pvs")
+    # For ND 3.0.x and earlier, check for lvm-pvs at root level
+    lvm_pvs_files = cache.find_files("lvm-pvs")
     
     if pvdisplay_files:
         pvs_file_to_check = pvdisplay_files[0]
@@ -3534,8 +3556,11 @@ def check_atom0_nvme(tech_file):
     elif pvs_files:
         pvs_file_to_check = pvs_files[0]
         print("Using pvs file: {0}".format(os.path.basename(pvs_file_to_check)))
+    elif lvm_pvs_files:
+        pvs_file_to_check = lvm_pvs_files[0]
+        print("Using lvm-pvs file (ND 3.0.x format): {0}".format(os.path.basename(pvs_file_to_check)))
     else:
-        print("[WARNING] Neither pvdisplay nor pvs file found in tech support")
+        print("[WARNING] No PVS file found in tech support (checked: pvdisplay, pvs, lvm-pvs)")
         return CheckResult.set_warning(
             "atom0_nvme_check",
             "PVS file not found in the tech support to confirm atom0_nvme presence",
