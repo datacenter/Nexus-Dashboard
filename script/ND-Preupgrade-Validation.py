@@ -3498,25 +3498,37 @@ class APICheckResult:
 
 def get_version_tuple(version_string):
     """
-    Parse version string into (major, minor, patch) tuple.
-    Handles build suffixes like 'e' and 'f'.
+    Parse version string into (major, minor, patch, suffix) tuple.
+    Handles build suffixes like 'e', 'f', 'm', etc.
     
     Args:
-        version_string: Version string like "3.2.1e"
+        version_string: Version string like "3.2.1e" or "3.2.2m"
     
     Returns:
-        tuple: (major, minor, patch) as integers
+        tuple: (major, minor, patch, suffix) where major/minor/patch are integers and suffix is string
+               Examples: "3.2.2m" -> (3, 2, 2, 'm')
+                        "3.2.1" -> (3, 2, 1, '')
     """
     try:
-        # Remove build suffixes (e.g., 'f', 'e')
-        clean_version = version_string.replace('f', '').replace('e', '')
-        parts = clean_version.split('.')
+        # Split by dots first
+        parts = version_string.split('.')
         major = int(parts[0]) if len(parts) > 0 else 0
         minor = int(parts[1]) if len(parts) > 1 else 0
-        patch = int(parts[2]) if len(parts) > 2 else 0
-        return (major, minor, patch)
+        
+        # For patch, extract both numeric part and alphabetic suffix
+        patch = 0
+        suffix = ''
+        if len(parts) > 2:
+            patch_str = parts[2]
+            # Split into numeric and alphabetic parts
+            patch_numeric = ''.join(c for c in patch_str if c.isdigit())
+            patch_suffix = ''.join(c for c in patch_str if c.isalpha())
+            patch = int(patch_numeric) if patch_numeric else 0
+            suffix = patch_suffix
+            
+        return (major, minor, patch, suffix)
     except (ValueError, IndexError):
-        return (0, 0, 0)
+        return (0, 0, 0, '')
 
 ###############################################################
 # API Client Infrastructure
@@ -3773,12 +3785,19 @@ def check_telemetry_inband_epg(api_client, version):
     logger = logging.getLogger(__name__)
     
     # Check version applicability - only applies to 3.2.x (not 3.1.x or 4.0+)
-    major, minor, _ = get_version_tuple(version)
+    major, minor, patch, suffix = get_version_tuple(version)
     if major != 3 or minor != 2:
         return APICheckResult.set_pass(
             "telemetry_inband_epg",
             f"ND version {version} != 3.2, check not applicable"
         )
+    
+    # Example of suffix-based filtering (if needed in future):
+    # if suffix and suffix < 'm':  # Only run on builds 'm' and later
+    #     return APICheckResult.set_pass(
+    #         "telemetry_inband_epg",
+    #         f"ND version {version} build suffix '{suffix}' < 'm', check not applicable"
+    #     )
     
     # Version is 3.2.x - proceed with API check
     logger.info(f"[API] ND version {version} is 3.2.x - running Telemetry Inband EPG API check")
@@ -3814,6 +3833,7 @@ def check_telemetry_inband_epg(api_client, version):
         
         # Step 4: Check ACI sites for blank inbandEpgDN when connectionType is INBAND
         problematic_sites = []
+        aci_sites_found = []
         
         if isinstance(ndsites_data, list):
             for site in ndsites_data:
@@ -3829,7 +3849,11 @@ def check_telemetry_inband_epg(api_client, version):
                     # Check if this site has INBAND connection type in fabric config
                     connection_type = fabric_sites.get(site_name, "")
                     
-                    logger.info(f"[API] Checking ACI site '{site_name}': connectionType={connection_type}, inbandEpgDN='{inband_epg_dn}'")
+                    # Track that we found an ACI site
+                    aci_sites_found.append(site_name)
+                    
+                    # Log details for debugging
+                    logger.debug(f"[API] ACI site '{site_name}': connectionType={connection_type}, inbandEpgDN='{inband_epg_dn}'")
                     
                     # Only flag as problematic if connectionType is INBAND and inbandEpgDN is blank
                     if connection_type == "INBAND" and not inband_epg_dn:
@@ -3844,6 +3868,12 @@ def check_telemetry_inband_epg(api_client, version):
                 explanation="Due to a software defect when re-registering an ACI fabric in NDI, the Inband EPG can become blank.\n  This state will cause Nexus Dashboard upgrade to fail.",
                 recommendation="Contact Cisco TAC for assistance in remediating the issue prior to upgrade.",
                 reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            )
+        elif not aci_sites_found:
+            logger.info("[API] No ACI sites to check")
+            return APICheckResult.set_pass(
+                "telemetry_inband_epg",
+                "No ACI sites to check"
             )
         else:
             logger.info("[API] All ACI sites with INBAND connection have valid inbandEpgDN")
