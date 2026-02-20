@@ -38,20 +38,21 @@ Note: The cloning instructions differ slightly from the video now that the repo 
 | 5 | Subnet check | Verify Mgmt and Data interfaces are on different subnets | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-311/nd-prerequisites-platform-31x.html#concept_fdf_fxg_4mb) |
 | 6 | Persistent IP check | Verify at lest 5 Persistent IP address are configured in data-external-services | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc) |
 | 7 | Disk space | Verify all directories are under 70% utilization | |
-| 8 | Pod status | Verify all Pods and Services are in a healthy state | |
-| 9 | System health | Verify all nodes are healthy using 'acs health' command | |
-| 10 | Telemetry inband EPG check | Verify ACI NDI sites have inband EPG populated | [CSCws23607](https://bst.cisco.com/bugsearch/bug/CSCws23607) |
-| 11 | NXOS Discovery Service | Verify cisco-ndfc k8 App is not stuck in Disabling | [CSCwm97680](https://bst.cisco.com/bugsearch/bug/CSCwm97680) |
-| 12 | Backup failure check | Verify latest backup is not in Failed or InProgress state | [CSCwq57968](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwq57968), [CSCwm96512](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwm96512) |
-| 13 | Nameserver duplicate check | Verify no duplicate nameservers exist in acs_system_config | |
-| 14 | Legacy NDI ElasticSearch | Verify legacy NDI ElasticSearch LV does not exist for non-NDI deployments | [CSCwr43810](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr43810) |
-| 15 | NTP authentication check | Verify no NTP servers have authentication enabled | [CSCwr97181](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr97181) |
-| 16 | Certificate check | Verify no certificates have non-alphanumeric characters | [CSCwm35992](https://bst.cisco.com/bugsearch/bug/CSCwm35992) |
-| 17 | ISO check | Verify multiple ISOs aren't found in boothook | [CSCwn94394](https://bst.cisco.com/bugsearch/bug/CSCwn94394) |
-| 18 | Lvm Pvs check | Verify no empty ElasticSearch PVs are found | [CSCwe91228](https://bst.cisco.com/bugsearch/bug/CSCwe91228) |
-| 19 | atom0 NVME check | Verify no NVME drive hardware failures are present in Physical node setups | |
-| 20 | atom0 vg check | Verify there is more than 50% free space in atom0 virtual group | [CSCwr43515](https://bst.cisco.com/bugsearch/bug/CSCwr43515) |
-| 21 | vND App Large check | Verify vND SE-VIRTUAL-APP is not using Large Profile | [CSCws77374](https://bst.cisco.com/bugsearch/bug/CSCws77374), [Documentation 1](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc), [Documentation 2](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-321/nd-deploy-esx-32x.html#concept_zkv_y2g_mmb) |
+| 8 | Storage device check | Verify all storage devices exist | |
+| 9 | Pod status | Verify all Pods and Services are in a healthy state | |
+| 10 | System health | Verify all nodes are healthy using 'acs health' command | |
+| 11 | Telemetry inband EPG check | Verify ACI NDI sites have inband EPG populated | [CSCws23607](https://bst.cisco.com/bugsearch/bug/CSCws23607) |
+| 12 | NXOS Discovery Service | Verify cisco-ndfc k8 App is not stuck in Disabling | [CSCwm97680](https://bst.cisco.com/bugsearch/bug/CSCwm97680) |
+| 13 | Backup failure check | Verify latest backup is not in Failed or InProgress state | [CSCwq57968](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwq57968), [CSCwm96512](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwm96512) |
+| 14 | Nameserver duplicate check | Verify no duplicate nameservers exist in acs_system_config | |
+| 15 | Legacy NDI ElasticSearch | Verify legacy NDI ElasticSearch LV does not exist for non-NDI deployments | [CSCwr43810](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr43810) |
+| 16 | NTP authentication check | Verify no NTP servers have authentication enabled | [CSCwr97181](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr97181) |
+| 17 | Certificate check | Verify no certificates have non-alphanumeric characters | [CSCwm35992](https://bst.cisco.com/bugsearch/bug/CSCwm35992) |
+| 18 | ISO check | Verify multiple ISOs aren't found in boothook | [CSCwn94394](https://bst.cisco.com/bugsearch/bug/CSCwn94394) |
+| 19 | Lvm Pvs check | Verify no empty ElasticSearch PVs are found | [CSCwe91228](https://bst.cisco.com/bugsearch/bug/CSCwe91228) |
+| 20 | atom0 NVME check | Verify no NVME drive hardware failures are present in Physical node setups | |
+| 21 | atom0 vg check | Verify there is more than 50% free space in atom0 virtual group | [CSCwr43515](https://bst.cisco.com/bugsearch/bug/CSCwr43515) |
+| 22 | vND App Large check | Verify vND SE-VIRTUAL-APP is not using Large Profile | [CSCws77374](https://bst.cisco.com/bugsearch/bug/CSCws77374), [Documentation 1](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc), [Documentation 2](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-321/nd-deploy-esx-32x.html#concept_zkv_y2g_mmb) |
 
 ## Dependencies and Installation
 
@@ -113,29 +114,29 @@ Resolving deltas: 100% (4/4), done.
 
 user@host:~$ ls -lh
 total 12K
-drwxr-xr-x 5 user user 4.0K Jan 21 22:59 Nexus-Dashboard
+drwxr-xr-x 5 user user 4.0K Feb 19 22:59 Nexus-Dashboard
 
 user@host:~$ ls -lh Nexus-Dashboard/
 total 12K
--rw-r--r-- 1 user user  365 Jan 21 22:59 README.md
-drwxr-xr-x 2 user user 4.0K Jan 21 22:59 plugin
-drwxr-xr-x 2 user user 4.0K Jan 21 22:59 script
+-rw-r--r-- 1 user user  365 Feb 19 22:59 README.md
+drwxr-xr-x 2 user user 4.0K Feb 19 22:59 plugin
+drwxr-xr-x 2 user user 4.0K Feb 19 22:59 script
 
 ## Step 2: Navigate to the /script directory
 
 user@host:~$ cd Nexus-Dashboard/script/
 user@host:~/Nexus-Dashboard/script$ ls -lh
 total 456K
--rw-r--r-- 1 user user 204K Jan 21 22:59 ND-Preupgrade-Validation.py
--rw-r--r-- 1 user user  21K Jan 21 22:59 README.md
--rw-r--r-- 1 user user 2.9K Jan 21 22:59 requirements.txt
--rw-r--r-- 1 user user 224K Jan 21 22:59 worker_functions.py
+-rw-r--r-- 1 user user 204K Feb 19 22:59 ND-Preupgrade-Validation.py
+-rw-r--r-- 1 user user  21K Feb 19 22:59 README.md
+-rw-r--r-- 1 user user 2.9K Feb 19 22:59 requirements.txt
+-rw-r--r-- 1 user user 224K Feb 19 22:59 worker_functions.py
 
 ## Step 3: Run the ND-Preupgrade-Validation.py script
 
 user@host:~/Nexus-Dashboard/script$ python3 ND-Preupgrade-Validation.py
 Nexus Dashboard Pre-upgrade Validation Script
-Running validation checks on 2026-01-21 22:59:51
+Running validation checks on 2026-02-19 18:46:10
 Enter Nexus Dashboard IP address: 1.1.1.1
 Enter password for rescue-user:
 
@@ -155,6 +156,11 @@ Checking ND1... PASS
 Checking ND2... PASS
 Checking ND3... PASS
 
+Checking storage disks on all nodes...
+Checking ND1... PASS
+Checking ND2... PASS
+Checking ND3... PASS
+
 Checking for large eventmonitoring log files...
 Checking ND1... PASS
 Checking ND2... PASS
@@ -166,7 +172,7 @@ PASS All nodes are ready for validation.
 System resource assessment:
   CPU cores: 32
   Memory: 376.16 GB
-  Current load: 4.1
+  Current load: 3.51
   Recommended concurrent nodes: 7
 
 Do you want to generate new tech supports for analysis?
@@ -180,31 +186,31 @@ Enter your choice (1/2): 1
   Tech Support Selection/Generation
 ================================================================================
 Generating tech supports for all nodes in parallel.
-Starting tech support collection on ND3. This may take several minutes...
-Starting tech support collection on ND1. This may take several minutes...
 Starting tech support collection on ND2. This may take several minutes...
-Tech support collection started successfully on ND3
+Starting tech support collection on ND1. This may take several minutes...
+Starting tech support collection on ND3. This may take several minutes...
 Tech support collection started successfully on ND1
 Tech support collection started successfully on ND2
+Tech support collection started successfully on ND3
 Found tech support file being generated on ND3, monitoring for completion...
-Found tech support file being generated on ND1, monitoring for completion...
 Found tech support file being generated on ND2, monitoring for completion...
-Tech support still generating on ND3: 1.19 GB (+650.4 MB)...
-Tech support still generating on ND1: 1.32 GB (+806.0 MB)...
-Tech support still generating on ND2: 1.61 GB (+1199.0 MB)...
+Found tech support file being generated on ND1, monitoring for completion...
+Tech support still generating on ND3: 1.28 GB (+815.7 MB)...
+Tech support still generating on ND1: 1.39 GB (+967.7 MB)...
+Tech support still generating on ND2: 1.58 GB (+1181.8 MB)...
 File size stable on ND3, performing verification checks...
 File size stable on ND1, performing verification checks...
-Tech support still generating on ND2: 2.20 GB (+601.0 MB)...
-Tech support generation confirmed complete on ND1
+Tech support still generating on ND2: 2.24 GB (+683.0 MB)...
 Tech support generation confirmed complete on ND3
-PASS Tech support generated on ND1: /techsupport/2026-01-22T04-02-23Z-system-ts-ND1.tgz
-PASS Tech support generated on ND3: /techsupport/2026-01-22T04-02-22Z-system-ts-ND3.tgz
-Generated tech support on ND3: 2026-01-22T04-02-22Z-system-ts-ND3.tgz
-Generated tech support on ND1: 2026-01-22T04-02-23Z-system-ts-ND1.tgz
+PASS Tech support generated on ND3: /techsupport/2026-02-19T23-53-14Z-system-ts-ND3.tgz
+Tech support generation confirmed complete on ND1
+PASS Tech support generated on ND1: /techsupport/2026-02-19T23-53-16Z-system-ts-ND1.tgz
+Generated tech support on ND3: 2026-02-19T23-53-14Z-system-ts-ND3.tgz
+Generated tech support on ND1: 2026-02-19T23-53-16Z-system-ts-ND1.tgz
 File size stable on ND2, performing verification checks...
 Tech support generation confirmed complete on ND2
-PASS Tech support generated on ND2: /techsupport/2026-01-22T04-02-26Z-system-ts-ND2.tgz
-Generated tech support on ND2: 2026-01-22T04-02-26Z-system-ts-ND2.tgz
+PASS Tech support generated on ND2: /techsupport/2026-02-19T23-53-17Z-system-ts-ND2.tgz
+Generated tech support on ND2: 2026-02-19T23-53-17Z-system-ts-ND2.tgz
 
 
 ================================================================================
@@ -214,11 +220,11 @@ Checking /tmp disk space on all nodes before extraction...
 This validation ensures sufficient space for tech support extraction (70% threshold).
 
 Checking space on ND1... PASS
-  Tech support: 1.32 GB | Current: 1.0% | Projected: 25.8%
+  Tech support: 1.39 GB | Current: 1.0% | Projected: 27.2%
 Checking space on ND2... PASS
-  Tech support: 2.20 GB | Current: 0.0% | Projected: 41.3%
+  Tech support: 2.24 GB | Current: 1.0% | Projected: 43.1%
 Checking space on ND3... PASS
-  Tech support: 1.19 GB | Current: 16.0% | Projected: 38.4%
+  Tech support: 1.28 GB | Current: 16.0% | Projected: 40.1%
 
 PASS All nodes passed /tmp space validation!
 Proceeding with worker script deployment...
@@ -263,65 +269,64 @@ PASS Cleaned up temporary files on ND3
 ================================================================================
   Pre-upgrade Validation Report
 ================================================================================
-Total validation time: 3 min 56 sec
-Report generated on: 2026-01-21 23:03:59
+Total validation time: 4 min 2 sec
+Report generated on: 2026-02-19 18:50:26
 
-[Check  1/21] Techsupport...                                                      PASS
-[Check  2/21] Version Check...                                                    PASS
-[Check  3/21] Node Status...                                                      PASS
-[Check  4/21] Ping Check...                                                       PASS
-[Check  5/21] Subnet Check...                                                     PASS
-[Check  6/21] Persistent Ip Check...                                              PASS
-[Check  7/21] Disk Space...                                                       PASS
-[Check  8/21] Pod Status...                                                       PASS
-[Check  9/21] System Health...                                                    PASS
-[Check 10/21] Telemetry Inband Epg Check...                                       PASS
-[Check 11/21] Nxos Discovery Service...                                           PASS
-[Check 12/21] Backup Failure Check...                                             PASS
-[Check 13/21] Nameserver Duplicate Check...                                       PASS
-[Check 14/21] Legacy Ndi Elasticsearch Check...                                   PASS
-[Check 15/21] Ntp Auth Check...                                                   PASS
-[Check 16/21] Certificate Check...                                                PASS
-[Check 17/21] Iso Check...                                                        PASS
-[Check 18/21] Lvm Pvs Check...                                                    PASS
-[Check 19/21] Atom0 Nvme Check...                                                 PASS
-[Check 20/21] Atom0 Vg Check...                                                   PASS
-[Check 21/21] Vnd App Large Check...                                              PASS
+[Check  1/22] Techsupport...                                                      PASS
+[Check  2/22] Version Check...                                                    PASS
+[Check  3/22] Node Status...                                                      PASS
+[Check  4/22] Ping Check...                                                       PASS
+[Check  5/22] Subnet Check...                                                     PASS
+[Check  6/22] Persistent Ip Check...                                              PASS
+[Check  7/22] Disk Space...                                                       PASS
+[Check  8/22] Storage Device Check...                                             PASS
+[Check  9/22] Pod Status...                                                       PASS
+[Check 10/22] System Health...                                                    PASS
+[Check 11/22] Telemetry Inband Epg Check...                                       PASS
+[Check 12/22] Nxos Discovery Service...                                           PASS
+[Check 13/22] Backup Failure Check...                                             PASS
+[Check 14/22] Nameserver Duplicate Check...                                       PASS
+[Check 15/22] Legacy Ndi Elasticsearch Check...                                   PASS
+[Check 16/22] Ntp Auth Check...                                                   PASS
+[Check 17/22] Certificate Check...                                                PASS
+[Check 18/22] Iso Check...                                                        PASS
+[Check 19/22] Lvm Pvs Check...                                                    PASS
+[Check 20/22] Atom0 Nvme Check...                                                 PASS
+[Check 21/22] Atom0 Vg Check...                                                   PASS
+[Check 22/22] Vnd App Large Check...                                              PASS
 
 
 ================================================================================
 REPORT SUMMARY
 ================================================================================
 
-PASS                         : 21
+PASS                         : 22
 WARNING - ATTENTION REQUIRED : 0
 FAIL - UPGRADE FAILURE!!     : 0
 
 Detailed results are available in /home/user/Nexus-Dashboard/script/final-results/
 
-Results Bundle: /home/user/Nexus-Dashboard/script/nd-preupgrade-validation-results_2026-01-17T14-46-01.tgz
+Results Bundle: /home/user/Nexus-Dashboard/script/nd-preupgrade-validation-results_2026-02-19T18-50-26.tgz
 
-user@host:~/Nexus-Dashboard/script$ ls -lh
-total 516K
-total 532K
-drwxr-xr-x. 2 user user  236 Jan 21 23:03 final-results
--rw-r--r--. 1 user user 228K Jan 21 22:59 ND-Preupgrade-Validation.py
--rw-r--r--. 1 user user  21K Jan 21 22:59 README.md
--rw-r--r--. 1 user user  14K Jan 21 23:03 nd-preupgrade-validation-results_2026-01-21T23-03-59.tgz
--rw-r--r--. 1 user user  69K Jan 21 23:03 nd_validation_debug.log
--rw-r--r--. 1 user user 215K Jan 21 22:59 worker_functions.py
+user@host:~/Nexus-Dashboard/script$  ls -lh
+total 564K
+drwxr-xr-x. 2 root root  236 Feb 19 18:50 final-results
+-rw-r--r--. 1 root root 240K Feb 19 18:45 ND-Preupgrade-Validation.py
+-rw-r--r--. 1 root root  16K Feb 19 18:50 nd-preupgrade-validation-results_2026-02-19T18-50-26.tgz
+-rw-r--r--. 1 root root  83K Feb 19 18:50 nd_validation_debug.log
+-rw-r--r--. 1 root root 222K Feb 19 18:46 worker_functions.py
 
-user@host:~/Nexus-Dashboard/script$ ls -lh final-results/
-total 140K
--rw-r--r--. 1 user user  14K Jan 21 23:03 ND1_output.log
--rw-r--r--. 1 user user 2.8K Jan 21 23:03 ND1_results.json
--rw-r--r--. 1 user user  14K Jan 21 23:03 ND2_output.log
--rw-r--r--. 1 user user 2.8K Jan 21 23:03 ND2_results.json
--rw-r--r--. 1 user user  14K Jan 21 23:03 ND3_output.log
--rw-r--r--. 1 user user 2.8K Jan 21 23:03 ND3_results.json
--rw-r--r--. 1 user user  68K Jan 21 23:03 nd_validation_debug.log
--rw-r--r--. 1 user user 7.5K Jan 21 23:03 validation_details.json
--rw-r--r--. 1 user user 2.3K Jan 21 23:03 validation_summary.txt
+user@host:~/Nexus-Dashboard/script$  ls -lh final-results/
+total 156K
+-rw-r--r--. 1 root root  15K Feb 19 18:50 ND1_output.log
+-rw-r--r--. 1 root root 2.8K Feb 19 18:50 ND1_results.json
+-rw-r--r--. 1 root root  15K Feb 19 18:50 ND2_output.log
+-rw-r--r--. 1 root root 2.8K Feb 19 18:50 ND2_results.json
+-rw-r--r--. 1 root root  15K Feb 19 18:50 ND3_output.log
+-rw-r--r--. 1 root root 2.8K Feb 19 18:50 ND3_results.json
+-rw-r--r--. 1 root root  83K Feb 19 18:50 nd_validation_debug.log
+-rw-r--r--. 1 root root 7.8K Feb 19 18:50 validation_details.json
+-rw-r--r--. 1 root root 2.4K Feb 19 18:50 validation_summary.txt
 ```
 
 ## Support
