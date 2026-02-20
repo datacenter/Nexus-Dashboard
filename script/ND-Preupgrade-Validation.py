@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.14 (Feb 13, 2026)
+Version: 1.0.15 (Feb 19, 2026)
 """
 
 import re
@@ -2918,10 +2918,15 @@ class MultipleFileManager:
             return self.files[index]
         return None
 
-def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None):
+def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None):
     """Process all nodes with validation script using optimal resource-based concurrency"""
     # Record process start time
     process_start_time = time.time()
+    
+    # Initialize storage_check_result if not provided
+    if storage_check_result is None:
+        storage_check_result = {"status": "NOTRUN"}
+    logger.debug(f"[Storage] process_all_nodes() received storage_check_result: {storage_check_result}")
     
     # Check system resources to determine optimal concurrency
     resources = check_system_resources()
@@ -3170,13 +3175,35 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             logger.info(f"[API] Initializing ND API client for checks")
             api_client = NDAPIClient(node_manager.nd_ip, "admin", admin_password)
             
-            if not api_client.authenticate():
-                logger.error("[API] Failed to authenticate API client")
+            # Authenticate and get detailed error information
+            auth_success, error_type, error_message = api_client.authenticate()
+            
+            if not auth_success:
+                logger.error(f"[API] Failed to authenticate API client: {error_type} - {error_message}")
+                
+                # Provide specific error messages based on error type
+                if error_type == 'AUTH_FAILURE':
+                    details = f"Authentication failed: {error_message}"
+                    explanation = "Invalid credentials or authentication rejected by ND API"
+                    recommendation = "Verify the admin username and password are correct"
+                elif error_type == 'CONNECTION_FAILURE':
+                    details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
+                    explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
+                    recommendation = "Verify port 443 on ND is accessible from device running the script. Check network connectivity and firewall rules."
+                elif error_type == 'TIMEOUT':
+                    details = f"Connection timeout to {node_manager.nd_ip}:443"
+                    explanation = "Connection attempt to ND management interface timed out"
+                    recommendation = "Check network connectivity, firewall rules, and ND system health"
+                else:
+                    details = f"Failed to authenticate to ND API: {error_message}"
+                    explanation = "Could not authenticate to ND management interface"
+                    recommendation = "Verify admin credentials and API accessibility. Check debug log for details."
+                
                 result = APICheckResult.set_warning(
                     "telemetry_inband_epg",
-                    "Failed to authenticate to ND API",
-                    explanation="Could not authenticate to ND management interface",
-                    recommendation="Verify admin credentials and API accessibility"
+                    details,
+                    explanation=explanation,
+                    recommendation=recommendation
                 )
                 api_check_result.update(result)
                 return
@@ -3371,6 +3398,31 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
         elif api_check_result["status"] == "WARNING" and overall_status != "FAIL":
             overall_status = "WARNING"
     
+    # Add Storage check result to all_results if it was run
+    logger.debug(f"[Storage] Checking storage_check_result for merge: status={storage_check_result.get('status', 'UNKNOWN')}, details={storage_check_result.get('details', [])}")
+    if storage_check_result["status"] != "NOTRUN":
+        logger.info(f"[Storage] Adding storage check results to all_results with status: {storage_check_result['status']}")
+        # Add as a special "storage_checks" node in results
+        all_results["_storage_checks"] = {
+            "node_name": "Storage Device Checks",
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "checks": {
+                "storage_device_check": {
+                    "status": storage_check_result["status"],
+                    "details": storage_check_result["details"],
+                    "explanation": storage_check_result.get("explanation"),
+                    "recommendation": storage_check_result.get("recommendation"),
+                    "reference": storage_check_result.get("reference")
+                }
+            }
+        }
+        
+        # Update overall status if Storage check failed
+        if storage_check_result["status"] == "FAIL":
+            overall_status = "FAIL"
+        elif storage_check_result["status"] == "WARNING" and overall_status != "FAIL":
+            overall_status = "WARNING"
+    
     # Calculate timing info
     total_time = time.time() - process_start_time
     timing_info = {
@@ -3524,7 +3576,8 @@ class NDAPIClient:
         Authenticate to ND API and obtain bearer token.
         
         Returns:
-            bool: True if authentication succeeded, False otherwise
+            tuple: (success: bool, error_type: str, error_message: str)
+                   error_type can be: 'AUTH_FAILURE', 'CONNECTION_FAILURE', 'TIMEOUT', 'UNKNOWN', or None if success
         """
         login_url = f"https://{self.nd_ip}/login"
         login_data = json.dumps({
@@ -3557,16 +3610,39 @@ class NDAPIClient:
             # Extract and store bearer token
             self._token = login_result.get('token')
             if not self._token:
-                self.logger.error("[API] No token received from ND API authentication")
-                return False
+                error_msg = "No token received from ND API authentication"
+                self.logger.error(f"[API] {error_msg}")
+                return False, 'AUTH_FAILURE', error_msg
             
             self.logger.info("[API] Successfully authenticated to ND API")
-            return True
+            return True, None, None
+            
+        except self.urllib_error.HTTPError as e:
+            # HTTP errors indicate the connection succeeded but authentication failed
+            error_msg = f"HTTP {e.code}: {e.reason}"
+            if e.code in [401, 403]:
+                self.logger.error(f"[API] Authentication failed (invalid credentials): {error_msg}")
+                return False, 'AUTH_FAILURE', error_msg
+            else:
+                self.logger.error(f"[API] HTTP error during authentication: {error_msg}")
+                return False, 'HTTP_ERROR', error_msg
+                
+        except self.urllib_error.URLError as e:
+            # URLError indicates connection-level failure (port closed, network unreachable, DNS failure, etc.)
+            error_msg = str(e.reason) if hasattr(e, 'reason') else str(e)
+            self.logger.error(f"[API] Connection failed to {self.nd_ip}:443: {error_msg}")
+            return False, 'CONNECTION_FAILURE', error_msg
+            
+        except socket.timeout:
+            error_msg = "Connection timeout"
+            self.logger.error(f"[API] Timeout connecting to {self.nd_ip}:443")
+            return False, 'TIMEOUT', error_msg
             
         except Exception as e:
-            # Never include password in error messages
-            self.logger.error(f"[API] Authentication failed: {str(e)}")
-            return False
+            # Catch-all for any other unexpected errors
+            error_msg = str(e)
+            self.logger.error(f"[API] Unexpected authentication error: {error_msg}")
+            return False, 'UNKNOWN', error_msg
     
     def get(self, endpoint, timeout=30):
         """
@@ -3938,7 +4014,8 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             "ping_check",
             "subnet_check",
             "persistent_ip_check",
-            "disk_space", 
+            "disk_space",
+            "storage_device_check",  # Storage check - cluster-level (after disk_space)
             "pod_status", 
             "system_health",
             "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
@@ -3958,7 +4035,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         # Organize by check type instead of by node
         all_checks = {}
         for node_name, node_results in all_results.items():
-            # Skip special _api_checks and _debug_info entries in main processing
+            # Skip special _api_checks, _storage_checks, and _debug_info entries in main processing
             if node_name.startswith("_"):
                 continue
                 
@@ -4026,6 +4103,30 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                 
                 # Store as cluster-level check (no specific node)
                 all_checks[check_name]["nodes"]["API Check"] = check_result
+                
+                # Extract top-level explanation, recommendation, and reference
+                if check_result.get("explanation"):
+                    all_checks[check_name]["explanation"] = f"\n  Explanation:\n  {check_result['explanation']}"
+                if check_result.get("recommendation"):
+                    all_checks[check_name]["recommendation"] = f"\n  Recommendation:\n  {check_result['recommendation']}"
+                if check_result.get("reference"):
+                    all_checks[check_name]["reference"] = f"\n  Reference:\n  {check_result['reference']}"
+        
+        # Handle Storage Device checks separately (cluster-level, similar to API checks)
+        if "_storage_checks" in all_results:
+            storage_results = all_results["_storage_checks"]
+            for check_name, check_result in storage_results["checks"].items():
+                if check_name not in all_checks:
+                    all_checks[check_name] = {
+                        "status": check_result["status"],
+                        "nodes": {},  # Empty for storage checks
+                        "explanation": None,
+                        "recommendation": None,
+                        "reference": None
+                    }
+                
+                # Store as cluster-level check (no specific node)
+                all_checks[check_name]["nodes"]["Storage Check"] = check_result
                 
                 # Extract top-level explanation, recommendation, and reference
                 if check_result.get("explanation"):
@@ -4488,6 +4589,10 @@ def main():
                     'directories': over_threshold_dirs,
                     'error': error_msg
                 })
+        
+        # Initialize storage check result (will be populated during storage device check)
+        storage_check_result = {"status": "NOTRUN"}  # Default status
+        
         # Check storage devices
         print("\nChecking storage disks on all nodes...")
         nodes_with_issues = []
@@ -4515,6 +4620,35 @@ def main():
                         "error": error_msg,
                     }
                 )
+        
+        # Populate storage check result based on findings
+        if nodes_with_issues:
+            # Build detailed error message
+            error_details = []
+            for item in nodes_with_issues:
+                node_name = item["node"]["name"]
+                error_msg = item["error"]
+                error_details.append(f"{node_name}: {error_msg}")
+            
+            storage_check_result.update({
+                "status": "FAIL",
+                "details": error_details,
+                "explanation": "One or more nodes have storage device issues that will prevent upgrade",
+                "recommendation": "Resolve storage device issues before attempting upgrade. Contact TAC if assistance is needed.",
+                "reference": None
+            })
+            logger.error(f"[Storage] Storage check FAILED: {len(nodes_with_issues)} node(s) with issues")
+            logger.debug(f"[Storage] storage_check_result after FAIL update: {storage_check_result}")
+        else:
+            storage_check_result.update({
+                "status": "PASS",
+                "details": [f"All {len(nodes_healthy)} active node(s) have healthy storage devices"],
+                "explanation": None,
+                "recommendation": None,
+                "reference": None
+            })
+            logger.info(f"[Storage] Storage check PASSED: All nodes healthy")
+        
         if nodes_with_issues:
             while True:
                 choice = (
@@ -4737,7 +4871,7 @@ def main():
 
         # Process all nodes - resource-optimized
         # Save the results to ensure we can access debug_data after the report is generated
-        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info)
+        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info, storage_check_result)
 
         # Display debug mode warning at the very end, after the report
         if args.debug and results and "_debug_info" in results:

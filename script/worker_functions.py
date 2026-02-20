@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.14 (Feb 13, 2026)
+Version: 1.0.15 (Feb 19, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -176,15 +176,17 @@ def get_file_cache():
 class ValidationContext:
     """
     Shared context for all validation checks
-    Centralizes version, deployment mode, and node type reading
+    Centralizes version, deployment mode, node type, and model reading
     Eliminates 50+ redundant file read operations across checks
     """
     def __init__(self):
         self.nd_version = None
         self.nd_version_tuple = None
+        self.nd_version_suffix = None  # Letter suffix (e.g., 'g', 'j')
         self.node_count = None
         self.deployment_mode = None
         self.node_type = None
+        self.model = None  # Node model (e.g., 'ND-NODE-G5S', 'SE-VIRTUAL-APP')
         self.cache = None
         self._initialized = False
     
@@ -196,7 +198,7 @@ class ValidationContext:
         self.cache = get_file_cache()
         self._load_version()
         self._load_deployment_mode()
-        self._load_node_type()
+        self._load_system_config()  # Loads both node_type and model from acs_system_config
         self._initialized = True
     
     def _load_version(self):
@@ -213,18 +215,37 @@ class ValidationContext:
                 else:
                     self.nd_version = version_line
                 
-                # Parse version tuple for comparisons (e.g., "3.2.1f" -> (3, 2, 1))
-                parts = self.nd_version.replace('f', '').replace('e', '').split('.')
-                if len(parts) >= 2:
+                # Parse version tuple for comparisons (e.g., "3.2.1g" -> (3, 2, 1) + suffix 'g')
+                import re
+                # Match version pattern: digits.digits.digits + optional letters
+                match = re.match(r'^(\d+\.\d+\.\d+)([a-zA-Z]+)?$', self.nd_version)
+                if match:
+                    version_clean = match.group(1)
+                    self.nd_version_suffix = match.group(2)  # e.g., 'g', 'j', or None
+                    parts = version_clean.split('.')
                     try:
-                        self.nd_version_tuple = tuple(int(p) for p in parts[:3] if p.isdigit())
+                        self.nd_version_tuple = tuple(int(p) for p in parts[:3])
                     except (ValueError, IndexError):
                         # Fallback to major.minor only
                         try:
-                            self.nd_version_tuple = (int(parts[0]), int(parts[1]))
+                            self.nd_version_tuple = (int(parts[0]), int(parts[1]), 0)
                         except:
                             pass
+                else:
+                    # Fallback for non-standard formats
+                    version_clean = re.sub(r'[a-zA-Z]+', '', self.nd_version)
+                    parts = version_clean.split('.')
+                    if len(parts) >= 2:
+                        try:
+                            self.nd_version_tuple = tuple(int(p) for p in parts[:3])
+                        except (ValueError, IndexError):
+                            try:
+                                self.nd_version_tuple = (int(parts[0]), int(parts[1]), 0)
+                            except:
+                                pass
                 print("[INFO] Loaded ND Version: {0}".format(self.nd_version))
+                if self.nd_version_suffix:
+                    print("[DEBUG] Version suffix: {0}".format(self.nd_version_suffix))
         except Exception as e:
             print("[WARNING] Could not load version: {0}".format(str(e)))
     
@@ -244,28 +265,43 @@ class ValidationContext:
         except Exception as e:
             print("[WARNING] Could not load deployment mode: {0}".format(str(e)))
     
-    def _load_node_type(self):
-        """Load node type once from acs_system_config"""
+    def _load_system_config(self):
+        """Load node type and model once from acs_system_config"""
         config_files = self.cache.find_files("acs-checks/acs_system_config")
         if not config_files:
             return
         
         try:
             with open(config_files[0], 'r') as f:
-                content = f.read()
-                if "nodeType:" in content:
-                    for line in content.split('\n'):
-                        if line.strip().startswith("nodeType:"):
-                            self.node_type = line.split(":")[1].strip()
-                            print("[INFO] Loaded node type: {0}".format(self.node_type))
-                            break
+                for line in f:
+                    # Extract nodeType
+                    if line.strip().startswith("nodeType:"):
+                        self.node_type = line.split(":", 1)[1].strip()
+                        print("[INFO] Loaded node type: {0}".format(self.node_type))
+                    # Extract model
+                    elif line.strip().startswith("model:"):
+                        self.model = line.split(":", 1)[1].strip()
+                        print("[INFO] Loaded model: {0}".format(self.model))
+                    
+                    # Exit early if we have both values
+                    if self.node_type and self.model:
+                        break
         except Exception as e:
-            print("[WARNING] Could not load node type: {0}".format(str(e)))
+            print("[WARNING] Could not load system config: {0}".format(str(e)))
     
-    def version_greater_or_equal(self, major, minor, patch=0):
+    def version_greater_or_equal(self, major, minor, patch=0, suffix=None):
         """
         Compare current version against required version
         Returns True if current version >= required version
+        
+        Args:
+            major, minor, patch: Numeric version components
+            suffix: Optional letter suffix (e.g., 'g', 'j')
+                   If provided, compares suffix only when numeric versions are equal
+        
+        Examples:
+            version_greater_or_equal(4, 1, 1) -> True for 4.1.1g, 4.1.1j, 4.2.0
+            version_greater_or_equal(4, 1, 1, 'j') -> True for 4.1.1j+, False for 4.1.1g
         """
         if not self.nd_version_tuple:
             return False
@@ -273,11 +309,79 @@ class ValidationContext:
         required = (major, minor, patch) if patch > 0 else (major, minor)
         current = self.nd_version_tuple[:len(required)]
         
-        return current >= required
+        # Compare numeric versions first
+        if current > required:
+            return True
+        elif current < required:
+            return False
+        else:  # Numeric versions are equal
+            # If no suffix required, numeric equality is sufficient
+            if suffix is None:
+                return True
+            # If suffix required, compare suffixes
+            if self.nd_version_suffix is None:
+                return False  # Current has no suffix, required has one
+            # Compare letter suffixes alphabetically (e.g., 'g' < 'j')
+            return self.nd_version_suffix >= suffix
     
-    def is_version_applicable(self, min_major, min_minor, min_patch=0):
+    def version_less_than(self, major, minor, patch=0, suffix=None):
+        """
+        Compare current version against required version
+        Returns True if current version < required version
+        
+        Examples:
+            version_less_than(4, 1, 1, 'j') -> True for 4.1.1g, False for 4.1.1j+
+        """
+        if not self.nd_version_tuple:
+            return False
+        
+        required = (major, minor, patch) if patch > 0 else (major, minor)
+        current = self.nd_version_tuple[:len(required)]
+        
+        # Compare numeric versions first
+        if current < required:
+            return True
+        elif current > required:
+            return False
+        else:  # Numeric versions are equal
+            # If no suffix required, numeric equality means not less than
+            if suffix is None:
+                return False
+            # If suffix required, compare suffixes
+            if self.nd_version_suffix is None:
+                return True  # Current has no suffix, required has one
+            # Compare letter suffixes alphabetically
+            return self.nd_version_suffix < suffix
+    
+    def version_in_range(self, min_major, min_minor, min_patch=0, min_suffix=None,
+                        max_major=None, max_minor=None, max_patch=0, max_suffix=None):
+        """
+        Check if version is within a range (inclusive on both ends)
+        
+        Examples:
+            # Check if version is between 4.1.1g and 4.1.1j (inclusive)
+            version_in_range(4, 1, 1, 'g', 4, 1, 1, 'j')
+            
+            # Check if version is 4.1.1 or higher (no upper bound)
+            version_in_range(4, 1, 1)
+        """
+        # Check minimum version
+        if not self.version_greater_or_equal(min_major, min_minor, min_patch, min_suffix):
+            return False
+        
+        # If no maximum specified, only minimum matters
+        if max_major is None:
+            return True
+        
+        # Check maximum version (use less_than + 1 to get less_than_or_equal)
+        return not self.version_greater_or_equal(max_major, max_minor, max_patch, max_suffix) or \
+               (self.nd_version_tuple[:3] == (max_major, max_minor, max_patch) and 
+                (max_suffix is None or self.nd_version_suffix == max_suffix or 
+                 (self.nd_version_suffix and max_suffix and self.nd_version_suffix <= max_suffix)))
+    
+    def is_version_applicable(self, min_major, min_minor, min_patch=0, suffix=None):
         """Check if current version meets minimum requirement"""
-        return self.version_greater_or_equal(min_major, min_minor, min_patch)
+        return self.version_greater_or_equal(min_major, min_minor, min_patch, suffix)
 
 # Global context instance
 _validation_context = None
@@ -2311,8 +2415,11 @@ def check_legacy_ndi_elasticsearch(tech_file):
     migrate to new OpenSearch format. This problematic volume will cause upgrade 
     to 4.1 and later to fail.
     
+    NOTE: This check is bypassed for ND 4.1 and later versions, as any upgrade
+    to 4.1+ would have required this issue to be resolved.
+    
     This check:
-    1. Verifies ND version is 3.2 or later
+    1. Verifies ND version is 3.2 or later but less than 4.1
     2. Checks if desiredDeploymentMode contains "ndi" (if yes, skip check)
     3. Searches for "elasticsearch.nir" string in lvm-lvs output
     
@@ -2323,8 +2430,21 @@ def check_legacy_ndi_elasticsearch(tech_file):
     
     node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
     
-    # Use file cache for faster file discovery
-    cache = get_file_cache()
+    # Use shared context and cache
+    ctx = get_validation_context()
+    cache = ctx.cache
+    
+    # Check ND version - bypass check for 4.1 and later
+    # Rationale: If the system is already on 4.1+, it means the upgrade to 4.1 
+    # succeeded, which would have required this issue to be resolved
+    if ctx.nd_version and ctx.is_version_applicable(4, 1):
+        print("[PASS] ND version {0} >= 4.1 - Legacy NDI ElasticSearch check bypassed".format(ctx.nd_version))
+        print("       (System already on 4.1+ means upgrade succeeded and issue was resolved)")
+        CheckResult.set_pass(
+            "legacy_ndi_elasticsearch_check",
+            "Check bypassed for ND 4.1 and later (upgrade to 4.1+ requires issue resolution)"
+        )
+        return True
     
     # Helper function to set WARNING status with consistent message
     def set_warning_status():
@@ -3508,6 +3628,14 @@ def check_atom0_nvme(tech_file):
         print("[PASS] Virtual ND node - NVME check not applicable")
         return CheckResult.set_pass("atom0_nvme_check", "Virtual ND (check not applicable)")
     
+    # Check model - ND-NODE-G5S does not have NVME drives
+    if ctx.model and ctx.model == "ND-NODE-G5S":
+        print("[PASS] Model {0} does not contain NVME drives - check not applicable".format(ctx.model))
+        return CheckResult.set_pass(
+            "atom0_nvme_check",
+            "ND-NODE-G5S model does not have NVME drives (check not applicable)"
+        )
+    
     # Physical node - determine version and check appropriate PVS file
     print("Physical ND node detected - checking for NVME drive presence")
     
@@ -3765,36 +3893,27 @@ def check_vnd_app_large(tech_file):
     
     print("Version is 3.2.x - proceeding with check")
     
-    # Step 2: Check model and deploymentMode from acs_system_config
-    system_config_files = cache.find_files("acs-checks/acs_system_config")
-    if not system_config_files:
-        print("[WARNING] acs_system_config file not found")
-        return CheckResult.set_warning("vnd_app_large_check", "Unable to determine device type")
-    
-    system_config_file = system_config_files[0]
-    print("Reading model and deploymentMode from: {0}".format(os.path.basename(system_config_file)))
-    
-    model = None
-    deployment_mode = None
-    try:
-        with open(system_config_file, 'r') as f:
-            for line in f:
-                if 'model:' in line:
-                    model = line.split(':', 1)[1].strip()
-                    print("Found model: {0}".format(model))
-                if 'deploymentMode:' in line:
-                    deployment_mode = line.split(':', 1)[1].strip()
-                    print("Found deploymentMode: {0}".format(deployment_mode))
-                # Continue reading to get both fields
-                if model and deployment_mode:
-                    break
-    except Exception as e:
-        print("[WARNING] Error reading acs_system_config: {0}".format(str(e)))
-        return CheckResult.set_warning("vnd_app_large_check", "Unable to determine device type")
-    
-    if not model:
+    # Step 2: Check model from shared context
+    if not ctx.model:
         print("[WARNING] model field not found in acs_system_config")
         return CheckResult.set_warning("vnd_app_large_check", "Unable to determine device type")
+    
+    model = ctx.model
+    print("Using model from context: {0}".format(model))
+    
+    # Also read deploymentMode from acs_system_config (different from k8-releases deploymentMode)
+    system_config_files = cache.find_files("acs-checks/acs_system_config")
+    deployment_mode = None
+    if system_config_files:
+        try:
+            with open(system_config_files[0], 'r') as f:
+                for line in f:
+                    if 'deploymentMode:' in line:
+                        deployment_mode = line.split(':', 1)[1].strip()
+                        print("Found deploymentMode: {0}".format(deployment_mode))
+                        break
+        except Exception as e:
+            print("[WARNING] Error reading deploymentMode from acs_system_config: {0}".format(str(e)))
     
     # Check if model is SE-VIRTUAL-DATA (case insensitive)
     if model.upper() == "SE-VIRTUAL-DATA":
