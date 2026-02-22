@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.15 (Feb 19, 2026)
+Version: 1.0.16 (Feb 22, 2026)
 """
 
 import re
@@ -460,7 +460,6 @@ class NDNodeManager:
         if not self.legacy_ssh_mode:
             self.legacy_ssh_mode = True
             logger.warning("Enabling legacy SSH mode (ssh-rsa) for compatibility with older Nexus Dashboard host keys")
-            logger.warning("Note: ssh-rsa uses SHA-1 which has known weaknesses. Consider regenerating ND host keys with: ssh-keygen -A")
 
     def _check_crypto_policy(self):
         """Check if system crypto policy is blocking ssh-rsa"""
@@ -566,8 +565,6 @@ class NDNodeManager:
                         if returncode_retry == 0 and "Connected" in output_retry:
                             logger.info(f"Successfully connected using legacy SSH mode")
                             print(f"{PASS} Successfully connected using legacy SSH mode")
-                            print(f"      Note: ssh-rsa uses SHA-1. Consider regenerating ND host keys")
-                            print(f"            with stronger algorithms (ssh-keygen -A on ND)")
                             return True
                         else:
                             # Legacy SSH also failed - check for crypto policy issue
@@ -1409,7 +1406,8 @@ class TechSupportManager:
                 choice = input("> ")
                 
                 if choice.lower() == 'y':
-                    return self.generate_techsupport(node)
+                    tech_support_path = self.generate_techsupport(node)
+                    return tech_support_path
                 else:
                     print(f"Skipping node {node['name']}.")
                     return None
@@ -1421,7 +1419,8 @@ class TechSupportManager:
             choice = input("> ")
             
             if choice.lower() == 'y':
-                return self.generate_techsupport(node)
+                tech_support_path = self.generate_techsupport(node)
+                return tech_support_path
             else:
                 print(f"Skipping node {node['name']}.")
                 return None
@@ -1517,6 +1516,8 @@ class TechSupportManager:
             retry_interval = 30  # Check for new files every 30 seconds
             stale_check_interval = 5  # Once size stops increasing, verify every 5 seconds
             max_stale_checks = 3  # Maximum consecutive checks with no size increase (at 5-second intervals = 15 seconds total)
+            max_retry_attempts = 40  # Maximum retries when file exists and is growing (40 * 30s = 20 minutes)
+            max_initial_attempts = 5  # Maximum retries if file never appears (5 * 30s = 2.5 minutes)
             
             logger.info(f"Waiting for tech support generation to complete on {node['name']}...")
             # Don't print to console - we'll show status when file is detected
@@ -1538,7 +1539,6 @@ class TechSupportManager:
             
             # Now wait and look for a new file with timestamp AFTER our pre_command_timestamp
             found_tech_support = None
-            no_processes_detected = False
             tracked_file = None  # Track which file we're monitoring for size changes
             last_size = 0
             stale_count = 0  # Count consecutive checks with no size increase
@@ -1553,23 +1553,20 @@ class TechSupportManager:
                 logger.info(f"Tech support check attempt {retry_number} for {node['name']}")
                 # Don't print status here - we'll print more meaningful status in the loop below
                 
-                # On first few retries, check if tech support processes are actually running
-                # This helps detect early if the command failed to start properly
-                if retry_number <= 3 and not no_processes_detected:  # Check on first 3 retries (first 1.5 minutes)
-                    logger.debug(f"Checking if tech support processes are running on {node['name']}")
-                    cmd_check_processes = self.node_manager.build_ssh_command(node['ip'], "ps aux | grep -i techsupport | grep -v grep || echo 'no_processes'")
-                    process = subprocess.Popen(cmd_check_processes, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout_ps, stderr_ps = process.communicate()
-                    
-                    if process.returncode == 0:
-                        ps_output = stdout_ps.decode('utf-8').strip()
-                        if "no_processes" in ps_output:
-                            if not no_processes_detected:
-                                logger.warning(f"No tech support processes running on {node['name']} (retry {retry_number})")
-                                no_processes_detected = True
-                        else:
-                            logger.debug(f"Tech support processes found running on {node['name']}")
-                            no_processes_detected = False
+                # Check if we should give up early (file never appeared)
+                # Do this check at the top of the loop so it's not skipped by continue statements
+                if tracked_file is None and retry_number >= max_initial_attempts:
+                    # No file appeared after initial attempts (2.5 minutes), likely a failure
+                    logger.error(f"No new tech support file appeared on {node['name']} after {retry_number} checks ({retry_number * retry_interval / 60:.1f} minutes)")
+                    print(f"{FAIL} Tech support generation failed on {node['name']} - no new file detected after {retry_number * retry_interval / 60:.1f} minutes.")
+                    return None
+                
+                # Check if we've exceeded absolute maximum retries (file exists but taking too long)
+                if tracked_file is not None and retry_number >= max_retry_attempts:
+                    logger.error(f"Tech support generation exceeded maximum wait time ({max_retry_attempts * retry_interval / 60:.1f} minutes) for {node['name']}")
+                    print(f"{FAIL} Tech support generation timed out after {max_retry_attempts * retry_interval / 60:.1f} minutes on {node['name']}")
+                    print(f"File was found but did not complete within the expected timeframe.")
+                    return None
                 
                 # Get the current date part for identifying today's tech supports
                 cmd_date = self.node_manager.build_ssh_command(node['ip'], "date '+%Y-%m-%d'")
@@ -1715,26 +1712,6 @@ class TechSupportManager:
                 # If we found a new tech support with proper timestamp and stable size, we're done
                 if found_tech_support:
                     break
-                
-                # Check if we should give up (only if no file was found at all after initial retries)
-                if tracked_file is None and retry_number >= 3:
-                    # No file appeared after 3 retries (1.5 minutes), likely a failure
-                    logger.error(f"No new tech support file appeared on {node['name']} after {retry_number} checks")
-                    print(f"{FAIL} Tech support generation failed on {node['name']} - no new file detected.")
-                    print(f"No new tech support with timestamp after {pre_command_timestamp} was found.")
-                    print(f"")
-                    if no_processes_detected:
-                        print(f"⚠️  WARNING: No tech support processes were detected running on the node.")
-                    print(f"This usually indicates one of the following:")
-                    print(f"  1. The tech support command failed due to invalid arguments")
-                    print(f"  2. The tech support command is not supported on this ND version")
-                    print(f"  3. There is insufficient disk space to generate the tech support")
-                    print(f"")
-                    print(f"To debug this issue:")
-                    print(f"  1. SSH to {node['name']} and manually run: {techsupport_cmd}")
-                    print(f"  2. Check disk space with: df -h")
-                    print(f"  3. Check for running processes with: ps aux | grep techsupport")
-                    return None
                 
                 # Note: We no longer need a separate stale check here because we perform
                 # immediate rapid verification when size stops increasing (handled in the file checking loop above)
@@ -2962,6 +2939,10 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
         # Generate new tech supports IN PARALLEL for all nodes
         print("Generating tech supports for all nodes in parallel.")
         
+        # Track successful and failed nodes
+        failed_nodes = []
+        successful_nodes_list = []
+        
         # Use ThreadPoolExecutor to generate tech supports in parallel
         try:
             with ThreadPoolExecutor(max_workers=max_concurrent_nodes) as executor:
@@ -2975,17 +2956,48 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                     try:
                         tech_support_path = future.result()
                         if not tech_support_path:
-                            print(f"{FAIL} Failed to generate tech support on {node_name}")
+                            failed_nodes.append(node_name)
+                            logger.error(f"Failed to generate tech support on {node_name}")
                             continue
                         tech_support_paths[node_name] = tech_support_path
+                        successful_nodes_list.append(node_name)
                         print(f"Generated tech support on {node_name}: {os.path.basename(tech_support_path)}")
+                        logger.info(f"Generated tech support on {node_name}")
                     except Exception as exc:
+                        failed_nodes.append(node_name)
                         logger.exception(f"Error generating tech support for {node_name}: {exc}")
                         print(f"{FAIL} Error generating tech support for {node_name}: {str(exc)}")
         except KeyboardInterrupt:
             print("\n\n🛑 Tech support generation interrupted by user. Shutting down...")
             logger.warning("Tech support generation interrupted by user (Ctrl+C)")
             sys.exit(0)
+        
+        # Check if all nodes failed or only some
+        if failed_nodes:
+            if len(failed_nodes) == len(nodes):
+                # All nodes failed
+                error_msg = (
+                    "\nTry to perform the following steps:\n"
+                    "1. Generate the tech supports from the UI\n"
+                    "1a. Wait for tech support generation to complete\n"
+                    "2. Rerun the script and use Option 2 to select previously generated tech supports\n"
+                )
+                print(error_msg)
+                logger.error(f"Tech support generation failed on nodes: {', '.join(failed_nodes)}")
+                print(f"{FAIL} No tech supports were generated. Exiting.")
+                return {}
+            else:
+                # Some nodes failed, but at least one succeeded
+                error_msg = (
+                    "\nTry to perform the following steps:\n"
+                    "1. Generate the tech supports from the UI\n"
+                    "1a. Wait for tech support generation to complete\n"
+                    "2. Rerun the script and use Option 2 to select previously generated tech supports\n\n"
+                    f"Continuing validation with successful nodes: {', '.join(successful_nodes_list)}\n"
+                )
+                print(error_msg)
+                logger.warning(f"Tech support generation failed on nodes: {', '.join(failed_nodes)}")
+                logger.warning(f"Continuing with successful nodes: {', '.join(successful_nodes_list)}")
     else:
         # Fetch tech support listings for all nodes in parallel first
         print("Checking for tech support files on all nodes...")
@@ -3051,6 +3063,11 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                     print(f"Generating tech support on {node_name}...")
                     tech_support_path = tech_manager.generate_techsupport(node)
                     if tech_support_path:
+                        tech_support_paths[node_name] = tech_support_path
+                        print(f"Generated tech support on {node_name}: {os.path.basename(tech_support_path)}")
+                    else:
+                        logger.error(f"Failed to generate tech support on {node_name}")
+                        print(f"{FAIL} Failed to generate tech support on {node_name}")
                         tech_support_paths[node_name] = tech_support_path
                         print(f"Generated tech support on {node_name}: {os.path.basename(tech_support_path)}")
     
