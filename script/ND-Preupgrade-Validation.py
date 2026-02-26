@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.16 (Feb 22, 2026)
+Version: 1.0.17 (Feb 26, 2026)
 """
 
 import re
@@ -842,6 +842,12 @@ class NDNodeManager:
                     logger.debug(f"{node['name']}: Skipping {mount_point} (ISO mount point)")
                     continue
 
+                # Skip /data/services/oci_repo/boot-disk - this is the boot disk mount point
+                # High usage is expected and normal for this directory
+                if mount_point == '/data/services/oci_repo/boot-disk':
+                    logger.debug(f"{node['name']}: Skipping {mount_point} (boot disk mount point)")
+                    continue
+
                 # Check if usage >= 80%
                 if usage_pct >= 80:
                     over_threshold.append((mount_point, usage_pct))
@@ -1194,37 +1200,49 @@ class NDNodeManager:
     def verify_node_storage(self, node):
         """
         Check if node has storage disks as per the hardware specification.
-        Returns: (is_healthy, error_message)
+        Returns: (is_healthy, error_message, storage_output)
 
         Args:
             node: node IP
 
         Returns:
-            tuple: (bool, str) - (is_healthy, error_msg)
+            tuple: (bool, str, str) - (is_healthy, error_msg, storage_output)
         """
         model, role, error_msg = self.get_node_model_and_role(node)
         if error_msg != "":
-            return False, error_msg
+            logger.warning(f"[Storage] {node['name']}: Failed to get model/role: {error_msg}")
+            return False, error_msg, ""
+        
+        logger.debug(f"[Storage] {node['name']}: model={model}, role={role}")
         supported_models = [
             m.casefold() for m in ["SE-NODE-G2", "ND-NODE-L4", "ND-NODE-L4T"]
         ]
 
         if model.strip().casefold() not in supported_models:
             logger.info(f"Skipping node storage check for model {model}")
-            return True, ""
+            return True, "", ""
 
         try:
             logger.info(f"Checking node storage devices on {node['name']}")
             cmd = self.build_ssh_command(node["ip"], "acs verify storage")
+            logger.debug(f"[Storage] Executing command: {cmd}")
             process = subprocess.Popen(
                 cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
             stdout, stderr = process.communicate(timeout=30)
-            if process.returncode != 0:
-                error_msg = f"Failed to check storage devices: {stderr.decode('utf-8')}"
-                return False, error_msg
+            
+            # Always capture stdout - it contains the output even when return code is non-zero
             storage_output = stdout.decode("utf-8").strip()
-            logger.debug(f"{node['name']} storage output:\n{storage_output}")
+            logger.debug(f"[Storage] {node['name']} return code: {process.returncode}, stdout ({len(storage_output)} chars):\n{storage_output}")
+            
+            # If command completely failed (e.g., command not found, permission denied)
+            if process.returncode != 0 and not storage_output:
+                stderr_msg = stderr.decode('utf-8').strip()
+                error_msg = f"Failed to execute storage check: {stderr_msg if stderr_msg else 'Unknown error'}"
+                logger.error(f"[Storage] Command failed with return code {process.returncode}: {error_msg}")
+                return False, error_msg, ""
+            
+            # Now check the output for storage errors (even if returncode is non-zero)
             failed = next(
                 (
                     line
@@ -1234,6 +1252,7 @@ class NDNodeManager:
                 None,
             )
             if failed:
+                logger.info(f"[Storage] Detected failure line: {failed}")
                 error_msg = f"Storage device check failed. "
                 if "HDD" in failed:
                     error_msg += "One or more HDD disks are missing"
@@ -1245,18 +1264,19 @@ class NDNodeManager:
                 if role.strip().casefold() == "worker":
                     error_msg += "\nYou can ignore this failure as its on secondary node but please note you MUST NOT use this node as primary node."
                 logger.error(f"{node['name']}: {error_msg}")
-                return False, error_msg
+                logger.info(f"[Storage] Returning failure with storage_output length: {len(storage_output)}")
+                return False, error_msg, storage_output
 
-            return True, ""
+            return True, "", storage_output
 
         except subprocess.TimeoutExpired:
             error_msg = "Command timeout while checking disk space"
             logger.error(f"{node['name']}: {error_msg}")
-            return False, [], error_msg
+            return False, error_msg, ""
         except Exception as e:
             error_msg = f"Unexpected error checking disk space: {str(e)}"
             logger.exception(f"{node['name']}: {error_msg}")
-            return False, [], error_msg
+            return False, error_msg, ""
 
 
 class TechSupportManager:
@@ -1282,7 +1302,8 @@ class TechSupportManager:
             
             # Get file listing with a SINGLE command that includes all info we need
             # Format: timestamp size path
-            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} -name '*.tgz' -type f -printf '%T@ %s %p\\n' | sort -nr")
+            # Only match system-ts and all-ts files (the types this script can process)
+            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
             
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
@@ -1337,7 +1358,8 @@ class TechSupportManager:
             
             # Get file listing with a SINGLE command that includes all info we need
             # Format: timestamp size path
-            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} -name '*.tgz' -type f -printf '%T@ %s %p\\n' | sort -nr")
+            # Only match system-ts and all-ts files (the types this script can process)
+            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
             
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
@@ -1523,7 +1545,8 @@ class TechSupportManager:
             # Don't print to console - we'll show status when file is detected
             
             # Record all existing tech support files to detect new ones
-            cmd_existing = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} -name '*{node['name']}.tgz' -type f -printf '%T@ %p\\n'")
+            # Only match system-ts and all-ts files for this node
+            cmd_existing = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-{node['name']}.tgz' -o -name '*-all-ts-{node['name']}.tgz' \\) -type f -printf '%T@ %p\\n'")
             process = subprocess.Popen(cmd_existing, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
             
@@ -2152,7 +2175,7 @@ class WorkerScriptManager:
             
             # Step 5: Execute the worker script with retry logic
             logger.debug(f"Executing worker script on {node['name']}")
-            cmd = self.node_manager.build_ssh_command(node['ip'], f"cd {self.base_dir} && echo '[Starting worker script at $(date)]' > {node['name']}_output.log 2>&1 && echo 'Executing: {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version}' >> {node['name']}_output.log 2>&1 && nohup {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} >> {node['name']}_output.log 2>&1 & echo $!")
+            cmd = self.node_manager.build_ssh_command(node['ip'], f"cd {self.base_dir} && echo '[Starting worker script at $(date)]' > {node['name']}_output.log 2>&1 && echo 'Executing: {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} {node['name']}' >> {node['name']}_output.log 2>&1 && nohup {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} {node['name']} >> {node['name']}_output.log 2>&1 & echo $!")
             success, stdout, stderr = execute_ssh_with_retry(cmd, "execute worker script")
             
             if not success:
@@ -3173,7 +3196,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 result = APICheckResult.set_warning(
                     "telemetry_inband_epg",
                     "Password not provided for API check",
-                    recommendation="Ensure password is provided to run API validation"
+                    recommendation=f"Ensure password is provided to run API validation.\n\n{MANUAL_VERIFICATION_STEPS}"
                 )
                 api_check_result.update(result)
                 return
@@ -3183,7 +3206,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 result = APICheckResult.set_warning(
                     "telemetry_inband_epg",
                     "Could not determine ND version for API check",
-                    recommendation="Verify ND version and run check manually if needed"
+                    recommendation=f"Verify ND version and run check manually if needed.\n\n{MANUAL_VERIFICATION_STEPS}"
                 )
                 api_check_result.update(result)
                 return
@@ -3202,19 +3225,19 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 if error_type == 'AUTH_FAILURE':
                     details = f"Authentication failed: {error_message}"
                     explanation = "Invalid credentials or authentication rejected by ND API"
-                    recommendation = "Verify the admin username and password are correct"
+                    recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
                 elif error_type == 'CONNECTION_FAILURE':
                     details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
                     explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
-                    recommendation = "Verify port 443 on ND is accessible from device running the script. Check network connectivity and firewall rules."
+                    recommendation = f"Verify port 443 on ND is accessible from device running the script. Check network connectivity and firewall rules.\n\n{MANUAL_VERIFICATION_STEPS}"
                 elif error_type == 'TIMEOUT':
                     details = f"Connection timeout to {node_manager.nd_ip}:443"
                     explanation = "Connection attempt to ND management interface timed out"
-                    recommendation = "Check network connectivity, firewall rules, and ND system health"
+                    recommendation = f"Check network connectivity, firewall rules, and ND system health.\n\n{MANUAL_VERIFICATION_STEPS}"
                 else:
                     details = f"Failed to authenticate to ND API: {error_message}"
                     explanation = "Could not authenticate to ND management interface"
-                    recommendation = "Verify admin credentials and API accessibility. Check debug log for details."
+                    recommendation = f"Verify admin credentials and API accessibility. Check debug log for details.\n\n{MANUAL_VERIFICATION_STEPS}"
                 
                 result = APICheckResult.set_warning(
                     "telemetry_inband_epg",
@@ -3243,7 +3266,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             result = APICheckResult.set_warning(
                 "telemetry_inband_epg",
                 "API check was interrupted",
-                recommendation="Re-run validation to complete API check"
+                recommendation=f"Re-run validation to complete API check.\n\n{MANUAL_VERIFICATION_STEPS}"
             )
             api_check_result.update(result)
         except Exception as e:
@@ -3252,7 +3275,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 "telemetry_inband_epg",
                 f"API check error: {str(e)}",
                 explanation="An unexpected error occurred during API validation",
-                recommendation="Check logs and verify API connectivity",
+                recommendation=f"Check logs and verify API connectivity.\n\n{MANUAL_VERIFICATION_STEPS}",
                 reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
             )
             api_check_result.update(result)
@@ -3475,6 +3498,20 @@ def print_section(title):
 # API Check Helper Classes (Module Level)
 ###############################################################
 
+# Manual verification steps for when API checks fail
+MANUAL_VERIFICATION_STEPS = """
+Steps to manually confirm ND is not encountering Telemetry Inband EPG issue:
+1. Navigate to https://<nd ip>
+2. Click "Admin Console" in the top pane and navigate to "Insights"
+3. Click Manage > Fabrics
+4. Identify any Fabrics with Type "ACI"
+5. Click the 3 dots and select "Edit"
+6. Confirm the dropdown under "In-Band EPG" is populated
+
+If the dropdown is populated with text, the setup is not encountering the issue.
+If the dropdown is blank, engage Cisco TAC for assistance in remediation (reference: CSCws23607).
+"""
+
 class APICheckResult:
     """
     Lightweight result helper for API checks in main script.
@@ -3673,13 +3710,14 @@ class NDAPIClient:
             self.logger.error(f"[API] Unexpected authentication error: {error_msg}")
             return False, 'UNKNOWN', error_msg
     
-    def get(self, endpoint, timeout=30):
+    def get(self, endpoint, timeout=30, suppress_error_log=False):
         """
         Make authenticated GET request to ND API.
         
         Args:
             endpoint: API endpoint path (e.g., '/sedgeapi/v1/cisco-nir/api/api/v1/ndsites')
             timeout: Request timeout in seconds (default: 30)
+            suppress_error_log: If True, log error to debug only (not console) - for optional endpoints
         
         Returns:
             dict/list: Parsed JSON response from API
@@ -3714,7 +3752,10 @@ class NDAPIClient:
             return data
             
         except Exception as e:
-            self.logger.error(f"[API] GET {endpoint} failed: {str(e)}")
+            if suppress_error_log:
+                self.logger.debug(f"[API] GET {endpoint} failed: {str(e)}")
+            else:
+                self.logger.error(f"[API] GET {endpoint} failed: {str(e)}")
             raise
     
     def post(self, endpoint, data, timeout=30):
@@ -3784,9 +3825,10 @@ def check_telemetry_inband_epg(api_client, version):
     become blank. This state will cause Nexus Dashboard upgrade to fail.
     
     This check uses the NDAPIClient infrastructure to:
-    1. Call ndsites API to get all ACI sites (siteType = "Aci")
-    2. Call telemetry fabric API to get connection type for each site
-    3. For sites with connectionType = "INBAND", verify inbandEpgDN is not blank
+    1. Check if SAN Controller is enabled (check doesn't apply to SAN persona)
+    2. Call ndsites API to get all ACI sites (siteType = "Aci")
+    3. Call telemetry fabric API to get connection type for each site
+    4. For sites with connectionType = "INBAND", verify inbandEpgDN is not blank
     
     Only applies to ND version 3.2.x
     
@@ -3827,19 +3869,45 @@ def check_telemetry_inband_epg(api_client, version):
                 "telemetry_inband_epg",
                 "API client not authenticated",
                 explanation="Could not authenticate to ND management interface",
-                recommendation="Verify admin credentials and API accessibility",
+                recommendation=MANUAL_VERIFICATION_STEPS,
                 reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
             )
         
-        # Step 1: Get ndsites data
+        # Step 1: Check if SAN Controller is enabled (check doesn't apply to SAN persona)
+        logger.info("[API] Checking SAN Controller status")
+        try:
+            # Use suppress_error_log=True since NDFC may not be installed (404 is expected)
+            features_data = api_client.get('/appcenter/cisco/ndfc/api/v1/fm/features', suppress_error_log=True)
+            
+            # Check if SAN feature exists and is enabled
+            if isinstance(features_data, dict) and "data" in features_data:
+                features = features_data.get("data", {}).get("features", {})
+                san_feature = features.get("san", {})
+                san_admin_state = san_feature.get("admin_state", "")
+                
+                logger.debug(f"[API] SAN Controller admin_state: '{san_admin_state}'")
+                
+                if san_admin_state == "enabled":
+                    logger.info("[API] SAN Controller is enabled - check does not apply to SAN persona")
+                    return APICheckResult.set_pass(
+                        "telemetry_inband_epg",
+                        "Check doesn't apply to SAN persona"
+                    )
+                else:
+                    logger.info(f"[API] SAN Controller is {san_admin_state} - proceeding with check")
+        except Exception as e:
+            # If we can't determine SAN status, log warning but continue with the check
+            logger.warning(f"[API] Could not determine SAN Controller status: {str(e)}. Proceeding with check.")
+        
+        # Step 2: Get ndsites data
         logger.info("[API] Fetching ndsites data")
         ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true')
         
-        # Step 2: Get fabric telemetry config
+        # Step 3: Get fabric telemetry config
         logger.info("[API] Fetching fabric telemetry config")
         fabric_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default')
         
-        # Step 3: Build mapping of site names to connection types
+        # Step 4: Build mapping of site names to connection types
         fabric_sites = {}
         if isinstance(fabric_data, dict) and "value" in fabric_data and "data" in fabric_data["value"]:
             for site in fabric_data["value"]["data"]:
@@ -3848,7 +3916,7 @@ def check_telemetry_inband_epg(api_client, version):
                 if site_name:
                     fabric_sites[site_name] = connection_type
         
-        # Step 4: Check ACI sites for blank inbandEpgDN when connectionType is INBAND
+        # Step 5: Check ACI sites for blank inbandEpgDN when connectionType is INBAND
         problematic_sites = []
         aci_sites_found = []
         
@@ -3905,7 +3973,7 @@ def check_telemetry_inband_epg(api_client, version):
             "telemetry_inband_epg",
             f"Error during API check: {str(e)}",
             explanation="Could not complete API-based validation",
-            recommendation="Verify admin credentials and API accessibility, or perform manual verification:\n  1. Authenticate to https://<nd-ip>/login as admin\n  2. Check API: /sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true\n  3. Check API: /sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default\n  4. Verify all ACI sites with connectionType=INBAND have non-empty inbandEpgDN",
+            recommendation=MANUAL_VERIFICATION_STEPS,
             reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
         )
 
@@ -4654,17 +4722,22 @@ def main():
                 continue
 
             print(f"Checking {node['name']}...", end=" ")
-            is_healthy, error_msg = node_manager.verify_node_storage(node)
+            is_healthy, error_msg, storage_output = node_manager.verify_node_storage(node)
+            
+            # Debug logging for storage output
+            logger.debug(f"[Storage] Node {node['name']} - is_healthy: {is_healthy}, error_msg: {error_msg}, storage_output length: {len(storage_output)}")
 
             if is_healthy:
                 print(f"{PASS}")
                 nodes_healthy.append(node["name"])
             else:
                 print(f"{FAIL}")
+                logger.warning(f"[Storage] Node {node['name']} failed. Storing output of length {len(storage_output)}")
                 nodes_with_issues.append(
                     {
                         "node": node,
                         "error": error_msg,
+                        "storage_output": storage_output,
                     }
                 )
         
@@ -4672,14 +4745,19 @@ def main():
         if nodes_with_issues:
             # Build detailed error message
             error_details = []
+            storage_outputs = {}  # Store full outputs by node name
             for item in nodes_with_issues:
                 node_name = item["node"]["name"]
                 error_msg = item["error"]
+                storage_output = item.get("storage_output", "")
                 error_details.append(f"{node_name}: {error_msg}")
+                if storage_output:
+                    storage_outputs[node_name] = storage_output
             
             storage_check_result.update({
                 "status": "FAIL",
                 "details": error_details,
+                "storage_outputs": storage_outputs,  # Store raw outputs for display
                 "explanation": "One or more nodes have storage device issues that will prevent upgrade",
                 "recommendation": "Resolve storage device issues before attempting upgrade. Contact TAC if assistance is needed.",
                 "reference": None
@@ -4697,6 +4775,24 @@ def main():
             logger.info(f"[Storage] Storage check PASSED: All nodes healthy")
         
         if nodes_with_issues:
+            # Display the full 'acs verify storage' output for failed nodes
+            print("\n" + "="*80)
+            print("Storage Device Check - Detailed Output")
+            print("="*80)
+            for item in nodes_with_issues:
+                node_name = item["node"]["name"]
+                storage_output = item.get("storage_output", "")
+                logger.debug(f"[Storage] Displaying output for {node_name}, length: {len(storage_output)}")
+                print(f"\n{node_name}:")
+                print("-" * 40)
+                if storage_output:
+                    print(storage_output)
+                else:
+                    print("(No storage output captured)")
+                    logger.warning(f"[Storage] No storage output available for {node_name}")
+                print("-" * 40)
+            print("="*80 + "\n")
+            
             while True:
                 choice = (
                     input(
