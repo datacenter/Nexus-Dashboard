@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.16 (Feb 22, 2026)
+Version: 1.0.17 (Feb 26, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -2587,7 +2587,7 @@ def check_ntp_authentication(tech_file):
     3.2.x to 4.1 or later will fail.
     
     This check:
-    1. Verifies ND version is 3.2 or later (if not, check is not applicable)
+    1. Verifies ND version is 3.2.x only (if not, check is not applicable)
     2. Reads the network-diag/ntpq-peers file
     3. Parses the auth column in the top table
     4. If any entry contains "yes" or "ok", the check fails
@@ -2604,16 +2604,21 @@ def check_ntp_authentication(tech_file):
     ctx = get_validation_context()
     cache = ctx.cache
     
-    # Check ND version - this check only applies to ND 3.2 and later
+    # Check ND version - this check only applies to ND 3.2.x
     if not ctx.nd_version:
         return CheckResult.set_warning("ntp_auth_check", "Unable to determine ND version")
     
-    # Version check using shared context
+    # Version check using shared context - only run on 3.2.x
     if not ctx.is_version_applicable(3, 2):
         print("[PASS] ND version {0} < 3.2 - NTP Authentication check not applicable".format(ctx.nd_version))
         return CheckResult.set_pass("ntp_auth_check", "Version below 3.2, check not applicable")
     
-    print("ND version {0} >= 3.2 - proceeding with NTP Authentication check".format(ctx.nd_version))
+    # Check if version >= 4.0 - this check only applies to 3.2.x
+    if ctx.is_version_applicable(4, 0):
+        print("[PASS] ND version {0} >= 4.0 - NTP Authentication check not applicable".format(ctx.nd_version))
+        return CheckResult.set_pass("ntp_auth_check", "Version 4.0 and later, check not applicable")
+    
+    print("ND version {0} is 3.2.x - proceeding with NTP Authentication check".format(ctx.nd_version))
     
     # Step 2: Find ntpq-peers file
     ntpq_pattern = "network-diag/ntpq-peers"
@@ -2775,7 +2780,8 @@ def check_ntp_authentication(tech_file):
                 "ntp_auth_check",
                 details,
                 explanation="Due to a defect, if a configured NTP server has authentication enabled\n  "
-                           "upgrade to Nexus Dashboard Version 4.1 or later will fail.",
+                           "upgrade from Nexus Dashboard 3.2.x to Version 4.1 will fail.\n\n" \
+                           "Note: This check only applies to 3.2.x versions. If destination version is 4.2 or later, authentication will not cause issues.",
                 recommendation="Remove authentication requirements from the identified NTP servers,\n  "
                               "then rerun the ND Pre-upgrade Validation script to confirm this check passes.\n  "
                               "Alternatively, you can run the command `acs ntp` and confirm the \"auth\" column reports \"none\".",
@@ -4646,7 +4652,16 @@ def cleanup_processes():
 
 def main():
     """Main worker function using single extraction approach"""
+    global NODE_NAME, RESULTS_FILE, STATUS_FILE
     signal.signal(signal.SIGINT, signal_handler)
+    
+    # Parse node name early if provided (fixes hostname=localhost issue)
+    # This overrides the socket.gethostname() value if provided
+    if len(sys.argv) > 4:
+        NODE_NAME = sys.argv[4].strip()
+        RESULTS_FILE = "{0}/{1}_results.json".format(BASE_DIR, NODE_NAME)
+        STATUS_FILE = "{0}/{1}_status.json".format(BASE_DIR, NODE_NAME)
+        results["node_name"] = NODE_NAME
     
     print("\nStarting Nexus Dashboard Pre-upgrade Validation on {0}".format(NODE_NAME))
     print("Running at {0}\n".format(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
