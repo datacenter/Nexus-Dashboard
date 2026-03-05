@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.17 (Feb 26, 2026)
+Version: 1.0.18 (Mar 5, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -3634,12 +3634,13 @@ def check_atom0_nvme(tech_file):
         print("[PASS] Virtual ND node - NVME check not applicable")
         return CheckResult.set_pass("atom0_nvme_check", "Virtual ND (check not applicable)")
     
-    # Check model - ND-NODE-G5S does not have NVME drives
-    if ctx.model and ctx.model == "ND-NODE-G5S":
+    # Check model - G5 models (ND-NODE-G5S, ND-NODE-G5ST, ND-NODE-G5L, ND-NODE-G5LT) do not have NVME drives
+    G5_MODELS = {"ND-NODE-G5S", "ND-NODE-G5ST", "ND-NODE-G5L", "ND-NODE-G5LT"}
+    if ctx.model and ctx.model.upper() in {m.upper() for m in G5_MODELS}:
         print("[PASS] Model {0} does not contain NVME drives - check not applicable".format(ctx.model))
         return CheckResult.set_pass(
             "atom0_nvme_check",
-            "ND-NODE-G5S model does not have NVME drives (check not applicable)"
+            "{0} model does not have NVME drives (check not applicable)".format(ctx.model)
         )
     
     # Physical node - determine version and check appropriate PVS file
