@@ -3951,7 +3951,7 @@ def check_telemetry_inband_epg(api_client, version):
             # Use suppress_error_log=True since NDI may not be installed (404 is expected)
             ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true', suppress_error_log=True)
         except Exception as e:
-            logger.warning(f"NDI AII failure: {str(e)}. Proceeding with check.")
+            logger.warning(f"NDI API failure: {str(e)}. Proceeding with check.")
             ndsites_data = None  # so Step 5 can safely check isinstance(ndsites_data, list)
 
         # Step 3: Get fabric telemetry config
@@ -3959,7 +3959,7 @@ def check_telemetry_inband_epg(api_client, version):
         try:
             fabric_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default', suppress_error_log=True)
         except Exception as e:
-            logger.warning(f"NDI AII failure: {str(e)}. Proceeding with check.")
+            logger.warning(f"NDI API failure: {str(e)}. Proceeding with check.")
             fabric_data = None  # so Step 4 can safely check isinstance(fabric_data, dict)
 
         # Step 4: Build mapping of site names to connection types
