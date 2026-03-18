@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.18 (Mar 5, 2026)
+Version: 1.0.19 (Mar 17, 2026)
 """
 
 import re
@@ -3182,7 +3182,8 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
     logger.info(f"Processing {len(nodes_to_process)} nodes in {len(nodes_batches)} batches")
     
     # Start API check in background thread (will run in parallel with worker nodes)
-    api_check_result = {"status": "NOTRUN"}  # Default status
+    api_check_result = {"status": "NOTRUN"}  # Default status (combined for overall_status)
+    api_check_results = {}  # Per-check results for report: check_name -> result dict
     api_check_thread = None
     
     # Helper function to run API check
@@ -3248,18 +3249,50 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 api_check_result.update(result)
                 return
             
-            # Run the API check using the authenticated client
+            # Run API checks using the authenticated client
             logger.info(f"[API] Starting API check for Telemetry Inband EPG with ND version {version}")
             result = check_telemetry_inband_epg(api_client, version)
-            api_check_result.update(result)
-            
-            # Log the result
+            api_check_results["telemetry_inband_epg"] = result
             if result["status"] == "FAIL":
-                logger.error(f"[API] API check FAILED: {result['details']}")
+                logger.error(f"[API] API check FAILED (telemetry_inband_epg): {result['details']}")
             elif result["status"] == "WARNING":
-                logger.warning(f"[API] API check WARNING: {result['details']}")
+                logger.warning(f"[API] API check WARNING (telemetry_inband_epg): {result['details']}")
             else:
-                logger.info(f"[API] API check PASSED: {result['details']}")
+                logger.info(f"[API] API check PASSED (telemetry_inband_epg): {result['details']}")
+
+            logger.info(f"[API] Starting API check for NXAPI cert verify state with ND version {version}")
+            result = check_nxapi_cert_verify_state(api_client, version)
+            api_check_results["nxapi_cert_verify_state"] = result
+            if result["status"] == "FAIL":
+                logger.error(f"[API] API check FAILED (nxapi_cert_verify_state): {result['details']}")
+            elif result["status"] == "WARNING":
+                logger.warning(f"[API] API check WARNING (nxapi_cert_verify_state): {result['details']}")
+            else:
+                logger.info(f"[API] API check PASSED (nxapi_cert_verify_state): {result['details']}")
+
+            # Combined status: FAIL if any FAIL, else WARNING if any WARNING, else PASS
+            statuses = [r["status"] for r in api_check_results.values()]
+            combined_status = "FAIL" if "FAIL" in statuses else "WARNING" if "WARNING" in statuses else "PASS"
+            combined_details = []
+            for name, r in api_check_results.items():
+                combined_details.extend(r.get("details", []))
+            # Use explanation/recommendation from first failed or warning result
+            combined_explanation = None
+            combined_recommendation = None
+            combined_reference = None
+            for r in api_check_results.values():
+                if r["status"] in ("FAIL", "WARNING") and (r.get("explanation") or r.get("recommendation")):
+                    combined_explanation = r.get("explanation")
+                    combined_recommendation = r.get("recommendation")
+                    combined_reference = r.get("reference")
+                    break
+            api_check_result.update({
+                "status": combined_status,
+                "details": combined_details,
+                "explanation": combined_explanation,
+                "recommendation": combined_recommendation,
+                "reference": combined_reference
+            })
                 
         except KeyboardInterrupt:
             logger.info("[API] API check interrupted by user")
@@ -3399,7 +3432,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
     # Wait for API check to complete
     if api_check_thread and api_check_thread.is_alive():
         print_section("Waiting for API Check Completion")
-        print("Waiting for Telemetry Inband EPG API check to complete...")
+        print("Waiting for API checks to complete...")
         api_check_thread.join(timeout=60)  # Wait up to 60 seconds
         
         if api_check_thread.is_alive():
@@ -3417,11 +3450,20 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
     
     # Add API check result to all_results if it was run
     if api_check_result["status"] != "NOTRUN":
-        # Add as a special "api_checks" node in results
-        all_results["_api_checks"] = {
-            "node_name": "API Checks",
-            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            "checks": {
+        # Build checks dict: per-check results when available, else single result (early-return path)
+        if api_check_results:
+            checks_dict = {
+                name + "_check": {
+                    "status": r["status"],
+                    "details": r.get("details", []),
+                    "explanation": r.get("explanation"),
+                    "recommendation": r.get("recommendation"),
+                    "reference": r.get("reference")
+                }
+                for name, r in api_check_results.items()
+            }
+        else:
+            checks_dict = {
                 "telemetry_inband_epg_check": {
                     "status": api_check_result["status"],
                     "details": api_check_result["details"],
@@ -3430,6 +3472,10 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                     "reference": api_check_result.get("reference")
                 }
             }
+        all_results["_api_checks"] = {
+            "node_name": "API Checks",
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "checks": checks_dict
         }
         
         # Update overall status if API check failed
@@ -3510,6 +3556,16 @@ Steps to manually confirm ND is not encountering Telemetry Inband EPG issue:
 
 If the dropdown is populated with text, the setup is not encountering the issue.
 If the dropdown is blank, engage Cisco TAC for assistance in remediation (reference: CSCws23607).
+"""
+
+NXAPI_CERT_VERIFY_MANUAL_STEPS = """
+Steps to manually verify NXAPI certificate verify state:
+1. Log in to the ND UI at https://<nd ip>
+2. Navigate to Fabric Controller: Admin -> Cert Mgmt -> CA Certificates
+3. Check the "NXAPI Certificate Verification" toggle at the top of the page
+
+If the toggle is ON (enabled), disable it before proceeding with upgrade.
+If the toggle is OFF (disabled), no action is needed.
 """
 
 class APICheckResult:
@@ -3842,12 +3898,13 @@ def check_telemetry_inband_epg(api_client, version):
     Reference: CSCws23607
     """
     logger = logging.getLogger(__name__)
-    
+    check_name = "telemetry_inband_epg"
+
     # Check version applicability - only applies to 3.2.x (not 3.1.x or 4.0+)
     major, minor, patch, suffix = get_version_tuple(version)
     if major != 3 or minor != 2:
         return APICheckResult.set_pass(
-            "telemetry_inband_epg",
+            check_name,
             f"ND version {version} != 3.2, check not applicable"
         )
     
@@ -3864,9 +3921,9 @@ def check_telemetry_inband_epg(api_client, version):
     try:
         # Verify API client is authenticated
         if not api_client.is_authenticated():
-            logger.error("[API] API client is not authenticated")
+            logger.warning("[API] API client is not authenticated")
             return APICheckResult.set_warning(
-                "telemetry_inband_epg",
+                check_name,
                 "API client not authenticated",
                 explanation="Could not authenticate to ND management interface",
                 recommendation=MANUAL_VERIFICATION_STEPS,
@@ -3890,7 +3947,7 @@ def check_telemetry_inband_epg(api_client, version):
                 if san_admin_state == "enabled":
                     logger.info("[API] SAN Controller is enabled - check does not apply to SAN persona")
                     return APICheckResult.set_pass(
-                        "telemetry_inband_epg",
+                        check_name,
                         "Check doesn't apply to SAN persona"
                     )
                 else:
@@ -3901,12 +3958,23 @@ def check_telemetry_inband_epg(api_client, version):
         
         # Step 2: Get ndsites data
         logger.info("[API] Fetching ndsites data")
-        ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true')
-        
+        ndsites_fetch_failed = False
+        try:
+            # Use suppress_error_log=True since NDI may not be installed (404 is expected)
+            ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true', suppress_error_log=True)
+        except Exception as e:
+            logger.warning(f"NDI API failure: {str(e)}. Proceeding with check.")
+            ndsites_data = None  # so Step 5 can safely check isinstance(ndsites_data, list)
+            ndsites_fetch_failed = True
+
         # Step 3: Get fabric telemetry config
         logger.info("[API] Fetching fabric telemetry config")
-        fabric_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default')
-        
+        try:
+            fabric_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/telemetry/v2/config/fabric?insightsGroupName=default', suppress_error_log=True)
+        except Exception as e:
+            logger.warning(f"NDI API failure: {str(e)}. Proceeding with check.")
+            fabric_data = None  # so Step 4 can safely check isinstance(fabric_data, dict)
+
         # Step 4: Build mapping of site names to connection types
         fabric_sites = {}
         if isinstance(fabric_data, dict) and "value" in fabric_data and "data" in fabric_data["value"]:
@@ -3948,34 +4016,137 @@ def check_telemetry_inband_epg(api_client, version):
         # Step 6: Return results
         if problematic_sites:
             return APICheckResult.set_fail(
-                "telemetry_inband_epg",
+                check_name,
                 f"Inband EPG is blank for ACI NDI site(s): {', '.join(problematic_sites)}",
                 explanation="Due to a software defect when re-registering an ACI fabric in NDI, the Inband EPG can become blank.\n  This state will cause Nexus Dashboard upgrade to fail.",
                 recommendation="Contact Cisco TAC for assistance in remediating the issue prior to upgrade.",
                 reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
             )
+        elif ndsites_fetch_failed:
+            logger.warning("[API] Could not retrieve ndsites data - cannot confirm no ACI sites exist")
+            return APICheckResult.set_warning(
+                check_name,
+                "Could not retrieve site data from ND API to complete check (API timeout or error)",
+                explanation="Could not complete API-based validation due to an API error or timeout",
+                recommendation=MANUAL_VERIFICATION_STEPS,
+                reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            )
         elif not aci_sites_found:
             logger.info("[API] No ACI sites to check")
             return APICheckResult.set_pass(
-                "telemetry_inband_epg",
+                check_name,
                 "No ACI sites to check"
             )
         else:
             logger.info("[API] All ACI sites with INBAND connection have valid inbandEpgDN")
             return APICheckResult.set_pass(
-                "telemetry_inband_epg",
+                check_name,
                 "All ACI sites validated successfully"
             )
     
     except Exception as e:
-        logger.exception(f"[API] Error during Telemetry Inband EPG API check: {str(e)}")
+        logger.debug(f"[API] Error during Telemetry Inband EPG API check: {str(e)}", exc_info=True)
         return APICheckResult.set_warning(
-            "telemetry_inband_epg",
+            check_name,
             f"Error during API check: {str(e)}",
             explanation="Could not complete API-based validation",
             recommendation=MANUAL_VERIFICATION_STEPS,
             reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
         )
+
+
+def check_nxapi_cert_verify_state(api_client, version):
+    """
+    API-based check for NXAPI certificate verify state.
+
+    Performs a GET to /appcenter/cisco/ndfc/api/v1/sim/cert/nxapi/certVerifyState.
+    Response is JSON: {"enable": true} or {"enable": false}.
+    enable=true -> PASS, enable=false -> FAIL.
+
+    Only applies to ND version 3.2.x (same as check_telemetry_inband_epg).
+
+    Args:
+        api_client: Authenticated NDAPIClient instance
+        version: ND version string (e.g., "3.2.1e")
+
+    Returns:
+        dict: Check result with status, details, explanation, recommendation, reference
+    """
+    logger = logging.getLogger(__name__)
+    check_name = "nxapi_cert_verify_state"
+    url_path = "/appcenter/cisco/ndfc/api/v1/sim/cert/nxapi/certVerifyState"
+
+    try:
+        # Check version applicability - only applies to 3.2.x (not 3.1.x or 4.0+)
+        if not version:
+            return APICheckResult.set_warning(
+                check_name,
+                "ND version not available for API check",
+                recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+            )
+        major, minor, patch, suffix = get_version_tuple(version)
+        if major != 3 or minor != 2:
+            return APICheckResult.set_pass(
+                check_name,
+                f"ND version {version} != 3.2, check not applicable"
+            )
+
+        logger.info(f"[API] ND version {version} is 3.2.x - running NXAPI cert verify state API check")
+
+        if not api_client.is_authenticated():
+            logger.warning("[API] API client is not authenticated")
+            return APICheckResult.set_warning(
+                check_name,
+                "API client not authenticated",
+                explanation="Could not authenticate to ND management interface",
+                recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+            )
+
+        logger.info(f"[API] Running NXAPI cert verify state check: GET {url_path}")
+        data = api_client.get(url_path, suppress_error_log=True)
+
+        if not isinstance(data, dict):
+            logger.warning(f"[API] Unexpected response type: {type(data)}")
+            return APICheckResult.set_warning(
+                check_name,
+                f"Unexpected API response format (expected JSON object)",
+                explanation="Response was not a JSON object",
+                recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+            )
+
+        enable = data.get("enable")
+        if enable is True:
+            logger.info("[API] NXAPI cert verify state: enable=true -> PASS")
+            return APICheckResult.set_fail(
+                check_name,
+                "NXAPI certificate verify state is enabled",
+                explanation="The NXAPI certificate verification is turned on. It should be disabled before upgrade from 3.2.2 is started.",
+                recommendation="Disable NXAPI certificate verification via the ND/NDFC UI [Fabric Controller: Admin->Cert Mgmt -> CA Certificates [Disable NXAPI Certificate verification toggle on the top]]or API before upgrade."
+            )
+        if enable is False:
+            logger.warning("[API] NXAPI cert verify state: enable=false -> FAIL")
+            return APICheckResult.set_pass(
+                check_name,
+                "NXAPI certificate verify state is disabled, upgrade validation is successful"
+            )
+
+        logger.warning(f"[API] Response missing or invalid 'enable' field: {data}")
+        return APICheckResult.set_warning(
+            check_name,
+            f"API response missing or invalid 'enable' field: {data!r}",
+            explanation="Expected {\"enable\": true} or {\"enable\": false}",
+            recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+        )
+
+    except Exception as e:
+        logger.debug(f"[API] Error during NXAPI cert verify state check: {str(e)}", exc_info=True)
+        return APICheckResult.set_warning(
+            check_name,
+            f"Error during API check: {str(e)}",
+            explanation="Could not complete API-based validation",
+            recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+        )
+
 
 def generate_report(all_results, version, overall_status, timing_info=None, skipped_nodes_info=None):
     """Generate a final report based on aggregated results with clear check-by-check output"""
@@ -4134,6 +4305,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             "pod_status", 
             "system_health",
             "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
+            "nxapi_cert_verify_state_check",  # API check - cluster-level (after telemetry)
             "nxos_discovery_service",
             "backup_failure_check",
             "nameserver_duplicate_check",
