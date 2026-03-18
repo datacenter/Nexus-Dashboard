@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.19 (Mar 17, 2026)
+Version: 1.0.20 (Mar 18, 2026)
 """
 
 import re
@@ -301,6 +301,20 @@ def is_valid_ip(ip):
         return True
     except (ValueError, AttributeError):
         return False
+
+def is_valid_fqdn(hostname):
+    """Validate if the string is a valid hostname or FQDN"""
+    if not hostname or len(hostname) > 253:
+        return False
+    # Strip optional trailing dot (fully-qualified)
+    hostname = hostname.rstrip('.')
+    labels = hostname.split('.')
+    label_pattern = re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$')
+    return all(label_pattern.match(label) for label in labels)
+
+def is_valid_host(host):
+    """Validate if the string is a valid IPv4/IPv6 address or hostname/FQDN"""
+    return is_valid_ip(host) or is_valid_fqdn(host)
 
 def check_system_resources():
     """
@@ -4712,7 +4726,7 @@ def main():
 
     # Continue with main function execution
     parser = argparse.ArgumentParser(description="Nexus Dashboard Pre-upgrade Validation Script")
-    parser.add_argument("--ndip", help="IP address of the Nexus Dashboard")
+    parser.add_argument("--ndip", help="IP address or hostname of the Nexus Dashboard")
     parser.add_argument("-p", "--password", help="Password for rescue-user")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to console and preserve temp files")
     parser.add_argument("-b", "--bash", action="store_true", help="Run in GitBash/Windows mode (no sshpass)")
@@ -4723,20 +4737,20 @@ def main():
     print("Nexus Dashboard Pre-upgrade Validation Script")
     print(f"Running validation checks on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Get ND IP with validation
+    # Get ND IP/hostname with validation
     nd_ip = args.ndip
     if not nd_ip:
         while True:
-            nd_ip = input("Enter Nexus Dashboard IP address: ")
-            if is_valid_ip(nd_ip):
+            nd_ip = input("Enter Nexus Dashboard IP address or hostname: ")
+            if is_valid_host(nd_ip):
                 break
             else:
-                print(f"{FAIL} Invalid IP address format. Please enter a valid IPv4 address (e.g., 192.168.1.1)")
+                print(f"{FAIL} Invalid format. Please enter a valid IPv4/IPv6 address or hostname (e.g., 192.168.1.1, 2001:db8::1, or nd.example.com)")
     else:
-        # Also validate IP if provided via command line
-        if not is_valid_ip(nd_ip):
-            print(f"{FAIL} Invalid IP address format: {nd_ip}")
-            print("Please enter a valid IPv4 address (e.g., 192.168.1.1)")
+        # Also validate if provided via command line
+        if not is_valid_host(nd_ip):
+            print(f"{FAIL} Invalid format: {nd_ip}")
+            print("Please enter a valid IPv4/IPv6 address or hostname (e.g., 192.168.1.1, 2001:db8::1, or nd.example.com)")
             return 1
 
     # Get password
@@ -5341,3 +5355,4 @@ def run_diagnostic_mode(node_manager, nodes):
 
 if __name__ == "__main__":
     sys.exit(main())
+    
