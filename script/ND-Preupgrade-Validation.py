@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.18 (Mar 5, 2026)
+Version: 1.0.19 (Mar 17, 2026)
 """
 
 import re
@@ -3558,6 +3558,16 @@ If the dropdown is populated with text, the setup is not encountering the issue.
 If the dropdown is blank, engage Cisco TAC for assistance in remediation (reference: CSCws23607).
 """
 
+NXAPI_CERT_VERIFY_MANUAL_STEPS = """
+Steps to manually verify NXAPI certificate verify state:
+1. Log in to the ND UI at https://<nd ip>
+2. Navigate to Fabric Controller: Admin -> Cert Mgmt -> CA Certificates
+3. Check the "NXAPI Certificate Verification" toggle at the top of the page
+
+If the toggle is ON (enabled), disable it before proceeding with upgrade.
+If the toggle is OFF (disabled), no action is needed.
+"""
+
 class APICheckResult:
     """
     Lightweight result helper for API checks in main script.
@@ -3888,12 +3898,13 @@ def check_telemetry_inband_epg(api_client, version):
     Reference: CSCws23607
     """
     logger = logging.getLogger(__name__)
-    
+    check_name = "telemetry_inband_epg"
+
     # Check version applicability - only applies to 3.2.x (not 3.1.x or 4.0+)
     major, minor, patch, suffix = get_version_tuple(version)
     if major != 3 or minor != 2:
         return APICheckResult.set_pass(
-            "telemetry_inband_epg",
+            check_name,
             f"ND version {version} != 3.2, check not applicable"
         )
     
@@ -3910,9 +3921,9 @@ def check_telemetry_inband_epg(api_client, version):
     try:
         # Verify API client is authenticated
         if not api_client.is_authenticated():
-            logger.error("[API] API client is not authenticated")
+            logger.warning("[API] API client is not authenticated")
             return APICheckResult.set_warning(
-                "telemetry_inband_epg",
+                check_name,
                 "API client not authenticated",
                 explanation="Could not authenticate to ND management interface",
                 recommendation=MANUAL_VERIFICATION_STEPS,
@@ -3936,7 +3947,7 @@ def check_telemetry_inband_epg(api_client, version):
                 if san_admin_state == "enabled":
                     logger.info("[API] SAN Controller is enabled - check does not apply to SAN persona")
                     return APICheckResult.set_pass(
-                        "telemetry_inband_epg",
+                        check_name,
                         "Check doesn't apply to SAN persona"
                     )
                 else:
@@ -3947,12 +3958,14 @@ def check_telemetry_inband_epg(api_client, version):
         
         # Step 2: Get ndsites data
         logger.info("[API] Fetching ndsites data")
+        ndsites_fetch_failed = False
         try:
             # Use suppress_error_log=True since NDI may not be installed (404 is expected)
             ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true', suppress_error_log=True)
         except Exception as e:
             logger.warning(f"NDI API failure: {str(e)}. Proceeding with check.")
             ndsites_data = None  # so Step 5 can safely check isinstance(ndsites_data, list)
+            ndsites_fetch_failed = True
 
         # Step 3: Get fabric telemetry config
         logger.info("[API] Fetching fabric telemetry config")
@@ -4003,29 +4016,38 @@ def check_telemetry_inband_epg(api_client, version):
         # Step 6: Return results
         if problematic_sites:
             return APICheckResult.set_fail(
-                "telemetry_inband_epg",
+                check_name,
                 f"Inband EPG is blank for ACI NDI site(s): {', '.join(problematic_sites)}",
                 explanation="Due to a software defect when re-registering an ACI fabric in NDI, the Inband EPG can become blank.\n  This state will cause Nexus Dashboard upgrade to fail.",
                 recommendation="Contact Cisco TAC for assistance in remediating the issue prior to upgrade.",
                 reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
             )
+        elif ndsites_fetch_failed:
+            logger.warning("[API] Could not retrieve ndsites data - cannot confirm no ACI sites exist")
+            return APICheckResult.set_warning(
+                check_name,
+                "Could not retrieve site data from ND API to complete check (API timeout or error)",
+                explanation="Could not complete API-based validation due to an API error or timeout",
+                recommendation=MANUAL_VERIFICATION_STEPS,
+                reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+            )
         elif not aci_sites_found:
             logger.info("[API] No ACI sites to check")
             return APICheckResult.set_pass(
-                "telemetry_inband_epg",
+                check_name,
                 "No ACI sites to check"
             )
         else:
             logger.info("[API] All ACI sites with INBAND connection have valid inbandEpgDN")
             return APICheckResult.set_pass(
-                "telemetry_inband_epg",
+                check_name,
                 "All ACI sites validated successfully"
             )
     
     except Exception as e:
-        logger.exception(f"[API] Error during Telemetry Inband EPG API check: {str(e)}")
+        logger.debug(f"[API] Error during Telemetry Inband EPG API check: {str(e)}", exc_info=True)
         return APICheckResult.set_warning(
-            "telemetry_inband_epg",
+            check_name,
             f"Error during API check: {str(e)}",
             explanation="Could not complete API-based validation",
             recommendation=MANUAL_VERIFICATION_STEPS,
@@ -4060,7 +4082,7 @@ def check_nxapi_cert_verify_state(api_client, version):
             return APICheckResult.set_warning(
                 check_name,
                 "ND version not available for API check",
-                recommendation=MANUAL_VERIFICATION_STEPS
+                recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
             )
         major, minor, patch, suffix = get_version_tuple(version)
         if major != 3 or minor != 2:
@@ -4072,16 +4094,16 @@ def check_nxapi_cert_verify_state(api_client, version):
         logger.info(f"[API] ND version {version} is 3.2.x - running NXAPI cert verify state API check")
 
         if not api_client.is_authenticated():
-            logger.error("[API] API client is not authenticated")
+            logger.warning("[API] API client is not authenticated")
             return APICheckResult.set_warning(
                 check_name,
                 "API client not authenticated",
                 explanation="Could not authenticate to ND management interface",
-                recommendation=MANUAL_VERIFICATION_STEPS
+                recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
             )
 
         logger.info(f"[API] Running NXAPI cert verify state check: GET {url_path}")
-        data = api_client.get(url_path, suppress_error_log=False)
+        data = api_client.get(url_path, suppress_error_log=True)
 
         if not isinstance(data, dict):
             logger.warning(f"[API] Unexpected response type: {type(data)}")
@@ -4089,7 +4111,7 @@ def check_nxapi_cert_verify_state(api_client, version):
                 check_name,
                 f"Unexpected API response format (expected JSON object)",
                 explanation="Response was not a JSON object",
-                recommendation=MANUAL_VERIFICATION_STEPS
+                recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
             )
 
         enable = data.get("enable")
@@ -4113,16 +4135,16 @@ def check_nxapi_cert_verify_state(api_client, version):
             check_name,
             f"API response missing or invalid 'enable' field: {data!r}",
             explanation="Expected {\"enable\": true} or {\"enable\": false}",
-            recommendation=MANUAL_VERIFICATION_STEPS
+            recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
         )
 
     except Exception as e:
-        logger.exception(f"[API] Error during NXAPI cert verify state check: {str(e)}")
+        logger.debug(f"[API] Error during NXAPI cert verify state check: {str(e)}", exc_info=True)
         return APICheckResult.set_warning(
             check_name,
             f"Error during API check: {str(e)}",
             explanation="Could not complete API-based validation",
-            recommendation=MANUAL_VERIFICATION_STEPS
+            recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
         )
 
 
@@ -4283,6 +4305,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             "pod_status", 
             "system_health",
             "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
+            "nxapi_cert_verify_state_check",  # API check - cluster-level (after telemetry)
             "nxos_discovery_service",
             "backup_failure_check",
             "nameserver_duplicate_check",
