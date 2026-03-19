@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.20 (Mar 18, 2026)
+Version: 1.0.21 (Mar 18, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -52,6 +52,11 @@ except ImportError:
 # Base directory for all operations
 BASE_DIR = "/tmp/ndpreupgradecheck"
 NODE_NAME = socket.gethostname().strip()
+
+# Pre-fetched live node data injected by the orchestrator in 4.1.x local mode.
+# Keys are exact command strings (e.g. "acs show nodes"); run_command() returns
+# the pre-fetched value instead of running the command locally.
+PRELOADED_COMMANDS = {}
 RESULTS_FILE = "{0}/{1}_results.json".format(BASE_DIR, NODE_NAME)
 STATUS_FILE = "{0}/{1}_status.json".format(BASE_DIR, NODE_NAME)
 
@@ -697,8 +702,14 @@ def update_status(status_value, operation, progress=0):
 
 def run_command(cmd, timeout=300):
     """OPTIMIZED: Wrapper for unified command runner - maintains compatibility"""
+    # In 4.1.x local mode the orchestrator pre-fetches live ND CLI output via SSH
+    # and stores it in PRELOADED_COMMANDS.  Return that cached value immediately so
+    # checks that call e.g. 'acs show nodes' still work when running on localhost.
+    if cmd in PRELOADED_COMMANDS:
+        return PRELOADED_COMMANDS[cmd]
+
     stdout, stderr, returncode = run_command_unified(cmd, timeout=timeout)
-    
+
     # Legacy behavior: return stdout only for compatibility
     if returncode == 0:
         return stdout
@@ -1402,135 +1413,42 @@ def check_disk_space(tech_file):
         results["checks"]["disk_space"]["recommendation"] = "Contact Cisco TAC for assistance to reduce disk space utilization before proceeding\n  with the upgrade."
     
     elif file_path_used is None:
-        # Fallback to direct command for live system
+        # Fallback to direct command for live system.
+        # run_command() is used here (rather than bare subprocess) so that in 4.1.x
+        # local mode the pre-fetched 'df -h' output from the real ND node is used
+        # instead of the localhost filesystem.
         print("[WARNING] No disk space data found in tech support, trying live command")
-        
-        # Use a Python 2.7 compatible approach for process management
-        if sys.version_info[0] < 3:
-            # Python 2.7 approach using Popen
-            process = subprocess.Popen(
-                "df -h", 
-                shell=True, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE
-            )
-            stdout, stderr = process.communicate()
-            
-            # Process the output lines
-            lines = stdout.splitlines()
-            # Skip the header line
-            if len(lines) > 0:
-                lines = lines[1:]
-                
+        df_output = run_command("df -h")
+        if df_output:
+            lines = df_output.splitlines()
+            if lines:
+                lines = lines[1:]  # skip header
             under_threshold_count = 0
-            
-            # Process each line
             for line in lines:
-                # For Python 2.7, decode the line if it's bytes
-                if isinstance(line, binary_type):
-                    line = line.decode('utf-8', errors='replace')
-                    
                 parts = line.split()
-                if len(parts) < 5:  # Need at least filesystem, size, used, avail, use%
+                if len(parts) < 5:
                     continue
-                
-                # Find the column with usage percentage (contains '%')
                 use_percent = None
                 mount_point = None
-                
                 for i, part in enumerate(parts):
                     if '%' in part:
                         use_percent = part.strip('%')
-                        # Mount point is typically after the percentage column
-                        if i+1 < len(parts):
-                            mount_point = ' '.join(parts[i+1:])
+                        if i + 1 < len(parts):
+                            mount_point = ' '.join(parts[i + 1:])
                         break
-                
                 if use_percent is None or mount_point is None:
                     continue
-                
-                # Skip /tmp/isomount* directories - these are temporary ISO mount points
-                # 100% usage is normal when an upgrade ISO is mounted
                 if mount_point.startswith('/tmp/isomount'):
                     continue
-                
-                # Skip /data/services/oci_repo/boot-disk - used for upgrade ISO mapping
-                # High usage is expected when ISOs are mapped for subsequent upgrades
                 if mount_point.startswith('/data/services/oci_repo/boot-disk'):
                     continue
-                
                 try:
-                    use_percent_int = int(use_percent)
-                    
-                    if use_percent_int >= 70:
+                    if int(use_percent) >= 70:
                         print("[FAIL] {0} is {1}% full".format(mount_point, use_percent))
                         high_usage_dirs.append("{0} is {1}% full".format(mount_point, use_percent))
                     else:
                         under_threshold_count += 1
                 except ValueError:
-                    # Skip if parsing fails
-                    pass
-                
-        else:
-            # Python 3.x approach using subprocess.run with universal_newlines
-            process = subprocess.run(
-                "df -h", 
-                shell=True, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                check=False
-            )
-            
-            # Process the output lines
-            lines = process.stdout.splitlines()
-            # Skip the header line
-            if len(lines) > 0:
-                lines = lines[1:]
-                
-            under_threshold_count = 0
-            
-            # Process each line
-            for line in lines:
-                parts = line.split()
-                if len(parts) < 5:  # Need at least filesystem, size, used, avail, use%
-                    continue
-                
-                # Find the column with usage percentage (contains '%')
-                use_percent = None
-                mount_point = None
-                
-                for i, part in enumerate(parts):
-                    if '%' in part:
-                        use_percent = part.strip('%')
-                        # Mount point is typically after the percentage column
-                        if i+1 < len(parts):
-                            mount_point = ' '.join(parts[i+1:])
-                        break
-                
-                if use_percent is None or mount_point is None:
-                    continue
-                
-                # Skip /tmp/isomount* directories - these are temporary ISO mount points
-                # 100% usage is normal when an upgrade ISO is mounted
-                if mount_point.startswith('/tmp/isomount'):
-                    continue
-                
-                # Skip /data/services/oci_repo/boot-disk - used for upgrade ISO mapping
-                # High usage is expected when ISOs are mapped for subsequent upgrades
-                if mount_point.startswith('/data/services/oci_repo/boot-disk'):
-                    continue
-                
-                try:
-                    use_percent_int = int(use_percent)
-                    
-                    if use_percent_int >= 70:
-                        print("[FAIL] {0} is {1}% full".format(mount_point, use_percent))
-                        high_usage_dirs.append("{0} is {1}% full".format(mount_point, use_percent))
-                    else:
-                        under_threshold_count += 1
-                except ValueError:
-                    # Skip if parsing fails
                     pass
         
         # Set results based on live command
@@ -1829,57 +1747,60 @@ def check_system_health(tech_file=None):
     """Check overall system health"""
     print_section("Checking System Health on {0}".format(NODE_NAME))
     update_status("running", "Checking system health", 98)
-    
-    # If tech_file is provided, extract health info from it
-    health_info = None
-    from_tech = False
-    
-    if tech_file and os.path.exists(tech_file):
-        print("Looking for system health information in extracted tech support")
-        
-        # Find already extracted health files
-        node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
-        health_file_paths = [
-            "{0}/acs-checks/acs_health".format(node_dir),   # Primary path to look for health file
-            "{0}/acs_health".format(node_dir)               # Fallback path
-        ]
-        
-        health_files = []
-        for path in health_file_paths:
-            if os.path.exists(path):
-                health_files.append(path)
-                break
-        
-        if health_files:
-            try:
-                # Load the entire file into memory at once
-                with open(health_files[0], 'r') as f:
-                    health_info = f.read()
-                    from_tech = True
-                    print("Found health information in tech support")
-            except Exception as e:
-                print("[WARNING] Error reading health file from tech support: {0}".format(str(e)))
-        else:
-            # If files not found where expected, search for them more broadly
-            find_cmd = "find {0} -name 'acs_health' -type f -print".format(node_dir)
-            found_files = run_command(find_cmd).strip().split('\n')
-            found_files = [f for f in found_files if f]
-            
-            if found_files:
+
+    # If the orchestrator pre-fetched 'acs health' via SSH (4.1.x local mode), use
+    # that as the authoritative source.  It reflects the current state of the node,
+    # whereas the acs_health file inside the tech support may be hours or days old.
+    if "acs health" in PRELOADED_COMMANDS:
+        health_info = PRELOADED_COMMANDS["acs health"]
+        print("Using pre-fetched live health data (4.1.x mode)")
+    else:
+        # Non-4.1.x path: try tech support first, fall back to live command.
+        health_info = None
+
+        if tech_file and os.path.exists(tech_file):
+            print("Looking for system health information in extracted tech support")
+
+            # Find already extracted health files
+            node_dir = "{0}/{1}".format(BASE_DIR, NODE_NAME)
+            health_file_paths = [
+                "{0}/acs-checks/acs_health".format(node_dir),
+                "{0}/acs_health".format(node_dir)
+            ]
+
+            health_files = []
+            for path in health_file_paths:
+                if os.path.exists(path):
+                    health_files.append(path)
+                    break
+
+            if health_files:
                 try:
-                    with open(found_files[0], 'r') as f:
+                    with open(health_files[0], 'r') as f:
                         health_info = f.read()
-                        from_tech = True
-                        print("Found health information in tech support at {0}".format(found_files[0]))
+                    print("Found health information in tech support")
                 except Exception as e:
-                    print("[WARNING] Error reading found health file: {0}".format(str(e)))
+                    print("[WARNING] Error reading health file from tech support: {0}".format(str(e)))
             else:
-                print("No health information found in extracted tech support")
-    
-    # If we couldn't get health info from tech support, use live command
-    if not health_info:
-        print("Getting live system health status")
-        health_info = run_command("acs health")
+                # Search more broadly if not found in expected paths
+                find_cmd = "find {0} -name 'acs_health' -type f -print".format(node_dir)
+                found_files = run_command(find_cmd).strip().split('\n')
+                found_files = [f for f in found_files if f]
+
+                if found_files:
+                    try:
+                        with open(found_files[0], 'r') as f:
+                            health_info = f.read()
+                        print("Found health information in tech support at {0}".format(found_files[0]))
+                    except Exception as e:
+                        print("[WARNING] Error reading found health file: {0}".format(str(e)))
+                else:
+                    print("No health information found in extracted tech support")
+
+        # If we couldn't get health info from tech support, use live command
+        if not health_info:
+            print("Getting live system health status")
+            health_info = run_command("acs health")
     
     # Process health information - same logic for both tech support and live output
     if "All components are healthy" in health_info:
@@ -2254,6 +2175,13 @@ def check_backup_failure(tech_file):
 
 def ping(host):
     """Ping a host and return True if successful. Works with both IPv4 and IPv6."""
+    # In 4.1.x local mode the orchestrator pre-fetches each 'ping -c 3 <ip>' result
+    # from the real ND node via SSH.  Use that instead of pinging from localhost.
+    preloaded_key = "ping -c 3 {0}".format(host)
+    if preloaded_key in PRELOADED_COMMANDS:
+        output = PRELOADED_COMMANDS[preloaded_key]
+        return "0% packet loss" in output or "0.0% packet loss" in output
+
     try:
         # On Nexus Dashboard, the regular 'ping' command handles both IPv4 and IPv6
         # No need for separate ping6 command
@@ -4653,9 +4581,28 @@ def cleanup_processes():
 
 def main():
     """Main worker function using single extraction approach"""
-    global NODE_NAME, RESULTS_FILE, STATUS_FILE
+    global NODE_NAME, RESULTS_FILE, STATUS_FILE, BASE_DIR, PRELOADED_COMMANDS
     signal.signal(signal.SIGINT, signal_handler)
-    
+
+    # Optional argv[5]: override BASE_DIR so all output stays in a caller-specified
+    # directory (used by the 4.1.x local-execution path to keep everything inside the
+    # script's working directory instead of /tmp/ndpreupgradecheck).
+    if len(sys.argv) > 5 and sys.argv[5].strip():
+        BASE_DIR = sys.argv[5].strip()
+
+    # Optional argv[6]: path to a JSON file containing pre-fetched live ND CLI outputs
+    # (written by the orchestrator in 4.1.x mode before launching this worker).
+    # Loading it populates PRELOADED_COMMANDS so live checks (version, node status,
+    # ping, subnet) still work correctly even though we run on localhost.
+    if len(sys.argv) > 6 and sys.argv[6].strip():
+        live_data_file = sys.argv[6].strip()
+        try:
+            with open(live_data_file, 'r') as _ldf:
+                PRELOADED_COMMANDS.update(json.load(_ldf))
+            print("[INFO] Loaded pre-fetched live node data ({0} command(s))".format(len(PRELOADED_COMMANDS)))
+        except Exception as _exc:
+            print("[WARNING] Could not load live data file {0}: {1}".format(live_data_file, _exc))
+
     # Parse node name early if provided (fixes hostname=localhost issue)
     # This overrides the socket.gethostname() value if provided
     if len(sys.argv) > 4:
@@ -4663,21 +4610,19 @@ def main():
         RESULTS_FILE = "{0}/{1}_results.json".format(BASE_DIR, NODE_NAME)
         STATUS_FILE = "{0}/{1}_status.json".format(BASE_DIR, NODE_NAME)
         results["node_name"] = NODE_NAME
-    
+
     print("\nStarting Nexus Dashboard Pre-upgrade Validation on {0}".format(NODE_NAME))
     print("Running at {0}\n".format(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
-    
+
     try:
         # Create the base directory
         if sys.version_info[0] < 3:
-            # Python 2.7 approach - no exist_ok parameter
             if not os.path.exists(BASE_DIR):
                 os.makedirs(BASE_DIR)
         else:
-            # Python 3.x approach
             os.makedirs(BASE_DIR, exist_ok=True)
-        
-        # Check if we have enough space in /tmp
+
+        # Check if we have enough space in the working area
         check_tmp_space()
         
         # Get tech support file

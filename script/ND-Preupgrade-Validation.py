@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.20 (Mar 18, 2026)
+Version: 1.0.21 (Mar 18, 2026)
 """
 
 import re
@@ -468,6 +468,19 @@ class NDNodeManager:
         ssh_opts_str = " ".join(ssh_opts)
         # Use SSHPASS environment variable method which is more reliable than -p flag
         return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {local_file} {self.username}@{node_ip}:{remote_file}"
+
+    def build_scp_download_command(self, node_ip, remote_file, local_file):
+        """Build SCP command to download a file FROM a node TO localhost"""
+        ssh_opts = self.ssh_options.copy()
+
+        if self.legacy_ssh_mode:
+            ssh_opts.extend([
+                "-o HostKeyAlgorithms=+ssh-rsa",
+                "-o PubkeyAcceptedKeyTypes=+ssh-rsa"
+            ])
+
+        ssh_opts_str = " ".join(ssh_opts)
+        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {self.username}@{node_ip}:{remote_file} {local_file}"
 
     def enable_legacy_ssh_mode(self):
         """Enable legacy SSH mode (ssh-rsa) for compatibility with older ND versions"""
@@ -1059,7 +1072,7 @@ class NDNodeManager:
             # Need at least 7 parts: name, serial, version, role, datanet, mgmtnet, status
             # OR could be continuation line with just datanet and mgmtnet
             if len(parts) >= 7:
-                # This is a full node line with Master role
+                # This is a full node line with any role (Master, Worker, Standby, etc.)
                 node_name = parts[0].replace('*', '').strip()
                 serial = parts[1].strip()
                 version = parts[2].strip()
@@ -1070,10 +1083,10 @@ class NDNodeManager:
 
                 logger.debug(f"Checking node: name={node_name}, role={role}, status={status}")
 
-                # Check for Master role (case insensitive)
-                if role.lower() == "master":
+                # Accept all roles (Master, Worker, Standby, etc.) - no role filtering
+                if node_name:
                     current_node_name = node_name
-                    logger.debug(f"Processing Master node: {node_name}")
+                    logger.debug(f"Processing node: {node_name} (role={role})")
 
                     # Create or update node record
                     if node_name not in node_dict:
@@ -1081,7 +1094,7 @@ class NDNodeManager:
                             "name": node_name,
                             "serial": serial,
                             "version": version,
-                            "role": "Master",
+                            "role": role,
                             "datanetwork": [],
                             "mgmtnetwork": [],
                             "status": status
@@ -2932,11 +2945,1295 @@ class MultipleFileManager:
             return self.files[index]
         return None
 
-def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None):
-    """Process all nodes with validation script using optimal resource-based concurrency"""
+
+###############################################################
+# 4.1.x Local Execution Path
+###############################################################
+
+class _MultiBarDisplay:
+    """
+    Renders N stacked live progress bars for concurrent file downloads.
+
+    A single coordinator background thread owns ALL terminal writes, using
+    ANSI cursor movement to redraw each bar in place.  Download threads never
+    write to the terminal; they only update the shared state dict returned by
+    get_state_ref(name).
+
+    Typical lifecycle:
+        mbd = _MultiBarDisplay([{"name": "nd1", "total": 772243456}, ...])
+        mbd.start()                          # prints N initial bars, starts coordinator
+        # ... parallel downloads running, each updating state_ref["transferred"] ...
+        mbd.mark_done("nd1", success=True)   # called as each download finishes
+        mbd.stop()                           # final render then coordinator stops
+    """
+
+    BAR_WIDTH = 28
+    BAR_FILL  = "\u2588"   # █
+    BAR_EMPTY = "\u2591"   # ░
+    CYAN      = "\033[96m"
+    GREEN     = "\033[92m"
+    RED       = "\033[91m"
+    GREY      = "\033[90m"
+    BOLD      = "\033[1m"
+    RESET     = "\033[0m"
+
+    def __init__(self, items):
+        # items: list of {"name": node_name, "total": total_bytes (int, 0 if unknown)}
+        self._items  = items
+        self._n      = len(items)
+        self._states = {
+            it["name"]: {
+                "transferred": 0,
+                "total":       it["total"],
+                "done":        False,
+                "failed":      False,
+                "samples":     [],   # (monotonic_time, bytes) for speed calculation
+            }
+            for it in items
+        }
+        self._stop   = threading.Event()
+        self._thread = None
+
+    def get_state_ref(self, name):
+        """Return the mutable state dict; download thread sets state['transferred'] to report progress."""
+        return self._states[name]
+
+    def mark_done(self, name, success=True, final_size=None):
+        s = self._states[name]
+        if final_size is not None:
+            s["transferred"] = final_size
+        elif s["total"]:
+            s["transferred"] = s["total"]
+        s["done"]   = True
+        s["failed"] = not success
+
+    def start(self):
+        """Print N initial bar lines and start the coordinator thread."""
+        for it in self._items:
+            sys.stdout.write(f"{self._render_line(it['name'])}\033[K\n")
+        sys.stdout.flush()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop the coordinator thread and do a final redraw."""
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+        self._redraw()   # final state — all bars show Done / FAILED
+
+    # ------------------------------------------------------------------
+    # Internal helpers — only called from the coordinator thread
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fmt_bytes(n):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024 or unit == "TB":
+                return f"{n:.1f} {unit}"
+            n /= 1024
+
+    @staticmethod
+    def _fmt_time(secs):
+        if secs < 0 or secs > 86400:
+            return "--:--"
+        m, s = divmod(int(secs), 60)
+        h, m = divmod(m, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+    def _render_line(self, name):
+        import shutil as _sh
+        s           = self._states[name]
+        total       = s["total"]
+        transferred = s["transferred"]
+        done        = s["done"]
+        failed      = s["failed"]
+
+        # Update speed samples (coordinator-thread-only; no locking needed)
+        now = time.monotonic()
+        s["samples"].append((now, transferred))
+        s["samples"] = [(t, b) for t, b in s["samples"] if t >= now - 5.0]
+
+        speed = 0.0
+        smp   = s["samples"]
+        if len(smp) >= 2:
+            dt = smp[-1][0] - smp[0][0]
+            db = smp[-1][1] - smp[0][1]
+            if dt > 0:
+                speed = db / dt
+        eta = (total - transferred) / speed if (speed > 0 and total) else -1.0
+
+        if total and total > 0:
+            pct      = min(transferred / total, 1.0)
+            filled   = int(self.BAR_WIDTH * pct)
+            bar      = (f"[{self.CYAN}{self.BAR_FILL * filled}"
+                        f"{self.GREY}{self.BAR_EMPTY * (self.BAR_WIDTH - filled)}{self.RESET}]")
+            pct_str  = f"{self.BOLD}{pct * 100:5.1f}%{self.RESET}"
+            size_str = f"{self._fmt_bytes(transferred)} / {self._fmt_bytes(total)}"
+        else:
+            bar      = f"[{self.CYAN}{self.BAR_EMPTY * self.BAR_WIDTH}{self.RESET}]"
+            pct_str  = "  ???  "
+            size_str = self._fmt_bytes(transferred)
+
+        if done and not failed:
+            tail = f"{self.GREEN}Done{self.RESET}"
+        elif done and failed:
+            tail = f"{self.RED}FAILED{self.RESET}"
+        else:
+            speed_str = f"{self._fmt_bytes(speed)}/s" if speed > 0 else "  ---  "
+            eta_str   = self._fmt_time(eta) if (speed > 0 and total) else "--:--"
+            tail      = f"{speed_str}  ETA {eta_str}"
+
+        cols = _sh.get_terminal_size((80, 24)).columns
+        line = f"  [{name}] {bar} {pct_str}  {size_str}  {tail}"
+        # Truncate to terminal width, preserving ANSI escape sequences
+        visible = ""
+        vis_len = 0
+        i       = 0
+        while i < len(line):
+            if vis_len >= cols - 1:
+                break
+            if line[i] == "\033":
+                j = line.find("m", i)
+                if j == -1:
+                    break
+                visible += line[i:j + 1]
+                i = j + 1
+            else:
+                visible += line[i]
+                vis_len += 1
+                i += 1
+        return visible + self.RESET
+
+    def _redraw(self):
+        sys.stdout.write(f"\033[{self._n}A")
+        for it in self._items:
+            sys.stdout.write(f"\r{self._render_line(it['name'])}\033[K\n")
+        sys.stdout.flush()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._redraw()
+            self._stop.wait(0.5)
+
+
+class LocalTechSupportManager:
+    """
+    Manages downloading tech support files from ND nodes to localhost for 4.1.x clusters.
+    On 4.1.x, rescue-user lacks write access to /tmp on the nodes so the worker script
+    cannot extract the tech support there.  Instead we SCP the file locally and run
+    worker_functions.py on the local machine.
+    """
+
+    LOCAL_STAGING_DIR = "nd-preupgrade-local-ts"  # relative to cwd
+    EXTRACTION_EXPANSION_FACTOR = 3               # tgz typically expands 3x
+
+    def __init__(self, node_manager):
+        self.node_manager = node_manager
+        self.staging_dir = os.path.join(os.getcwd(), self.LOCAL_STAGING_DIR)
+
+    def _node_staging_dir(self, node_name):
+        return os.path.join(self.staging_dir, node_name)
+
+    def _ensure_node_dir(self, node_name):
+        node_dir = self._node_staging_dir(node_name)
+        os.makedirs(node_dir, exist_ok=True)
+        return node_dir
+
+    def get_remote_file_size_bytes(self, node, remote_path):
+        """Return file size in bytes on the remote node, or None on failure."""
+        cmd = self.node_manager.build_ssh_command(
+            node['ip'], f"stat -c %s {remote_path} 2>/dev/null || stat -f %z {remote_path} 2>/dev/null"
+        )
+        try:
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _ = process.communicate(timeout=30)
+            return int(stdout.decode('utf-8').strip())
+        except Exception:
+            return None
+
+    def get_remote_md5(self, node, remote_path):
+        """Return md5 hex string of file on remote node, or None on failure."""
+        cmd = self.node_manager.build_ssh_command(
+            node['ip'], f"md5sum {remote_path} 2>/dev/null | awk '{{print $1}}'"
+        )
+        try:
+            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _ = process.communicate(timeout=120)
+            result = stdout.decode('utf-8').strip()
+            return result if result else None
+        except Exception:
+            return None
+
+    def get_local_md5(self, local_path):
+        """Return md5 hex string of a local file, or None on failure."""
+        import hashlib
+        try:
+            h = hashlib.md5()
+            with open(local_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(65536), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    def _download_with_progress(self, node, remote_path, local_path, total_bytes, parallel=False, print_lock=None, state_ref=None):
+        """
+        Execute the SCP download and display a live progress bar.
+
+        A background thread polls the growing local file every 0.5 s and renders:
+
+            [████████████░░░░░░░░░░░░]  48.3%  1.06 GB / 2.20 GB  18.4 MB/s  ETA 01:01
+
+        When state_ref is provided (_MultiBarDisplay parallel mode), all terminal
+        writes are suppressed; the progress loop just sets state_ref["transferred"]
+        so the coordinator thread can render.
+
+        On non-interactive terminals a prefixed status line is printed every 15 s.
+
+        Returns (returncode, stderr_text).
+          returncode == -1  ->  60-minute timeout hit
+          returncode == -2  ->  failed to launch SCP process
+        """
+        import threading
+        import time
+
+        CYAN      = "\033[96m"
+        GREY      = "\033[90m"
+        BOLD      = "\033[1m"
+        RESET     = "\033[0m"
+        BAR_FILL  = "\u2588"   # █
+        BAR_EMPTY = "\u2591"   # ░
+        BAR_WIDTH = 30
+
+        def _fmt_bytes(n):
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if n < 1024 or unit == "TB":
+                    return f"{n:.1f} {unit}"
+                n /= 1024
+
+        def _fmt_time(secs):
+            if secs < 0 or secs > 86400:
+                return "--:--"
+            m, s = divmod(int(secs), 60)
+            h, m = divmod(m, 60)
+            return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+        def _render(tick, transferred, speed, eta):
+            import shutil as _sh
+            cols = _sh.get_terminal_size((80, 24)).columns
+            if total_bytes and total_bytes > 0:
+                pct      = min(transferred / total_bytes, 1.0)
+                filled   = int(BAR_WIDTH * pct)
+                bar      = f"[{CYAN}{BAR_FILL * filled}{GREY}{BAR_EMPTY * (BAR_WIDTH - filled)}{RESET}]"
+                pct_str  = f"{BOLD}{pct * 100:5.1f}%{RESET}"
+                size_str = f"{_fmt_bytes(transferred)} / {_fmt_bytes(total_bytes)}"
+            else:
+                spinner  = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+                bar      = f"[{CYAN}{spinner[tick % len(spinner)]}{' ' * (BAR_WIDTH - 1)}{RESET}]"
+                pct_str  = "  ???  "
+                size_str = _fmt_bytes(transferred)
+            speed_str = f"{_fmt_bytes(speed)}/s" if speed > 0 else "  ---  "
+            eta_str   = _fmt_time(eta) if (speed > 0 and total_bytes) else "--:--"
+            raw = f"  {bar} {pct_str}  {size_str}  {speed_str}  ETA {eta_str}"
+            # Truncate to terminal width, preserving ANSI escape sequences
+            visible  = ""
+            vis_len  = 0
+            i        = 0
+            while i < len(raw):
+                if vis_len >= cols - 1:
+                    break
+                if raw[i] == "\033":
+                    j = raw.find("m", i)
+                    if j == -1:
+                        break
+                    visible += raw[i:j + 1]
+                    i = j + 1
+                else:
+                    visible += raw[i]
+                    vis_len += 1
+                    i += 1
+            return visible + RESET
+
+        scp_cmd = self.node_manager.build_scp_download_command(node["ip"], remote_path, local_path)
+        try:
+            process = subprocess.Popen(scp_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as exc:
+            return -2, str(exc)
+
+        # parallel=True forces log-style output to avoid \r races across threads
+        is_tty     = sys.stdout.isatty() and not parallel
+        node_name  = node.get("name", "")
+        stop_event = threading.Event()
+
+        def _safe_print(msg):
+            """Thread-safe print; uses lock when provided."""
+            if print_lock is not None:
+                with print_lock:
+                    print(msg)
+            else:
+                print(msg)
+
+        def _progress_loop():
+            samples         = []   # [(monotonic_float, bytes_int)]
+            WINDOW          = 5.0  # sliding-window width in seconds
+            tick            = 0
+            last_print_time = 0.0
+            # Shorter interval in parallel mode so users see meaningful updates
+            log_interval    = 15.0 if parallel else 30.0
+            while not stop_event.is_set():
+                now = time.monotonic()
+                try:
+                    transferred = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+                except OSError:
+                    transferred = 0
+                samples.append((now, transferred))
+                samples = [(t, b) for t, b in samples if t >= now - WINDOW]
+                speed = 0.0
+                if len(samples) >= 2:
+                    dt = samples[-1][0] - samples[0][0]
+                    db = samples[-1][1] - samples[0][1]
+                    if dt > 0:
+                        speed = db / dt
+                eta = (total_bytes - transferred) / speed if (speed > 0 and total_bytes) else -1.0
+                if is_tty:
+                    sys.stdout.write(f"\r{_render(tick, transferred, speed, eta)}\033[K")
+                    sys.stdout.flush()
+                else:
+                    if state_ref is not None:
+                        state_ref["transferred"] = transferred
+                    elif now - last_print_time >= log_interval and transferred > 0:
+                        prefix = f"  [{node_name}]" if parallel and node_name else "    ..."
+                        parts = [f"{prefix} {_fmt_bytes(transferred)} transferred"]
+                        if total_bytes:
+                            pct = transferred / total_bytes * 100
+                            parts.append(f"({pct:.0f}%) of {_fmt_bytes(total_bytes)}")
+                        if speed > 0:
+                            parts.append(f"at {_fmt_bytes(speed)}/s")
+                        if eta > 0:
+                            parts.append(f"ETA {_fmt_time(eta)}")
+                        _safe_print(" ".join(parts))
+                        last_print_time = now
+                tick += 1
+                stop_event.wait(0.5)
+
+        if is_tty:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        progress_thread = threading.Thread(target=_progress_loop, daemon=True)
+        progress_thread.start()
+
+        stderr_data = b""
+        returncode  = 0
+        try:
+            _, stderr_data = process.communicate(timeout=3600)
+            returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            returncode = -1
+        except Exception as exc:
+            process.kill()
+            try:
+                process.communicate()
+            except Exception:
+                pass
+            returncode  = -2
+            stderr_data = str(exc).encode()
+        finally:
+            stop_event.set()
+            progress_thread.join(timeout=2)
+
+        if is_tty:
+            try:
+                final_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+            except OSError:
+                final_size = 0
+            if returncode == 0 and total_bytes:
+                # Clean completion: fully-filled bar + "Done" label
+                bar      = f"[{CYAN}{BAR_FILL * BAR_WIDTH}{RESET}]"
+                size_str = f"{_fmt_bytes(total_bytes)} / {_fmt_bytes(total_bytes)}"
+                sys.stdout.write(f"\r  {bar} {BOLD}100.0%{RESET}  {size_str}  Done\033[K\n")
+            else:
+                display = total_bytes or final_size
+                sys.stdout.write(f"\r{_render(0, display, 0.0, -1.0)}\033[K\n")
+            sys.stdout.flush()
+
+        return returncode, stderr_data.decode("utf-8", errors="replace")
+
+    def download_tech_support(self, node, remote_path, parallel=False, print_lock=None, state_ref=None):
+        """
+        SCP a tech support file from a node to the local staging directory.
+
+        Handles the re-run safety case: if the local file already exists, compare
+        md5sums.  If they match reuse the file; if they differ (possible corruption
+        from a previous interrupted run) delete and re-download.
+
+        If the remote file no longer exists but an existing local file is present,
+        the local file is accepted as-is (the user may have pre-populated the
+        directory manually).
+
+        Returns the local path on success, or None on failure.
+        """
+        node_name = node['name']
+        filename = os.path.basename(remote_path)
+        node_dir = self._ensure_node_dir(node_name)
+        local_path = os.path.join(node_dir, filename)
+
+        # --- re-run safety ---
+        if os.path.exists(local_path):
+            logger.info(f"[LocalTS] {node_name}: local file already exists: {local_path}")
+            if state_ref is None:
+                print(f"  Found existing local file for {node_name}: {filename}")
+                print(f"  Verifying integrity (md5sum)...")
+
+            remote_md5 = self.get_remote_md5(node, remote_path)
+            local_md5 = self.get_local_md5(local_path)
+
+            if remote_md5 and local_md5:
+                if remote_md5 == local_md5:
+                    if state_ref is None:
+                        print(f"  {PASS} md5sum matches — reusing existing file.")
+                    logger.info(f"[LocalTS] {node_name}: md5sum match, reusing {local_path}")
+                    return local_path
+                else:
+                    if state_ref is None:
+                        print(f"  {WARNING} md5sum mismatch — local file may be corrupt. Re-downloading...")
+                    logger.warning(f"[LocalTS] {node_name}: md5sum mismatch (local={local_md5} remote={remote_md5}), re-downloading")
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        pass
+            elif remote_md5 is None and local_md5:
+                # Remote file gone — accept local file without point-of-reference
+                if state_ref is None:
+                    print(f"  Remote file no longer accessible; accepting local file as-is.")
+                logger.info(f"[LocalTS] {node_name}: remote md5 unavailable, accepting local file")
+                return local_path
+            else:
+                if state_ref is None:
+                    print(f"  {WARNING} Could not compute md5sum — re-downloading to be safe...")
+                logger.warning(f"[LocalTS] {node_name}: md5 computation failed, re-downloading")
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+
+        # --- download ---
+        total_bytes = self.get_remote_file_size_bytes(node, remote_path)
+        size_hint   = f"  ({total_bytes / (1024 ** 3):.2f} GB)" if total_bytes else ""
+        if state_ref is None:
+            print(f"  Downloading {filename} from {node_name}{size_hint}...")
+        logger.info(f"[LocalTS] Downloading {remote_path} from {node_name} ({node['ip']}) -> {local_path}")
+        returncode, err_text = self._download_with_progress(node, remote_path, local_path, total_bytes,
+                                                             parallel=parallel, print_lock=print_lock,
+                                                             state_ref=state_ref)
+        if returncode == -1:
+            if state_ref is None:
+                print(f"  {FAIL} SCP download timed out for {node_name}")
+            logger.error(f"[LocalTS] SCP download timed out for {node_name}")
+            return None
+        if returncode != 0:
+            if state_ref is None:
+                print(f"  {FAIL} SCP download failed for {node_name}: {err_text.strip()}")
+            logger.error(f"[LocalTS] SCP download failed for {node_name}: {err_text.strip()}")
+            return None
+
+        if not os.path.exists(local_path):
+            if state_ref is None:
+                print(f"  {FAIL} Download appeared to succeed but file not found: {local_path}")
+            logger.error(f"[LocalTS] File missing after download: {local_path}")
+            return None
+
+        if state_ref is None:
+            print(f"  {PASS} Downloaded {filename} ({os.path.getsize(local_path) / (1024**3):.2f} GB)")
+        logger.info(f"[LocalTS] Download complete: {local_path}")
+        return local_path
+
+    def cleanup_node_local_dir(self, node_name):
+        """Remove the local staging directory for a node after validation is complete."""
+        node_dir = self._node_staging_dir(node_name)
+        if os.path.exists(node_dir):
+            try:
+                import shutil
+                shutil.rmtree(node_dir)
+                logger.info(f"[LocalTS] Cleaned up local staging dir: {node_dir}")
+            except Exception as e:
+                logger.warning(f"[LocalTS] Could not remove {node_dir}: {e}")
+
+
+def _check_local_disk_space(staging_dir, ts_sizes_bytes):
+    """
+    Evaluate local disk space against the set of tech support files to be processed.
+
+    For each tech support the space requirement is:
+        download size  +  extracted size (download * EXPANSION_FACTOR)
+        = ts_size * (1 + EXPANSION_FACTOR)
+
+    We check two scenarios:
+      - All-at-once parallel: sum of all requirements fits in available space.
+      - One-at-a-time sequential: the single largest requirement fits.
+
+    Returns a dict:
+        {
+          "available_bytes": int,
+          "total_required_bytes": int,   # sum of all
+          "max_single_bytes": int,       # largest single ts requirement
+          "can_do_parallel": bool,
+          "can_do_sequential": bool,
+          "feasible": {node_name: bool, ...}  # per-node feasibility
+        }
+    """
+    import shutil
+
+    EXP = LocalTechSupportManager.EXTRACTION_EXPANSION_FACTOR
+
+    os.makedirs(staging_dir, exist_ok=True)
+    stat = shutil.disk_usage(staging_dir)
+    available = stat.free
+
+    per_node_required = {name: size * (1 + EXP) for name, size in ts_sizes_bytes.items()}
+    total_required = sum(per_node_required.values())
+    max_single = max(per_node_required.values()) if per_node_required else 0
+
+    can_parallel = available >= total_required
+    can_sequential = available >= max_single
+
+    # Per-node feasibility regardless of others
+    feasible = {name: (available >= req) for name, req in per_node_required.items()}
+
+    return {
+        "available_bytes": available,
+        "total_required_bytes": total_required,
+        "max_single_bytes": max_single,
+        "can_do_parallel": can_parallel,
+        "can_do_sequential": can_sequential,
+        "feasible": feasible,
+        "per_node_required": per_node_required,
+    }
+
+
+def _collect_live_node_data(node, node_manager):
+    """
+    Run a small set of live SSH commands against an ND node and return a dict
+    mapping command string -> stdout output.
+
+    The dict is written to a JSON file in the staging directory before the local
+    worker is launched.  The worker loads it and uses the cached outputs for checks
+    that require live ND CLI data — commands that don't exist on the localhost where
+    the worker executes in 4.1.x mode.
+
+    Covers:
+      - acs version / acs show nodes  (version, node-status, subnet checks)
+      - df -h                          (disk-space live fallback)
+      - ping -c 3 <ip>                 (ping reachability: every other node's data + mgmt IP)
+    """
+    live_commands = ["acs version", "acs show nodes", "df -h", "acs health"]
+    data = {}
+
+    # Build ping commands for every peer IP so check_ping_reachability fires from the right host
+    other_nodes = [n for n in node_manager.nodes if n["name"] != node["name"]]
+    for peer in other_nodes:
+        for ip_field in ("datanetwork", "ip"):
+            raw_ip = peer.get(ip_field, "")
+            if not raw_ip or raw_ip == "unknown":
+                continue
+            ip = raw_ip.split("/")[0]  # strip CIDR notation if present
+            if ip:
+                live_commands.append(f"ping -c 3 {ip}")
+
+    for cmd in live_commands:
+        ssh_cmd = node_manager.build_ssh_command(node["ip"], cmd, timeout=30)
+        try:
+            process = subprocess.Popen(ssh_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, _ = process.communicate(timeout=60)
+            output = stdout.decode("utf-8", errors="replace").strip()
+            if output:
+                data[cmd] = output
+                logger.info(f"[LocalExec] Pre-fetched '{cmd}' from {node['name']}: {len(output)} chars")
+            else:
+                logger.warning(f"[LocalExec] Empty output for '{cmd}' from {node['name']}")
+        except Exception as exc:
+            logger.error(f"[LocalExec] Failed to pre-fetch '{cmd}' from {node['name']}: {exc}")
+    return data
+
+
+def _run_worker_locally(node_name, local_ts_path, nd_version, operation, staging_dir, worker_script_path,
+                        live_data_file=None):
+    """
+    Run worker_functions.py on the local machine against a locally-held tech support.
+
+    The worker script is invoked with:
+        argv[5] = base_dir   (staging_dir — keeps all output inside the CWD)
+        argv[6] = live_data  (optional path to a JSON file with pre-fetched live ND
+                              CLI outputs so checks like version/node-status/ping/subnet
+                              still work when the worker runs on localhost)
+
+    Returns True if the script was launched (not necessarily completed).
+    """
+    live_data_arg = f"{shlex.quote(live_data_file)} " if live_data_file else ""
+    # Ensure staging dir exists; the worker will create its own sub-directories inside it
+    os.makedirs(staging_dir, exist_ok=True)
+
+    log_file = os.path.join(staging_dir, f"{node_name}_output.log")
+    status_file = os.path.join(staging_dir, f"{node_name}_status.json")
+
+    # Seed a status file immediately so the monitor loop doesn't see an empty state
+    init_status = {"status": "initializing", "current_operation": "Starting local validation", "progress": 0,
+                   "node_name": node_name, "last_updated": datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    try:
+        with open(status_file, 'w') as f:
+            json.dump(init_status, f)
+    except Exception:
+        pass
+
+    python_cmd = "python3"
+    try:
+        subprocess.run([python_cmd, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+    except Exception:
+        python_cmd = "python"
+
+    # Pass staging_dir as argv[5] and optional live_data_file as argv[6]
+    cmd = (
+        f"cd {shlex.quote(staging_dir)} && "
+        f"echo '[Starting local worker at $(date)]' > {shlex.quote(os.path.basename(log_file))} 2>&1 && "
+        f"nohup {python_cmd} -u {shlex.quote(worker_script_path)} {operation} "
+        f"{shlex.quote(local_ts_path)} {shlex.quote(nd_version or 'unknown')} {shlex.quote(node_name)} "
+        f"{shlex.quote(staging_dir)} {live_data_arg}"
+        f">> {shlex.quote(os.path.basename(log_file))} 2>&1 &"
+    )
+
+    try:
+        process = subprocess.Popen(cmd, shell=True)
+        process.wait(timeout=5)
+        logger.info(f"[LocalExec] Launched worker for {node_name} (log: {log_file})")
+        return True
+    except Exception as e:
+        logger.error(f"[LocalExec] Failed to launch worker for {node_name}: {e}")
+        return False
+
+
+def _check_local_worker_status(node_name, staging_dir):
+    """
+    Poll status/results files written by the worker script.
+
+    Because we pass staging_dir as the worker's base_dir override (argv[5]), all
+    status and results files land in staging_dir alongside the output log.
+    """
+    log_file = os.path.join(staging_dir, f"{node_name}_output.log")
+    results_file = os.path.join(staging_dir, f"{node_name}_results.json")
+    status_file = os.path.join(staging_dir, f"{node_name}_status.json")
+
+    # Completion: results file exists (highest priority)
+    if os.path.exists(results_file):
+        return {"status": "complete", "current_operation": "Validation complete", "progress": 100}
+
+    # Check the output log for fatal errors or completion markers
+    if os.path.exists(log_file):
+        try:
+            with open(log_file, 'r') as f:
+                log_tail = f.read()[-8192:]  # last 8 KB
+            # Only treat as fatal if we see Python-level exceptions (not check-level tar warnings,
+            # which the worker handles gracefully and continues past).
+            if any(p in log_tail for p in ('SyntaxError', 'Traceback (most recent call last)', 'ImportError')):
+                return {"status": "error", "current_operation": "Worker script error", "progress": 0, "error": True}
+            if 'Validation complete on node' in log_tail:
+                return {"status": "complete", "current_operation": "Validation complete", "progress": 100}
+        except Exception:
+            pass
+
+    # Parse status file written by the worker
+    if os.path.exists(status_file):
+        try:
+            with open(status_file, 'r') as f:
+                data = json.load(f)
+            if data.get("status") == "complete":
+                return {"status": "complete", "current_operation": "Validation complete", "progress": 100}
+            return data
+        except Exception:
+            pass
+
+    return {"status": "initializing", "current_operation": "Starting...", "progress": 5}
+
+
+def _collect_local_worker_results(node_name, staging_dir, results_dir):
+    """
+    Read the results JSON from staging_dir (where the worker wrote it via the
+    base_dir override) and persist it to the final-results directory.
+    Returns the parsed dict or None.
+    """
+    results_file = os.path.join(staging_dir, f"{node_name}_results.json")
+    if not os.path.exists(results_file):
+        logger.warning(f"[LocalExec] Results file not found at {results_file}")
+        return None
+    try:
+        with open(results_file, 'r') as f:
+            data = json.load(f)
+        os.makedirs(results_dir, exist_ok=True)
+        dest = os.path.join(results_dir, f"{node_name}_results.json")
+        with open(dest, 'w') as f:
+            json.dump(data, f, indent=2)
+        log_src = os.path.join(staging_dir, f"{node_name}_output.log")
+        if os.path.exists(log_src):
+            import shutil
+            shutil.copy2(log_src, os.path.join(results_dir, f"{node_name}_output.log"))
+        return data
+    except Exception as e:
+        logger.error(f"[LocalExec] Could not collect results for {node_name}: {e}")
+        return None
+
+
+def _run_api_checks(node_manager, version, password):
+    """
+    Run the cluster-level API checks (telemetry_inband_epg and nxapi_cert_verify_state)
+    and return the (api_check_result, api_check_results) tuple.
+
+    Extracted from process_all_nodes() so that process_all_nodes_local() can reuse the
+    exact same check logic without duplication.
+
+    Returns:
+        api_check_result  - combined {status, details, ...} dict
+        api_check_results - {check_name: result_dict} per-check dict
+    """
+    api_check_result = {"status": "NOTRUN"}
+    api_check_results = {}
+
+    if not password:
+        logger.warning("[API] No password provided for API check")
+        api_check_result = APICheckResult.set_warning(
+            "telemetry_inband_epg",
+            "Password not provided for API check",
+            recommendation=f"Ensure password is provided to run API validation.\n\n{MANUAL_VERIFICATION_STEPS}"
+        )
+        return api_check_result, api_check_results
+
+    if not version:
+        logger.warning("[API] ND version not available for API check")
+        api_check_result = APICheckResult.set_warning(
+            "telemetry_inband_epg",
+            "Could not determine ND version for API check",
+            recommendation=f"Verify ND version and run check manually if needed.\n\n{MANUAL_VERIFICATION_STEPS}"
+        )
+        return api_check_result, api_check_results
+
+    try:
+        api_client = NDAPIClient(node_manager.nd_ip, "admin", password)
+        auth_success, error_type, error_message = api_client.authenticate()
+
+        if not auth_success:
+            logger.error(f"[API] Authentication failed: {error_type} - {error_message}")
+            if error_type == 'AUTH_FAILURE':
+                details = f"Authentication failed: {error_message}"
+                explanation = "Invalid credentials or authentication rejected by ND API"
+                recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
+            elif error_type == 'CONNECTION_FAILURE':
+                details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
+                explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
+                recommendation = f"Verify port 443 on ND is accessible from device running the script.\n\n{MANUAL_VERIFICATION_STEPS}"
+            elif error_type == 'TIMEOUT':
+                details = f"Connection timeout to {node_manager.nd_ip}:443"
+                explanation = "Connection attempt to ND management interface timed out"
+                recommendation = f"Check network connectivity, firewall rules, and ND system health.\n\n{MANUAL_VERIFICATION_STEPS}"
+            else:
+                details = f"Failed to authenticate to ND API: {error_message}"
+                explanation = "Could not authenticate to ND management interface"
+                recommendation = f"Verify admin credentials and API accessibility.\n\n{MANUAL_VERIFICATION_STEPS}"
+            api_check_result = APICheckResult.set_warning(
+                "telemetry_inband_epg", details, explanation=explanation, recommendation=recommendation
+            )
+            return api_check_result, api_check_results
+
+        result = check_telemetry_inband_epg(api_client, version)
+        api_check_results["telemetry_inband_epg"] = result
+
+        result = check_nxapi_cert_verify_state(api_client, version)
+        api_check_results["nxapi_cert_verify_state"] = result
+
+        statuses = [r["status"] for r in api_check_results.values()]
+        combined_status = "FAIL" if "FAIL" in statuses else "WARNING" if "WARNING" in statuses else "PASS"
+        combined_details = []
+        for r in api_check_results.values():
+            combined_details.extend(r.get("details", []))
+        combined_explanation = combined_recommendation = combined_reference = None
+        for r in api_check_results.values():
+            if r["status"] in ("FAIL", "WARNING") and (r.get("explanation") or r.get("recommendation")):
+                combined_explanation = r.get("explanation")
+                combined_recommendation = r.get("recommendation")
+                combined_reference = r.get("reference")
+                break
+        api_check_result = {
+            "status": combined_status,
+            "details": combined_details,
+            "explanation": combined_explanation,
+            "recommendation": combined_recommendation,
+            "reference": combined_reference
+        }
+
+    except Exception as exc:
+        logger.exception(f"[API] Error during API check: {exc}")
+        api_check_result = APICheckResult.set_warning(
+            "telemetry_inband_epg",
+            f"API check error: {exc}",
+            explanation="An unexpected error occurred during API validation",
+            recommendation=f"Check logs and verify API connectivity.\n\n{MANUAL_VERIFICATION_STEPS}",
+            reference="http://bst.cloudapps.cisco.com/bugsearch/bug/CSCws23607"
+        )
+
+    return api_check_result, api_check_results
+
+
+def process_all_nodes_local(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None):
+    """
+    4.1.x execution path: download tech supports locally, run worker_functions.py
+    on the local machine.
+
+    Behaviour mirrors process_all_nodes() from the user's perspective: the same
+    interactive tech-support menu, the same parallelism model, and the same final
+    report.  The difference is purely mechanical:
+      1. Tech supports are SCPed from each ND node to ./nd-preupgrade-local-ts/<node>/
+      2. worker_functions.py is invoked locally (subprocess) pointing at the local file
+      3. Local space is checked upfront; nodes that cannot fit are skipped with a warning
+      4. Per-node local staging dirs are cleaned up immediately after results are collected
+    """
+    process_start_time = time.time()
+
+    if storage_check_result is None:
+        storage_check_result = {"status": "NOTRUN"}
+    if skipped_nodes_info is None:
+        skipped_nodes_info = {'disk_space_issues': [], 'large_log_files': []}
+
+    resources = check_system_resources()
+    max_concurrent_nodes = resources.get("recommended_parallelism", 2)
+
+    nodes = list(node_manager.nodes)
+    tech_manager = TechSupportManager(node_manager)
+    local_ts_mgr = LocalTechSupportManager(node_manager)
+    results_dir = os.path.join(os.getcwd(), "final-results")
+    staging_dir = local_ts_mgr.staging_dir
+    worker_script_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker_functions.py"))
+
+    # ---------------------------------------------------------------
+    # STEP 1 — Tech support selection / generation (identical UX)
+    # ---------------------------------------------------------------
+    print("")
+    print_section("Tech Support Selection/Generation")
+    tech_support_paths = {}  # node_name -> remote path on ND node
+
+    if tech_choice == "1":
+        print("Generating tech supports for all nodes in parallel.")
+        failed_nodes = []
+        with ThreadPoolExecutor(max_workers=max_concurrent_nodes) as executor:
+            future_to_node = {executor.submit(tech_manager.generate_techsupport, node): node for node in nodes}
+            for future in as_completed(future_to_node):
+                node = future_to_node[future]
+                node_name = node["name"]
+                try:
+                    path = future.result()
+                    if path:
+                        tech_support_paths[node_name] = path
+                        print(f"Generated tech support on {node_name}: {os.path.basename(path)}")
+                    else:
+                        failed_nodes.append(node_name)
+                        logger.error(f"Failed to generate tech support on {node_name}")
+                except Exception as exc:
+                    failed_nodes.append(node_name)
+                    print(f"{FAIL} Error generating tech support for {node_name}: {exc}")
+
+        if not tech_support_paths:
+            print(f"{FAIL} No tech supports were generated. Exiting.")
+            return {}
+        if failed_nodes:
+            print(f"{WARNING} Tech support generation failed on: {', '.join(failed_nodes)}")
+    else:
+        # Interactive selection — identical to the non-local path
+        print("Checking for tech support files on all nodes...")
+        node_tech_support_files = {}
+        with ThreadPoolExecutor(max_workers=max_concurrent_nodes) as executor:
+            future_to_node = {executor.submit(tech_manager.list_techsupport_files, node): node for node in nodes}
+            for future in as_completed(future_to_node):
+                node = future_to_node[future]
+                try:
+                    tech_files = future.result()
+                    if tech_files:
+                        node_tech_support_files[node["name"]] = tech_files
+                except Exception as exc:
+                    print(f"{FAIL} Error listing tech support files for {node['name']}: {exc}")
+
+        for node in nodes:
+            node_name = node["name"]
+            if node_name not in node_tech_support_files:
+                print(f"{FAIL} No tech support files found for {node_name}")
+                continue
+            tech_files = node_tech_support_files[node_name]
+            print(f"\nTech support files available on {node_name} ({node['ip']}):")
+            print()
+            for idx, file_info in enumerate(tech_files, 1):
+                print(f"{idx}. {file_info['name']}")
+                print(f"   Size: {file_info['size']}, Created: {file_info['date']}")
+                print("   ")
+            while True:
+                try:
+                    range_str = str(len(tech_files)) if len(tech_files) == 1 else f"1-{len(tech_files)}"
+                    choice = input(f"\nSelect tech support file for {node_name} ({range_str}, or 0 to skip): ")
+                    if choice == '0':
+                        print(f"Skipping node {node_name}.")
+                        break
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(tech_files):
+                        tech_support_paths[node_name] = tech_files[idx]["path"]
+                        print(f"Selected: {tech_files[idx]['name']}")
+                        break
+                    else:
+                        print(f"Please enter a number between 0 and {len(tech_files)}")
+                except ValueError:
+                    print("Please enter a valid number")
+
+        if not tech_support_paths:
+            print(f"{FAIL} No tech supports were selected. Exiting.")
+            return {}
+
+    # ---------------------------------------------------------------
+    # STEP 2 — Gather remote file sizes for space planning
+    # ---------------------------------------------------------------
+    print_section("Local Disk Space Pre-Flight Check (4.1.x mode)")
+    print("Querying tech support file sizes from nodes...")
+
+    ts_sizes_bytes = {}  # node_name -> bytes
+    for node in nodes:
+        node_name = node["name"]
+        if node_name not in tech_support_paths:
+            continue
+        size = local_ts_mgr.get_remote_file_size_bytes(node, tech_support_paths[node_name])
+        if size is None:
+            print(f"  {WARNING} Could not determine file size for {node_name} — will attempt download anyway")
+            ts_sizes_bytes[node_name] = 0
+        else:
+            ts_sizes_bytes[node_name] = size
+            gb = size / (1024 ** 3)
+            print(f"  {node_name}: {gb:.2f} GB")
+
+    # ---------------------------------------------------------------
+    # STEP 3 — Local space analysis
+    # ---------------------------------------------------------------
+    space = _check_local_disk_space(staging_dir, ts_sizes_bytes)
+    avail_gb = space["available_bytes"] / (1024 ** 3)
+    total_gb = space["total_required_bytes"] / (1024 ** 3)
+    max_gb = space["max_single_bytes"] / (1024 ** 3)
+
+    print(f"\n  Available local disk space: {avail_gb:.2f} GB")
+    print(f"  Space required (all parallel, incl. extraction): {total_gb:.2f} GB")
+    print(f"  Space required (largest single tech support): {max_gb:.2f} GB")
+
+    # Identify nodes that physically cannot fit even sequentially
+    infeasible_nodes = [n for n, ok in space["feasible"].items() if not ok and ts_sizes_bytes.get(n, 0) > 0]
+    feasible_node_names = [n for n in tech_support_paths if n not in infeasible_nodes]
+
+    if infeasible_nodes:
+        print(f"\n{WARNING} The following tech support(s) are too large to process on this machine:")
+        for n in infeasible_nodes:
+            req_gb = space["per_node_required"].get(n, 0) / (1024 ** 3)
+            print(f"    {n}: requires ~{req_gb:.2f} GB (download + extraction), only {avail_gb:.2f} GB available")
+
+        if not feasible_node_names:
+            print(f"\n{FAIL} No tech supports can be processed given available disk space. Exiting.")
+            return {}
+
+        print(f"\nThe following tech support(s) can be processed: {', '.join(feasible_node_names)}")
+        while True:
+            choice = input(f"\nWould you like to proceed with {', '.join(feasible_node_names)} only? (y/n): ").lower().strip()
+            if choice in ('y', 'yes'):
+                print("Proceeding with feasible nodes...")
+                # Drop infeasible nodes from the working set
+                for n in infeasible_nodes:
+                    tech_support_paths.pop(n, None)
+                    ts_sizes_bytes.pop(n, None)
+                nodes = [nd for nd in nodes if nd["name"] in tech_support_paths]
+                break
+            elif choice in ('n', 'no'):
+                print("Validation cancelled by user.")
+                return {}
+            else:
+                print("Please enter 'y' or 'n'.")
+
+    # Determine parallelism
+    if space["can_do_parallel"]:
+        effective_concurrency = max_concurrent_nodes
+        print(f"\n{PASS} Sufficient local space for parallel processing.")
+    else:
+        effective_concurrency = 1
+        print(f"\n{WARNING} Insufficient space for full parallel processing — falling back to sequential (1 at a time).")
+
+    print(f"  Processing concurrency: {effective_concurrency}")
+
+    # ---------------------------------------------------------------
+    # STEP 4 — Download and analyse (per batch)
+    # ---------------------------------------------------------------
+    nodes_batches = []
+    for i in range(0, len(nodes), effective_concurrency):
+        nodes_batches.append(nodes[i:i + effective_concurrency])
+
+    all_results = {}
+    overall_status = "PASS"
+
+    print_section("Downloading Tech Supports and Starting Local Validation")
+
+    for batch_num, batch in enumerate(nodes_batches, 1):
+        logger.info(f"[Local] Processing batch {batch_num}/{len(nodes_batches)}")
+
+        # --- Download all in this batch in parallel (network I/O bound) ---
+        local_ts_paths = {}  # node_name -> local path
+
+        print(f"\nDownloading tech support(s) for batch {batch_num}...")
+        _is_multi_bar  = len(batch) > 1 and sys.stdout.isatty()
+        _dl_print_lock = threading.Lock()
+        _multi_bar     = None
+        if _is_multi_bar:
+            _mb_items  = [{"name": nd["name"], "total": ts_sizes_bytes.get(nd["name"], 0)} for nd in batch]
+            _multi_bar = _MultiBarDisplay(_mb_items)
+            _multi_bar.start()
+
+        def _download_one(node):
+            nd_name    = node["name"]
+            state_ref  = _multi_bar.get_state_ref(nd_name) if _is_multi_bar else None
+            local_path = local_ts_mgr.download_tech_support(
+                node, tech_support_paths[nd_name],
+                parallel=(len(batch) > 1),
+                print_lock=_dl_print_lock if (len(batch) > 1 and not _is_multi_bar) else None,
+                state_ref=state_ref,
+            )
+            if _is_multi_bar:
+                try:
+                    final_sz = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
+                except OSError:
+                    final_sz = 0
+                _multi_bar.mark_done(nd_name, success=(local_path is not None),
+                                     final_size=final_sz or ts_sizes_bytes.get(nd_name, 0))
+            return nd_name, local_path
+
+        _download_results = {}
+        with ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            futures = {executor.submit(_download_one, nd): nd for nd in batch}
+            for future in as_completed(futures):
+                try:
+                    nd_name, local_path = future.result()
+                    _download_results[nd_name] = local_path
+                except Exception as exc:
+                    logger.error(f"Download thread error: {exc}")
+                    _download_results[futures[future]["name"]] = None
+
+        if _multi_bar:
+            _multi_bar.stop()
+
+        for nd in batch:
+            nd_name    = nd["name"]
+            local_path = _download_results.get(nd_name)
+            if local_path:
+                local_ts_paths[nd_name] = local_path
+                print(f"{PASS} Downloaded tech support for {nd_name}")
+            else:
+                print(f"{FAIL} Download failed for {nd_name}")
+
+        if not local_ts_paths:
+            print(f"{FAIL} No tech supports downloaded in this batch. Skipping.")
+            continue
+
+        # --- Launch local workers for successfully downloaded nodes ---
+        launched_nodes = []
+        for node in batch:
+            node_name = node["name"]
+            if node_name not in local_ts_paths:
+                continue
+            operation = "generate" if tech_choice == "1" else "select"
+            print(f"Starting local validation for {node_name}...")
+            # Pre-fetch live ND CLI outputs (acs version, acs show nodes) via SSH
+            # so checks that need live node data still work when the worker runs on localhost.
+            live_data_file = None
+            live_data = _collect_live_node_data(node, node_manager)
+            if live_data:
+                live_data_path = os.path.join(staging_dir, f"{node_name}_live_data.json")
+                try:
+                    with open(live_data_path, "w") as _f:
+                        json.dump(live_data, _f)
+                    live_data_file = live_data_path
+                    logger.info(f"[LocalExec] Wrote live data ({len(live_data)} commands) for {node_name}")
+                except Exception as _exc:
+                    logger.warning(f"[LocalExec] Could not write live data for {node_name}: {_exc}")
+            ok = _run_worker_locally(node_name, local_ts_paths[node_name], version, operation, staging_dir, worker_script_path, live_data_file)
+            if ok:
+                launched_nodes.append(node)
+                print(f"{PASS} Validation started for {node_name}")
+            else:
+                print(f"{FAIL} Could not launch local worker for {node_name}")
+
+        if not launched_nodes:
+            continue
+
+        # --- Monitor status (identical to display_check_results logic, against local files) ---
+        print(f"\nMonitoring local validation on {len(launched_nodes)} nodes...")
+        max_monitoring_time = 1800
+        monitoring_interval = 2
+        start_time = time.time()
+        nodes_status = {}
+        nodes_results = {}
+
+        print(f"\nRunning validation checks on {len(launched_nodes)} Nexus Dashboard nodes...")
+        while True:
+            incomplete = [nd for nd in launched_nodes
+                          if nodes_status.get(nd["name"]) not in ("complete", "error")]
+            if not incomplete:
+                break
+            if (time.time() - start_time) > max_monitoring_time:
+                print(f"\n{WARNING} Monitoring timed out after {max_monitoring_time // 60} minutes")
+                break
+
+            for node in incomplete:
+                node_name = node["name"]
+                status = _check_local_worker_status(node_name, staging_dir)
+                if status.get("error", False):
+                    print(f"{FAIL} Worker error on {node_name}: {status.get('current_operation', '')}")
+                    nodes_status[node_name] = "error"
+                elif status["status"] == "complete":
+                    if nodes_status.get(node_name) != "complete":
+                        print(f"[Node {node_name}] Validation complete")
+                    nodes_status[node_name] = "complete"
+                else:
+                    nodes_status[node_name] = status["status"]
+
+            time.sleep(monitoring_interval)
+
+        # --- Collect results, then clean up local staging dir per node ---
+        completed_nodes = [nd for nd in launched_nodes if nodes_status.get(nd["name"]) == "complete"]
+        for node in completed_nodes:
+            node_name = node["name"]
+            result = _collect_local_worker_results(node_name, staging_dir, results_dir)
+            if result:
+                nodes_results[node_name] = result
+
+        # For nodes flagged as "error", still attempt result collection — the worker may have
+        # completed despite mid-run tar extraction warnings that triggered the error flag.
+        # If no results file exists, inject a synthetic FAIL so the node appears in the report.
+        error_nodes = [nd for nd in launched_nodes if nodes_status.get(nd["name"]) == "error"]
+        for node in error_nodes:
+            node_name = node["name"]
+            result = _collect_local_worker_results(node_name, staging_dir, results_dir)
+            if result:
+                nodes_results[node_name] = result
+            else:
+                nodes_results[node_name] = {
+                    "node_name": node_name,
+                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "checks": {
+                        "techsupport": {
+                            "status": "FAIL",
+                            "details": ["Tech support extraction failed — worker did not produce results"]
+                        }
+                    }
+                }
+                overall_status = "FAIL"
+
+        if nodes_results:
+            all_results.update(nodes_results)
+            for node_name, res in nodes_results.items():
+                for check_name, check_result in res["checks"].items():
+                    if check_result["status"] == "FAIL":
+                        overall_status = "FAIL"
+                    elif check_result["status"] == "WARNING" and overall_status != "FAIL":
+                        overall_status = "WARNING"
+
+        # Clean up per-node local staging dir immediately (reclaim space for next batch)
+        if not debug_mode:
+            for node in launched_nodes:
+                local_ts_mgr.cleanup_node_local_dir(node["name"])
+                print(f"{PASS} Cleaned up local staging files for {node['name']}")
+
+    # ---------------------------------------------------------------
+    # STEP 5 — API checks (cluster-level, identical to non-local path)
+    # ---------------------------------------------------------------
+    print_section("Running API Checks")
+    print("Running cluster-level API checks...")
+    api_check_result, api_check_results = _run_api_checks(node_manager, version, password)
+
+    if api_check_result["status"] != "NOTRUN":
+        if api_check_results:
+            checks_dict = {
+                name + "_check": {
+                    "status": r["status"],
+                    "details": r.get("details", []),
+                    "explanation": r.get("explanation"),
+                    "recommendation": r.get("recommendation"),
+                    "reference": r.get("reference")
+                }
+                for name, r in api_check_results.items()
+            }
+        else:
+            checks_dict = {
+                "telemetry_inband_epg_check": {
+                    "status": api_check_result["status"],
+                    "details": api_check_result.get("details", []),
+                    "explanation": api_check_result.get("explanation"),
+                    "recommendation": api_check_result.get("recommendation"),
+                    "reference": api_check_result.get("reference")
+                }
+            }
+        all_results["_api_checks"] = {
+            "node_name": "API Checks",
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "checks": checks_dict
+        }
+        if api_check_result["status"] == "FAIL":
+            overall_status = "FAIL"
+        elif api_check_result["status"] == "WARNING" and overall_status != "FAIL":
+            overall_status = "WARNING"
+
+    # ---------------------------------------------------------------
+    # STEP 6 — Storage check result passthrough + report
+    # ---------------------------------------------------------------
+    if storage_check_result["status"] != "NOTRUN":
+        all_results["_storage_checks"] = {
+            "node_name": "Storage Device Checks",
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "checks": {
+                "storage_device_check": {
+                    "status": storage_check_result["status"],
+                    "details": storage_check_result["details"],
+                    "explanation": storage_check_result.get("explanation"),
+                    "recommendation": storage_check_result.get("recommendation"),
+                    "reference": storage_check_result.get("reference")
+                }
+            }
+        }
+        if storage_check_result["status"] == "FAIL":
+            overall_status = "FAIL"
+        elif storage_check_result["status"] == "WARNING" and overall_status != "FAIL":
+            overall_status = "WARNING"
+
+    total_time = time.time() - process_start_time
+    timing_info = {"total_time": total_time, "node_times": {}}
+
+    if all_results:
+        generate_report(all_results, version, overall_status, timing_info, skipped_nodes_info)
+    else:
+        print(f"{FAIL} No results were collected from any nodes.")
+
+    if debug_mode:
+        print(f"\n{WARNING} Debug mode: local staging directory preserved at {staging_dir}")
+
+    return all_results
+
+
+def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None, use_local_mode=False):
+    """Process all nodes with validation script using optimal resource-based concurrency.
+
+    For ND 4.1.x, delegates to process_all_nodes_local() which downloads tech supports
+    to the local machine before running worker_functions.py locally.
+    """
+    if use_local_mode:
+        return process_all_nodes_local(node_manager, tech_choice, version, password, debug_mode, skipped_nodes_info, storage_check_result)
+
     # Record process start time
     process_start_time = time.time()
-    
+
     # Initialize storage_check_result if not provided
     if storage_check_result is None:
         storage_check_result = {"status": "NOTRUN"}
@@ -4792,65 +6089,35 @@ def main():
         except Exception as e:
             logger.error(f"Error getting version: {str(e)}")
 
-        # Check for version 4.1.1x - if detected, switch to root user
-        # This applies to all 4.1.1 variants (4.1.1, 4.1.1a, 4.1.1b, 4.1.1g, etc.)
-        if version and version.startswith('4.1.1'):
-            print(f"\n{WARNING} Detected ND version {version} - this version requires root access to run")
-            print(f"\nExecuting 'acs debug-token' to retrieve the root password token...")
+        if not version:
+            print(f"{FAIL} Unable to determine Nexus Dashboard version.")
+            print("The script was able to connect but could not parse version output from 'acs version'.")
+            print("Please verify the ND is healthy and rerun the script.")
+            return 1
 
+        # Determine whether the 4.1.x local-execution path is required.
+        # Version 4.1.x has a rescue-user /tmp permission restriction that prevents
+        # the worker script from extracting tech supports on the node.  The workaround
+        # is to download each tech support to the local machine and run the worker script
+        # locally instead.  This applies to ANY 4.1.x build (4.1.1, 4.1.2, etc.) and
+        # does NOT apply to 3.x, 2.x, 4.0.x, 4.2.x, or higher.
+        use_local_mode = False
+        if version:
             try:
-                # Execute acs debug-token command
-                token_cmd = node_manager.build_ssh_command(nd_ip, "acs debug-token") + " 2>/dev/null"
-                process = subprocess.Popen(token_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
+                _v_parts = version.split('.')
+                _v_major = int(_v_parts[0]) if len(_v_parts) > 0 else 0
+                _v_minor = int(''.join(c for c in _v_parts[1] if c.isdigit())) if len(_v_parts) > 1 else 0
+                if _v_major == 4 and _v_minor == 1:
+                    use_local_mode = True
+                    logger.info(f"Version {version} is 4.1.x — local execution mode enabled")
+            except Exception:
+                pass
 
-                if process.returncode == 0:
-                    debug_token = stdout.decode('utf-8').strip()
-                    # Remove any extra whitespace or newlines
-                    debug_token = debug_token.split('\n')[-1].strip() if '\n' in debug_token else debug_token
-
-                    if debug_token:
-                        print(f"\nRoot password token: {debug_token}")
-                        print(f"\nPlease enter the root password for Nexus Dashboard.")
-
-                        # Prompt for root password
-                        root_password = getpass.getpass("Enter root password: ")
-
-                        if root_password:
-                            # Update node_manager to use root credentials
-                            node_manager.username = "root"
-                            node_manager.password = root_password
-
-                            # Test the root credentials
-                            print(f"\nVerifying root credentials...")
-                            test_cmd = node_manager.build_ssh_command(nd_ip, "echo 'Root access verified'") + " 2>/dev/null"
-                            process = subprocess.Popen(test_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            stdout, stderr = process.communicate()
-
-                            if process.returncode == 0 and 'Root access verified' in stdout.decode('utf-8'):
-                                print(f"{PASS} Successfully switched to root user")
-                                print(f"All subsequent operations will use root credentials\n")
-                                logger.info(f"Switched to root user for version 4.1.1g")
-                            else:
-                                print(f"{FAIL} Failed to verify root credentials. Please check the password.")
-                                print(f"Error: {stderr.decode('utf-8')}")
-                                return 1
-                        else:
-                            print(f"{FAIL} Root password is required for version 4.1.1")
-                            return 1
-                    else:
-                        print(f"{FAIL} Failed to retrieve debug token")
-                        logger.error(f"Empty debug token returned")
-                        return 1
-                else:
-                    print(f"{FAIL} Failed to execute 'acs debug-token' command")
-                    logger.error(f"acs debug-token failed: {stderr.decode('utf-8')}")
-                    return 1
-
-            except Exception as e:
-                print(f"{FAIL} Error retrieving debug token: {str(e)}")
-                logger.exception(f"Error in debug token retrieval")
-                return 1
+        if use_local_mode:
+            print(f"\n{WARNING} Detected ND version {version} (4.1.x)")
+            print("  rescue-user does not have write access to /tmp on 4.1.x nodes.")
+            print("  Tech supports will be downloaded to this machine and analyzed locally.")
+            print("  No root password is required.\n")
 
         # Discover nodes
         print("Discovering Nexus Dashboard nodes...")
@@ -4863,7 +6130,8 @@ def main():
         print(f"Found {len(nodes)} Nexus Dashboard nodes")
         print("---------------------------------------")
         for node in nodes:
-            print(f"\t{node['name']} ({node['ip']})")
+            role = node.get('role', 'Unknown')
+            print(f"\t{node['name']} - {role} ({node['ip']})")
         print("---------------------------------------")
 
         # Check disk space on all nodes before proceeding
@@ -5200,7 +6468,7 @@ def main():
 
         # Process all nodes - resource-optimized
         # Save the results to ensure we can access debug_data after the report is generated
-        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info, storage_check_result)
+        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info, storage_check_result, use_local_mode)
 
         # Display debug mode warning at the very end, after the report
         if args.debug and results and "_debug_info" in results:
@@ -5355,4 +6623,3 @@ def run_diagnostic_mode(node_manager, nodes):
 
 if __name__ == "__main__":
     sys.exit(main())
-    
