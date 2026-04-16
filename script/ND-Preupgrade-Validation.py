@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.21 (Mar 18, 2026)
+Version: 1.0.22 (Apr 16, 2026)
 """
 
 import re
@@ -302,6 +302,18 @@ def is_valid_ip(ip):
     except (ValueError, AttributeError):
         return False
 
+def bracket_ipv6(ip):
+    """Wrap an IPv6 address in brackets for use in URLs and SCP commands.
+    Returns the address unchanged if it is IPv4 or a hostname."""
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(ip)
+        if addr.version == 6:
+            return f"[{ip}]"
+    except (ValueError, AttributeError):
+        pass
+    return ip
+
 def is_valid_fqdn(hostname):
     """Validate if the string is a valid hostname or FQDN"""
     if not hostname or len(hostname) > 253:
@@ -463,11 +475,11 @@ class NDNodeManager:
                 "-o PubkeyAcceptedKeyTypes=+ssh-rsa"
             ])
 
-        # Note: OpenSSH handles bare IPv6 addresses correctly in user@host format
-        # No need to wrap in brackets - this works for both IPv4 and IPv6
+        # SCP requires IPv6 addresses wrapped in brackets because ':' separates host from path
         ssh_opts_str = " ".join(ssh_opts)
+        scp_ip = bracket_ipv6(node_ip)
         # Use SSHPASS environment variable method which is more reliable than -p flag
-        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {local_file} {self.username}@{node_ip}:{remote_file}"
+        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {local_file} {self.username}@{scp_ip}:{remote_file}"
 
     def build_scp_download_command(self, node_ip, remote_file, local_file):
         """Build SCP command to download a file FROM a node TO localhost"""
@@ -480,7 +492,8 @@ class NDNodeManager:
             ])
 
         ssh_opts_str = " ".join(ssh_opts)
-        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {self.username}@{node_ip}:{remote_file} {local_file}"
+        scp_ip = bracket_ipv6(node_ip)
+        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {self.username}@{scp_ip}:{remote_file} {local_file}"
 
     def enable_legacy_ssh_mode(self):
         """Enable legacy SSH mode (ssh-rsa) for compatibility with older ND versions"""
@@ -5012,7 +5025,7 @@ class NDAPIClient:
             tuple: (success: bool, error_type: str, error_message: str)
                    error_type can be: 'AUTH_FAILURE', 'CONNECTION_FAILURE', 'TIMEOUT', 'UNKNOWN', or None if success
         """
-        login_url = f"https://{self.nd_ip}/login"
+        login_url = f"https://{bracket_ipv6(self.nd_ip)}/login"
         login_data = json.dumps({
             "userName": self.username,
             "userPasswd": self._password,  # Never log this
@@ -5096,7 +5109,7 @@ class NDAPIClient:
         if not self._token:
             raise RuntimeError("Not authenticated - call authenticate() first")
         
-        url = f"https://{self.nd_ip}{endpoint}"
+        url = f"https://{bracket_ipv6(self.nd_ip)}{endpoint}"
         self.logger.debug(f"[API] GET {endpoint}")
         
         try:
@@ -5144,7 +5157,7 @@ class NDAPIClient:
         if not self._token:
             raise RuntimeError("Not authenticated - call authenticate() first")
         
-        url = f"https://{self.nd_ip}{endpoint}"
+        url = f"https://{bracket_ipv6(self.nd_ip)}{endpoint}"
         self.logger.debug(f"[API] POST {endpoint}")
         
         post_data = json.dumps(data)
