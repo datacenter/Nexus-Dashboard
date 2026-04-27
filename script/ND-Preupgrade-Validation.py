@@ -33,6 +33,8 @@ import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+NON_INTERACTIVE = True
+
 # Set up logging
 def setup_logging():
     """Set up logging configuration"""
@@ -1432,6 +1434,10 @@ class TechSupportManager:
                     print(f"   Size: {file_info['size']}, Created: {file_info['date']}")
                 
                 # Ask user to select a file
+                if NON_INTERACTIVE:
+                    selected_file = display_info[0]["path"]
+                    print(f"[non-interactive] Auto-selected: {display_info[0]['name']}")
+                    return selected_file
                 while True:
                     try:
                         range_str = str(len(display_info)) if len(display_info) == 1 else f"1-{len(display_info)}"
@@ -1451,6 +1457,9 @@ class TechSupportManager:
                         print("Please enter a valid number")
             else:
                 print(f"\nNo tech support files found on {node['name']}.")
+                if NON_INTERACTIVE:
+                    print(f"[non-interactive] Auto-generating tech support for {node['name']}...")
+                    return self.generate_techsupport(node)
                 print(f"Would you like to generate a new tech support? (y/n)")
                 choice = input("> ")
                 
@@ -1464,6 +1473,9 @@ class TechSupportManager:
         except Exception as e:
             logger.exception(f"Error selecting tech support for node {node['name']}: {str(e)}")
             print(f"Error listing tech support files: {str(e)}")
+            if NON_INTERACTIVE:
+                print(f"[non-interactive] Auto-generating tech support for {node['name']}...")
+                return self.generate_techsupport(node)
             print(f"Would you like to generate a new tech support? (y/n)")
             choice = input("> ")
             
@@ -3872,6 +3884,10 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                 print(f"{idx}. {file_info['name']}")
                 print(f"   Size: {file_info['size']}, Created: {file_info['date']}")
                 print("   ")
+            if NON_INTERACTIVE:
+                tech_support_paths[node_name] = tech_files[0]["path"]
+                print(f"[non-interactive] Auto-selected: {tech_files[0]['name']}")
+                continue
             while True:
                 try:
                     range_str = str(len(tech_files)) if len(tech_files) == 1 else f"1-{len(tech_files)}"
@@ -3940,21 +3956,23 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
             return {}
 
         print(f"\nThe following tech support(s) can be processed: {', '.join(feasible_node_names)}")
-        while True:
-            choice = input(f"\nWould you like to proceed with {', '.join(feasible_node_names)} only? (y/n): ").lower().strip()
-            if choice in ('y', 'yes'):
-                print("Proceeding with feasible nodes...")
-                # Drop infeasible nodes from the working set
-                for n in infeasible_nodes:
-                    tech_support_paths.pop(n, None)
-                    ts_sizes_bytes.pop(n, None)
-                nodes = [nd for nd in nodes if nd["name"] in tech_support_paths]
-                break
-            elif choice in ('n', 'no'):
-                print("Validation cancelled by user.")
-                return {}
-            else:
-                print("Please enter 'y' or 'n'.")
+        if NON_INTERACTIVE:
+            print(f"[non-interactive] Auto-proceeding with feasible nodes...")
+        else:
+            while True:
+                choice = input(f"\nWould you like to proceed with {', '.join(feasible_node_names)} only? (y/n): ").lower().strip()
+                if choice in ('y', 'yes'):
+                    break
+                elif choice in ('n', 'no'):
+                    print("Validation cancelled by user.")
+                    return {}
+                else:
+                    print("Please enter 'y' or 'n'.")
+        print("Proceeding with feasible nodes...")
+        for n in infeasible_nodes:
+            tech_support_paths.pop(n, None)
+            ts_sizes_bytes.pop(n, None)
+        nodes = [nd for nd in nodes if nd["name"] in tech_support_paths]
 
     # Determine parallelism
     if space["can_do_parallel"]:
@@ -4369,29 +4387,37 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 print("   ")
             
             # Ask user to select a file
-            while True:
-                try:
-                    range_str = str(len(tech_files)) if len(tech_files) == 1 else f"1-{len(tech_files)}"
-                    choice = input(f"\nSelect tech support file for {node_name} ({range_str}, or 0 to skip): ")
-                    if choice == '0':
-                        print(f"Skipping node {node_name}.")
-                        break
-                        
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(tech_files):
-                        selected_file = tech_files[idx]["path"]
-                        print(f"Selected: {tech_files[idx]['name']}")
-                        tech_support_paths[node_name] = selected_file
-                        break
-                    else:
-                        print(f"Please enter a number between 0 and {len(tech_files)}")
-                except ValueError:
-                    print("Please enter a valid number")
+            if NON_INTERACTIVE:
+                tech_support_paths[node_name] = tech_files[0]["path"]
+                print(f"[non-interactive] Auto-selected: {tech_files[0]['name']}")
+            else:
+                while True:
+                    try:
+                        range_str = str(len(tech_files)) if len(tech_files) == 1 else f"1-{len(tech_files)}"
+                        choice = input(f"\nSelect tech support file for {node_name} ({range_str}, or 0 to skip): ")
+                        if choice == '0':
+                            print(f"Skipping node {node_name}.")
+                            break
+                            
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(tech_files):
+                            selected_file = tech_files[idx]["path"]
+                            print(f"Selected: {tech_files[idx]['name']}")
+                            tech_support_paths[node_name] = selected_file
+                            break
+                        else:
+                            print(f"Please enter a number between 0 and {len(tech_files)}")
+                    except ValueError:
+                        print("Please enter a valid number")
             
             if node_name not in tech_support_paths and not tech_files:
                 print(f"\nNo tech support files found on {node_name}.")
-                print(f"Would you like to generate a new tech support? (y/n)")
-                choice = input("> ")
+                if NON_INTERACTIVE:
+                    print(f"[non-interactive] Auto-generating tech support for {node_name}...")
+                    choice = 'y'
+                else:
+                    print(f"Would you like to generate a new tech support? (y/n)")
+                    choice = input("> ")
                 
                 if choice.lower() == 'y':
                     print(f"Generating tech support on {node_name}...")
@@ -6028,8 +6054,13 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to console and preserve temp files")
     parser.add_argument("-b", "--bash", action="store_true", help="Run in GitBash/Windows mode (no sshpass)")
     parser.add_argument("--diagnose", action="store_true", help="Run diagnostic tests only (check Python interpreters and worker script execution)")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Run with interactive prompts (default is non-interactive)")
 
     args = parser.parse_args()
+
+    global NON_INTERACTIVE
+    if args.interactive:
+        NON_INTERACTIVE = False
 
     print("Nexus Dashboard Pre-upgrade Validation Script")
     print(f"Running validation checks on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -6247,22 +6278,25 @@ def main():
                 print("-" * 40)
             print("="*80 + "\n")
             
-            while True:
-                choice = (
-                    input(
-                        f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): "
+            if NON_INTERACTIVE:
+                print(f"[non-interactive] Auto-continuing with validation on {len(nodes)} node(s)...")
+            else:
+                while True:
+                    choice = (
+                        input(
+                            f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): "
+                        )
+                        .lower()
+                        .strip()
                     )
-                    .lower()
-                    .strip()
-                )
-                if choice in ["y", "yes"]:
-                    print("Proceeding with validation...")
-                    break
-                elif choice in ["n", "no"]:
-                    print("Validation cancelled by user.")
-                    return 0
-                else:
-                    print("Please enter 'y' for yes or 'n' for no.")
+                    if choice in ["y", "yes"]:
+                        print("Proceeding with validation...")
+                        break
+                    elif choice in ["n", "no"]:
+                        print("Validation cancelled by user.")
+                        return 0
+                    else:
+                        print("Please enter 'y' for yes or 'n' for no.")
 
         # For versions below 4.1.1, check for large eventmonitoring log files
         nodes_with_large_logs = []
@@ -6327,18 +6361,21 @@ def main():
                 print(f"  - {node['name']} ({node['ip']})")
 
             # Ask user for confirmation
-            while True:
-                choice = input(f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): ").lower().strip()
-                if choice in ['y', 'yes']:
-                    print("Proceeding with nodes that passed eventmonitoring check...")
-                    # Update node_manager to use only healthy nodes
-                    node_manager.nodes = nodes
-                    break
-                elif choice in ['n', 'no']:
-                    print("Validation cancelled by user.")
-                    return 0
-                else:
-                    print("Please enter 'y' for yes or 'n' for no.")
+            if NON_INTERACTIVE:
+                print(f"[non-interactive] Auto-continuing with {len(nodes)} node(s) that passed eventmonitoring check...")
+                node_manager.nodes = nodes
+            else:
+                while True:
+                    choice = input(f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): ").lower().strip()
+                    if choice in ['y', 'yes']:
+                        print("Proceeding with nodes that passed eventmonitoring check...")
+                        node_manager.nodes = nodes
+                        break
+                    elif choice in ['n', 'no']:
+                        print("Validation cancelled by user.")
+                        return 0
+                    else:
+                        print("Please enter 'y' for yes or 'n' for no.")
             print()
 
         # If any nodes have space issues, report them and exclude from validation
@@ -6376,18 +6413,21 @@ def main():
                 print(f"  - {node['name']} ({node['ip']})")
 
             # Ask user for confirmation
-            while True:
-                choice = input(f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): ").lower().strip()
-                if choice in ['y', 'yes']:
-                    print("Proceeding with nodes that passed disk space check...")
-                    # Update node_manager to use only healthy nodes
-                    node_manager.nodes = nodes
-                    break
-                elif choice in ['n', 'no']:
-                    print("Validation cancelled by user.")
-                    return 0
-                else:
-                    print("Please enter 'y' for yes or 'n' for no.")
+            if NON_INTERACTIVE:
+                print(f"[non-interactive] Auto-continuing with {len(nodes)} node(s) that passed disk space check...")
+                node_manager.nodes = nodes
+            else:
+                while True:
+                    choice = input(f"\nDo you want to continue with validation on {len(nodes)} node(s)? (y/n): ").lower().strip()
+                    if choice in ['y', 'yes']:
+                        print("Proceeding with nodes that passed disk space check...")
+                        node_manager.nodes = nodes
+                        break
+                    elif choice in ['n', 'no']:
+                        print("Validation cancelled by user.")
+                        return 0
+                    else:
+                        print("Please enter 'y' for yes or 'n' for no.")
             print()
 
         # Check for inactive nodes and get user confirmation
@@ -6413,19 +6453,23 @@ def main():
             print(f"\n{WARNING} Inactive nodes will be skipped during validation operations.")
             print("Tech support operations and validations will only run on active nodes.")
 
-            while True:
-                choice = input(f"\nDo you want to continue with validation on {len(active_nodes)} active node(s)? (y/n): ").lower().strip()
-                if choice in ['y', 'yes']:
-                    print("Proceeding with active nodes only...")
-                    # Update the node_manager to use only active nodes
-                    node_manager.nodes = active_nodes
-                    nodes = active_nodes
-                    break
-                elif choice in ['n', 'no']:
-                    print("Validation cancelled by user.")
-                    return 0
-                else:
-                    print("Please enter 'y' for yes or 'n' for no.")
+            if NON_INTERACTIVE:
+                print(f"[non-interactive] Auto-continuing with {len(active_nodes)} active node(s)...")
+                node_manager.nodes = active_nodes
+                nodes = active_nodes
+            else:
+                while True:
+                    choice = input(f"\nDo you want to continue with validation on {len(active_nodes)} active node(s)? (y/n): ").lower().strip()
+                    if choice in ['y', 'yes']:
+                        print("Proceeding with active nodes only...")
+                        node_manager.nodes = active_nodes
+                        nodes = active_nodes
+                        break
+                    elif choice in ['n', 'no']:
+                        print("Validation cancelled by user.")
+                        return 0
+                    else:
+                        print("Please enter 'y' for yes or 'n' for no.")
         else:
             print(f"\n{PASS} All {len(nodes)} nodes are active and have healthy disk space (<80% usage).")
             print(f"{PASS} All nodes are ready for validation.")
@@ -6458,7 +6502,11 @@ def main():
         print("1. Generate new tech supports for analysis")
         print("2. Use existing tech supports on all nodes")
 
-        tech_choice = input("\nEnter your choice (1/2): ")
+        if NON_INTERACTIVE:
+            tech_choice = "1"
+            print(f"\n[non-interactive] Auto-selecting: Generate new tech supports")
+        else:
+            tech_choice = input("\nEnter your choice (1/2): ")
 
         # Store skipped nodes information for final report
         skipped_nodes_info = {
