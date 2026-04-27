@@ -94,9 +94,72 @@ Most dependencies are part of Python's standard library. For the few external de
 - **sshpass**: External system tool for password-based SSH authentication
 - All other dependencies are part of Python's standard library
 
+### Running on an ND Node (via NDP Plugin)
+
+This script can be packaged as an NDP plugin and run via `acs plugin run`.
+Since the script requires `sshpass` and ND boxes do not ship with it (no
+package manager available), the binary must be transferred manually before
+the plugin will work (one-time per node):
+
+```bash
+base64 /usr/bin/sshpass | ssh root@<nd-node> \
+  "base64 -d > /usr/local/bin/sshpass && chmod +x /usr/local/bin/sshpass"
+```
+
+This is a dependency of the validation script, not of the NDP framework
+itself. See [`plugin/README.md`](../plugin/README.md) for NDP packaging
+details.
+
 ## Usage
 
-Place the main script `ND-Preupgrade-Validation.py` and the worker script `worker_functions.py` in the same directory and execute the main script with the command `python ND-Preupgrade-Validation.py` or `python3 ND-Preupgrade-Validation.py`
+Place the main script `ND-Preupgrade-Validation.py` and the worker script `worker_functions.py` in the same directory and execute the main script.
+
+### Command-line Options
+
+```
+python3 ND-Preupgrade-Validation.py [OPTIONS]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--ndip HOST` | IP address or hostname of the Nexus Dashboard (prompted if omitted in interactive mode) |
+| `-p`, `--password PASS` | Password for rescue-user (prompted if omitted in interactive mode) |
+| `-i`, `--interactive` | Enable interactive mode with prompts for all decisions (tech support selection, continue/abort on warnings, etc.) |
+| `--debug` | Enable debug logging to console and preserve temp files |
+| `-b`, `--bash` | Run in GitBash/Windows mode (no sshpass) |
+| `--diagnose` | Run diagnostic tests only |
+
+### Non-interactive Mode (Default)
+
+By default, the script runs non-interactively:
+- Auto-generates new tech supports on all nodes
+- Auto-continues when warnings are encountered (disk space, inactive nodes, etc.)
+- Auto-selects the most recent tech support file when using existing ones
+- Requires `--ndip` and `-p` to be specified on the command line
+
+```bash
+python3 ND-Preupgrade-Validation.py --ndip 10.1.1.1 -p <password>
+```
+
+### Interactive Mode
+
+Use `-i` or `--interactive` to get prompted for each decision (original behavior):
+
+```bash
+python3 ND-Preupgrade-Validation.py --ndip 10.1.1.1 -p <password> -i
+```
+
+In interactive mode:
+- You choose between generating new tech supports or using existing ones
+- You select which tech support file to use per node
+- You confirm whether to continue when warnings are detected
+- If `--ndip` or `-p` are omitted, you will be prompted
+
+### NDP Plugin Mode
+
+When packaged as a `.ndp` plugin and run via `acs plugin run` on the ND node, the entry
+point (`run.sh`) automatically supplies `--ndip`, `-p`, and runs non-interactively. No
+user input is required. See [`plugin/README.md`](../plugin/README.md) for packaging details.
 
 ### Compatibility Notes
 - The main script is currently only compatible with Python 3.7+ but will be modified in the future.
