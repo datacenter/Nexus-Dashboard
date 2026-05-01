@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.22 (Apr 16, 2026)
+Version: 1.0.23 (May 1, 2026)
 """
 
 import re
@@ -44,11 +44,13 @@ def setup_logging():
     
     log_file = "{}/nd_validation_{}.log".format(log_dir, datetime.now().strftime('%Y%m%d'))
     
-    # Get the current script directory
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    # Create debug log in script directory (will be moved to final-results later)
-    debug_log = os.path.join(script_dir, "nd_validation_debug.log")
+    # Create debug log directly in final-results directory (bundled into .tgz for TAC SR)
+    results_dir = os.path.join(os.getcwd(), "final-results")
+    try:
+        os.makedirs(results_dir)
+    except OSError:
+        pass  # Directory already exists
+    debug_log = os.path.join(results_dir, "nd_validation_debug.log")
     
     # Configure logging
     logging.basicConfig(
@@ -266,6 +268,7 @@ class SSHCommand:
                         ssh_opts += " -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa"
 
                     # Try SSH without sshpass to see the actual error
+                    # SSH handles bare IPv6 natively; no brackets needed here
                     diagnostic_cmd = f"ssh {ssh_opts} -o BatchMode=yes {self.node_manager.username}@{self.node['ip']} 'echo test' 2>&1"
                     logger.debug(f"Running diagnostic: {diagnostic_cmd}")
 
@@ -442,7 +445,7 @@ class NDNodeManager:
             "-o LogLevel=ERROR",
             "-o ConnectTimeout=30",
             "-o ControlMaster=auto",
-            "-o ControlPath=/tmp/ssh-nd-%r@%h:%p",
+            "-o ControlPath=/tmp/ssh-nd-%C",
             "-o ControlPersist=300"  # Keep connections alive for 5 minutes
         ]
 
@@ -457,8 +460,8 @@ class NDNodeManager:
                 "-o PubkeyAcceptedKeyTypes=+ssh-rsa"
             ])
 
-        # Note: OpenSSH handles bare IPv6 addresses correctly in user@host format
-        # No need to wrap in brackets - this works for both IPv4 and IPv6
+        # SSH handles bare IPv6 addresses natively (user@2001:db8::1);
+        # brackets are only needed for SCP and URLs.
         ssh_opts_str = " ".join(ssh_opts)
         # Use SSHPASS environment variable method which is more reliable than -p flag
         # This avoids issues with special characters in passwords and shell escaping
@@ -1128,27 +1131,17 @@ class NDNodeManager:
                 # Format: │  │  │  │  │ 2001:6114:114::14/64 │ 2001:420:28e:2023::111:604/64 │  │
 
                 # Find non-empty parts that look like IP addresses
-                for part in parts:
-                    if part and ('.' in part or ':' in part) and '/' in part:
-                        # This looks like an IP address with CIDR
-                        if ':' in part:
-                            # IPv6 - add to mgmt network (typically second column)
-                            if part != "0.0.0.0/0" and part != "::/0":
-                                # Determine if it's data or mgmt based on position
-                                # In the continuation line, data is usually before mgmt
-                                part_index = parts.index(part)
-                                if part_index == 0 or (len(parts) > 1 and part == parts[0]):
-                                    node_dict[current_node_name]["datanetwork"].append(part)
-                                else:
-                                    node_dict[current_node_name]["mgmtnetwork"].append(part)
-                        elif '.' in part:
-                            # IPv4
-                            if part != "0.0.0.0/0":
-                                part_index = parts.index(part)
-                                if part_index == 0:
-                                    node_dict[current_node_name]["datanetwork"].append(part)
-                                else:
-                                    node_dict[current_node_name]["mgmtnetwork"].append(part)
+                _placeholder_cidrs = {"0.0.0.0/0", "::/0"}
+                _ip_parts = [
+                    (idx, p) for idx, p in enumerate(parts)
+                    if p and ('.' in p or ':' in p) and '/' in p and p not in _placeholder_cidrs
+                ]
+                for list_pos, (part_index, part) in enumerate(_ip_parts):
+                    # Assign first encountered IP to datanetwork, second to mgmtnetwork
+                    if list_pos == 0:
+                        node_dict[current_node_name]["datanetwork"].append(part)
+                    else:
+                        node_dict[current_node_name]["mgmtnetwork"].append(part)
 
         # Convert node_dict to list and select primary IPs
         for node_name, node_data in node_dict.items():
@@ -1265,7 +1258,8 @@ class NDNodeManager:
         try:
             logger.info(f"Checking node storage devices on {node['name']}")
             cmd = self.build_ssh_command(node["ip"], "acs verify storage")
-            logger.debug(f"[Storage] Executing command: {cmd}")
+            masked_cmd = cmd.replace(self.password, "********")
+            logger.debug(f"[Storage] Executing command: {masked_cmd}")
             process = subprocess.Popen(
                 cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -3554,7 +3548,9 @@ def _collect_live_node_data(node, node_manager):
                 continue
             ip = raw_ip.split("/")[0]  # strip CIDR notation if present
             if ip:
-                live_commands.append(f"ping -c 3 {ip}")
+                # Use -6 flag for IPv6 addresses so the correct socket family is selected
+                ping_flag = "-6 " if ":" in ip else ""
+                live_commands.append(f"ping {ping_flag}-c 3 {ip}")
 
     for cmd in live_commands:
         ssh_cmd = node_manager.build_ssh_command(node["ip"], cmd, timeout=30)
@@ -3737,31 +3733,82 @@ def _run_api_checks(node_manager, version, password):
         if not auth_success:
             logger.error(f"[API] Authentication failed: {error_type} - {error_message}")
             if error_type == 'AUTH_FAILURE':
-                details = f"Authentication failed: {error_message}"
-                explanation = "Invalid credentials or authentication rejected by ND API"
-                recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
+                conn_details = f"Authentication failed: {error_message}"
+                conn_explanation = "Invalid credentials or authentication rejected by ND API"
+                conn_recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
             elif error_type == 'CONNECTION_FAILURE':
-                details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
-                explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
-                recommendation = f"Verify port 443 on ND is accessible from device running the script.\n\n{MANUAL_VERIFICATION_STEPS}"
+                conn_details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
+                conn_explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
+                conn_recommendation = f"Verify port 443 on ND is accessible from device running the script.\n\n{MANUAL_VERIFICATION_STEPS}"
             elif error_type == 'TIMEOUT':
-                details = f"Connection timeout to {node_manager.nd_ip}:443"
-                explanation = "Connection attempt to ND management interface timed out"
-                recommendation = f"Check network connectivity, firewall rules, and ND system health.\n\n{MANUAL_VERIFICATION_STEPS}"
+                conn_details = f"Connection timeout to {node_manager.nd_ip}:443"
+                conn_explanation = "Connection attempt to ND management interface timed out"
+                conn_recommendation = f"Check network connectivity, firewall rules, and ND system health.\n\n{MANUAL_VERIFICATION_STEPS}"
             else:
-                details = f"Failed to authenticate to ND API: {error_message}"
-                explanation = "Could not authenticate to ND management interface"
-                recommendation = f"Verify admin credentials and API accessibility.\n\n{MANUAL_VERIFICATION_STEPS}"
-            api_check_result = APICheckResult.set_warning(
-                "telemetry_inband_epg", details, explanation=explanation, recommendation=recommendation
-            )
+                conn_details = f"Failed to authenticate to ND API: {error_message}"
+                conn_explanation = "Could not authenticate to ND management interface"
+                conn_recommendation = f"Verify admin credentials and API accessibility.\n\n{MANUAL_VERIFICATION_STEPS}"
+
+            # Derive version tuple once for version-gated check filtering
+            _ver = get_version_tuple(version) if version else (0, 0, 0, '')
+            _maj, _min = _ver[0], _ver[1]
+
+            # telemetry_inband_epg: only 3.2.x (4.2.x+ addressed the root cause)
+            if version and not (_maj == 3 and _min == 2):
+                api_check_results["telemetry_inband_epg"] = APICheckResult.set_pass(
+                    "telemetry_inband_epg", f"ND version {version} is not 3.2.x, check not applicable"
+                )
+            else:
+                api_check_results["telemetry_inband_epg"] = APICheckResult.set_warning(
+                    "telemetry_inband_epg", conn_details,
+                    explanation=conn_explanation, recommendation=conn_recommendation
+                )
+            # nxapi_cert_verify_state: only 3.2.x
+            if version and not (_maj == 3 and _min == 2):
+                api_check_results["nxapi_cert_verify_state"] = APICheckResult.set_pass(
+                    "nxapi_cert_verify_state", f"ND version {version} != 3.2, check not applicable"
+                )
+            else:
+                api_check_results["nxapi_cert_verify_state"] = APICheckResult.set_warning(
+                    "nxapi_cert_verify_state", conn_details,
+                    explanation=conn_explanation, recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+                )
+            # reserved_tenant_names: only 3.2.x or 4.1.x
+            if version and not ((_maj == 3 and _min == 2) or (_maj == 4 and _min == 1)):
+                api_check_results["reserved_tenant_names"] = APICheckResult.set_pass(
+                    "reserved_tenant_names", f"ND version {version} is not 3.2.x or 4.1.x, check not applicable"
+                )
+            else:
+                api_check_results["reserved_tenant_names"] = APICheckResult.set_warning(
+                    "reserved_tenant_names", conn_details,
+                    explanation=conn_explanation,
+                    recommendation="Verify API connectivity and check tenant names manually before upgrade."
+                )
+
+            statuses = [r["status"] for r in api_check_results.values()]
+            api_check_result = {
+                "status": "FAIL" if "FAIL" in statuses else "WARNING" if "WARNING" in statuses else "PASS",
+                "details": [d for r in api_check_results.values() for d in r.get("details", [])],
+                "explanation": conn_explanation,
+                "recommendation": conn_recommendation,
+                "reference": None
+            }
             return api_check_result, api_check_results
 
+        logger.info(f"[API] Running telemetry_inband_epg check (ND version {version})")
         result = check_telemetry_inband_epg(api_client, version)
         api_check_results["telemetry_inband_epg"] = result
+        logger.info(f"[API] telemetry_inband_epg: {result['status']}")
 
+        logger.info(f"[API] Running nxapi_cert_verify_state check (ND version {version})")
         result = check_nxapi_cert_verify_state(api_client, version)
         api_check_results["nxapi_cert_verify_state"] = result
+        logger.info(f"[API] nxapi_cert_verify_state: {result['status']}")
+
+        logger.info(f"[API] Running reserved_tenant_names check (ND version {version})")
+        result = check_reserved_tenant_names(api_client, version)
+        api_check_results["reserved_tenant_names"] = result
+        logger.info(f"[API] reserved_tenant_names: {result['status']}")
 
         statuses = [r["status"] for r in api_check_results.values()]
         combined_status = "FAIL" if "FAIL" in statuses else "WARNING" if "WARNING" in statuses else "PASS"
@@ -4545,32 +4592,69 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             
             if not auth_success:
                 logger.error(f"[API] Failed to authenticate API client: {error_type} - {error_message}")
-                
+
                 # Provide specific error messages based on error type
                 if error_type == 'AUTH_FAILURE':
-                    details = f"Authentication failed: {error_message}"
-                    explanation = "Invalid credentials or authentication rejected by ND API"
-                    recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
+                    conn_details = f"Authentication failed: {error_message}"
+                    conn_explanation = "Invalid credentials or authentication rejected by ND API"
+                    conn_recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
                 elif error_type == 'CONNECTION_FAILURE':
-                    details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
-                    explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
-                    recommendation = f"Verify port 443 on ND is accessible from device running the script. Check network connectivity and firewall rules.\n\n{MANUAL_VERIFICATION_STEPS}"
+                    conn_details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
+                    conn_explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
+                    conn_recommendation = f"Verify port 443 on ND is accessible from device running the script. Check network connectivity and firewall rules.\n\n{MANUAL_VERIFICATION_STEPS}"
                 elif error_type == 'TIMEOUT':
-                    details = f"Connection timeout to {node_manager.nd_ip}:443"
-                    explanation = "Connection attempt to ND management interface timed out"
-                    recommendation = f"Check network connectivity, firewall rules, and ND system health.\n\n{MANUAL_VERIFICATION_STEPS}"
+                    conn_details = f"Connection timeout to {node_manager.nd_ip}:443"
+                    conn_explanation = "Connection attempt to ND management interface timed out"
+                    conn_recommendation = f"Check network connectivity, firewall rules, and ND system health.\n\n{MANUAL_VERIFICATION_STEPS}"
                 else:
-                    details = f"Failed to authenticate to ND API: {error_message}"
-                    explanation = "Could not authenticate to ND management interface"
-                    recommendation = f"Verify admin credentials and API accessibility. Check debug log for details.\n\n{MANUAL_VERIFICATION_STEPS}"
-                
-                result = APICheckResult.set_warning(
-                    "telemetry_inband_epg",
-                    details,
-                    explanation=explanation,
-                    recommendation=recommendation
-                )
-                api_check_result.update(result)
+                    conn_details = f"Failed to authenticate to ND API: {error_message}"
+                    conn_explanation = "Could not authenticate to ND management interface"
+                    conn_recommendation = f"Verify admin credentials and API accessibility. Check debug log for details.\n\n{MANUAL_VERIFICATION_STEPS}"
+
+                # Derive version tuple once for version-gated check filtering
+                _ver = get_version_tuple(version) if version else (0, 0, 0, '')
+                _maj, _min = _ver[0], _ver[1]
+
+                # telemetry_inband_epg: only 3.2.x (4.2.x+ addressed the root cause)
+                if version and not (_maj == 3 and _min == 2):
+                    api_check_results["telemetry_inband_epg"] = APICheckResult.set_pass(
+                        "telemetry_inband_epg", f"ND version {version} is not 3.2.x, check not applicable"
+                    )
+                else:
+                    api_check_results["telemetry_inband_epg"] = APICheckResult.set_warning(
+                        "telemetry_inband_epg", conn_details,
+                        explanation=conn_explanation, recommendation=conn_recommendation
+                    )
+                # nxapi_cert_verify_state: only 3.2.x
+                if version and not (_maj == 3 and _min == 2):
+                    api_check_results["nxapi_cert_verify_state"] = APICheckResult.set_pass(
+                        "nxapi_cert_verify_state", f"ND version {version} != 3.2, check not applicable"
+                    )
+                else:
+                    api_check_results["nxapi_cert_verify_state"] = APICheckResult.set_warning(
+                        "nxapi_cert_verify_state", conn_details,
+                        explanation=conn_explanation, recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+                    )
+                # reserved_tenant_names: only 3.2.x or 4.1.x
+                if version and not ((_maj == 3 and _min == 2) or (_maj == 4 and _min == 1)):
+                    api_check_results["reserved_tenant_names"] = APICheckResult.set_pass(
+                        "reserved_tenant_names", f"ND version {version} is not 3.2.x or 4.1.x, check not applicable"
+                    )
+                else:
+                    api_check_results["reserved_tenant_names"] = APICheckResult.set_warning(
+                        "reserved_tenant_names", conn_details,
+                        explanation=conn_explanation,
+                        recommendation="Verify API connectivity and check tenant names manually before upgrade."
+                    )
+
+                statuses = [r["status"] for r in api_check_results.values()]
+                api_check_result.update({
+                    "status": "FAIL" if "FAIL" in statuses else "WARNING" if "WARNING" in statuses else "PASS",
+                    "details": [d for r in api_check_results.values() for d in r.get("details", [])],
+                    "explanation": conn_explanation,
+                    "recommendation": conn_recommendation,
+                    "reference": None
+                })
                 return
             
             # Run API checks using the authenticated client
@@ -4578,7 +4662,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             result = check_telemetry_inband_epg(api_client, version)
             api_check_results["telemetry_inband_epg"] = result
             if result["status"] == "FAIL":
-                logger.error(f"[API] API check FAILED (telemetry_inband_epg): {result['details']}")
+                logger.info(f"[API] API check FAILED (telemetry_inband_epg): {result['details']}")
             elif result["status"] == "WARNING":
                 logger.warning(f"[API] API check WARNING (telemetry_inband_epg): {result['details']}")
             else:
@@ -4588,11 +4672,21 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             result = check_nxapi_cert_verify_state(api_client, version)
             api_check_results["nxapi_cert_verify_state"] = result
             if result["status"] == "FAIL":
-                logger.error(f"[API] API check FAILED (nxapi_cert_verify_state): {result['details']}")
+                logger.info(f"[API] API check FAILED (nxapi_cert_verify_state): {result['details']}")
             elif result["status"] == "WARNING":
                 logger.warning(f"[API] API check WARNING (nxapi_cert_verify_state): {result['details']}")
             else:
                 logger.info(f"[API] API check PASSED (nxapi_cert_verify_state): {result['details']}")
+
+            logger.info(f"[API] Starting API check for reserved tenant names with ND version {version}")
+            result = check_reserved_tenant_names(api_client, version)
+            api_check_results["reserved_tenant_names"] = result
+            if result["status"] == "FAIL":
+                logger.info(f"[API] API check FAILED (reserved_tenant_names): {result['details']}")
+            elif result["status"] == "WARNING":
+                logger.warning(f"[API] API check WARNING (reserved_tenant_names): {result['details']}")
+            else:
+                logger.info(f"[API] API check PASSED (reserved_tenant_names): {result['details']}")
 
             # Combined status: FAIL if any FAIL, else WARNING if any WARNING, else PASS
             statuses = [r["status"] for r in api_check_results.values()]
@@ -5016,6 +5110,20 @@ class NDAPIClient:
         self.ssl_context = self.ssl.create_default_context()
         self.ssl_context.check_hostname = False
         self.ssl_context.verify_mode = self.ssl.CERT_NONE
+
+        # Build opener that bypasses any system proxy (https_proxy / HTTPS_PROXY env vars).
+        # ND is a directly reachable management appliance — routing HTTPS through a proxy
+        # causes urllib's CONNECT tunnel + custom SSL context to hang on Python 3.10/Linux.
+        # ProxyHandler({}) with an empty dict suppresses all proxy routing for this opener.
+        if self.python3:
+            self.opener = self.urllib_request.build_opener(
+                self.urllib_request.HTTPSHandler(context=self.ssl_context),
+                self.urllib_request.ProxyHandler({})  # bypass any system proxy for ND
+            )
+        else:
+            self.opener = self.urllib_request.build_opener(
+                self.urllib_request.HTTPSHandler()
+            )
     
     def authenticate(self):
         """
@@ -5036,22 +5144,15 @@ class NDAPIClient:
         self.logger.info(f"[API] Authenticating to ND API at {login_url} as {self.username}")
         
         try:
-            if self.python3:
-                login_req = self.urllib_request.Request(
-                    login_url,
-                    data=login_data.encode('utf-8'),
-                    headers={'Content-Type': 'application/json'}
-                )
-                login_response = self.urllib_request.urlopen(login_req, context=self.ssl_context, timeout=30)
-                login_result = json.loads(login_response.read().decode('utf-8'))
-            else:
-                login_req = self.urllib_request.Request(
-                    login_url,
-                    data=login_data,
-                    headers={'Content-Type': 'application/json'}
-                )
-                login_response = self.urllib_request.urlopen(login_req, context=self.ssl_context, timeout=30)
-                login_result = json.loads(login_response.read())
+            data_bytes = login_data.encode('utf-8') if self.python3 else login_data
+            login_req = self.urllib_request.Request(
+                login_url,
+                data=data_bytes,
+                headers={'Content-Type': 'application/json'}
+            )
+            login_response = self.opener.open(login_req, timeout=30)
+            raw = login_response.read()
+            login_result = json.loads(raw.decode('utf-8') if self.python3 else raw)
             
             # Extract and store bearer token
             self._token = login_result.get('token')
@@ -5113,20 +5214,13 @@ class NDAPIClient:
         self.logger.debug(f"[API] GET {endpoint}")
         
         try:
-            if self.python3:
-                req = self.urllib_request.Request(
-                    url,
-                    headers={'Authorization': f'Bearer {self._token}'}
-                )
-                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
-                data = json.loads(response.read().decode('utf-8'))
-            else:
-                req = self.urllib_request.Request(
-                    url,
-                    headers={'Authorization': f'Bearer {self._token}'}
-                )
-                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
-                data = json.loads(response.read())
+            req = self.urllib_request.Request(
+                url,
+                headers={'Authorization': f'Bearer {self._token}'}
+            )
+            response = self.opener.open(req, timeout=timeout)
+            raw = response.read()
+            data = json.loads(raw.decode('utf-8') if self.python3 else raw)
             
             self.logger.debug(f"[API] GET {endpoint} succeeded")
             return data
@@ -5163,28 +5257,18 @@ class NDAPIClient:
         post_data = json.dumps(data)
         
         try:
-            if self.python3:
-                req = self.urllib_request.Request(
-                    url,
-                    data=post_data.encode('utf-8'),
-                    headers={
-                        'Authorization': f'Bearer {self._token}',
-                        'Content-Type': 'application/json'
-                    }
-                )
-                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
-                result = json.loads(response.read().decode('utf-8'))
-            else:
-                req = self.urllib_request.Request(
-                    url,
-                    data=post_data,
-                    headers={
-                        'Authorization': f'Bearer {self._token}',
-                        'Content-Type': 'application/json'
-                    }
-                )
-                response = self.urllib_request.urlopen(req, context=self.ssl_context, timeout=timeout)
-                result = json.loads(response.read())
+            data_bytes = post_data.encode('utf-8') if self.python3 else post_data
+            req = self.urllib_request.Request(
+                url,
+                data=data_bytes,
+                headers={
+                    'Authorization': f'Bearer {self._token}',
+                    'Content-Type': 'application/json'
+                }
+            )
+            response = self.opener.open(req, timeout=timeout)
+            raw = response.read()
+            result = json.loads(raw.decode('utf-8') if self.python3 else raw)
             
             self.logger.debug(f"[API] POST {endpoint} succeeded")
             return result
@@ -5225,11 +5309,12 @@ def check_telemetry_inband_epg(api_client, version):
     check_name = "telemetry_inband_epg"
 
     # Check version applicability - only applies to 3.2.x (not 3.1.x or 4.0+)
+    # 4.2.x and later address the root cause; check is not applicable
     major, minor, patch, suffix = get_version_tuple(version)
     if major != 3 or minor != 2:
         return APICheckResult.set_pass(
             check_name,
-            f"ND version {version} != 3.2, check not applicable"
+            f"ND version {version} is not 3.2.x, check not applicable"
         )
     
     # Example of suffix-based filtering (if needed in future):
@@ -5287,6 +5372,15 @@ def check_telemetry_inband_epg(api_client, version):
             # Use suppress_error_log=True since NDI may not be installed (404 is expected)
             ndsites_data = api_client.get('/sedgeapi/v1/cisco-nir/api/api/v1/ndsites?siteStatus=ONLINE&excludeNodeDetails=true', suppress_error_log=True)
         except Exception as e:
+            # A 404 means the NDI/Insights feature is not installed on this cluster,
+            # so there are no ACI sites with telemetry to check.
+            err_code = getattr(e, 'code', None)
+            if err_code == 404:
+                logger.info("[API] NDI ndsites API returned 404 - Insights not enabled, no sites to check")
+                return APICheckResult.set_pass(
+                    check_name,
+                    "Insights (NDI) feature is not enabled on this cluster (HTTP 404) - no sites to check"
+                )
             logger.warning(f"NDI API failure: {str(e)}. Proceeding with check.")
             ndsites_data = None  # so Step 5 can safely check isinstance(ndsites_data, list)
             ndsites_fetch_failed = True
@@ -5427,7 +5521,19 @@ def check_nxapi_cert_verify_state(api_client, version):
             )
 
         logger.info(f"[API] Running NXAPI cert verify state check: GET {url_path}")
-        data = api_client.get(url_path, suppress_error_log=True)
+        try:
+            data = api_client.get(url_path, suppress_error_log=True)
+        except Exception as fetch_err:
+            # A 404 means the NDFC feature is not installed on this cluster,
+            # so the cert verify state check is not applicable.
+            err_code = getattr(fetch_err, 'code', None)
+            if err_code == 404:
+                logger.info("[API] NDFC cert verify API returned 404 - NDFC not enabled, check not applicable")
+                return APICheckResult.set_pass(
+                    check_name,
+                    "NDFC feature is not enabled on this cluster (HTTP 404) - check not applicable"
+                )
+            raise  # Re-raise any other error to the outer handler
 
         if not isinstance(data, dict):
             logger.warning(f"[API] Unexpected response type: {type(data)}")
@@ -5469,6 +5575,132 @@ def check_nxapi_cert_verify_state(api_client, version):
             f"Error during API check: {str(e)}",
             explanation="Could not complete API-based validation",
             recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
+        )
+
+
+# Reserved keyword prefixes that can block tenant uplift during upgrade (CSCwt87466)
+RESERVED_TENANT_PREFIXES = ("default", "all", "none", "null", "mgmt")
+
+
+def check_reserved_tenant_names(api_client, version):
+    """
+    API-based check for tenant names that start with reserved keyword prefixes (CSCwt87466).
+
+    During upgrade/uplift from ND 3.2.x or 4.1.x to 4.2, tenant uplift can fail because
+    ND tenant-name validation blocks tenant names that begin with certain reserved keywords,
+    even when the full tenant name is otherwise valid (e.g. "All_Schema_test" blocked
+    because it starts with "All").
+
+    This check queries the MSO tenant API and flags any tenant whose name starts with one
+    of the reserved prefixes (case-insensitive).
+
+    Only applies to ND versions 3.2.x and 4.1.x.
+
+    Args:
+        api_client: Authenticated NDAPIClient instance
+        version: ND version string (e.g., "3.2.1e")
+
+    Returns:
+        dict: Check result with status, details, explanation, recommendation, reference
+
+    Reference: CSCwt87466
+    """
+    logger = logging.getLogger(__name__)
+    check_name = "reserved_tenant_names"
+
+    try:
+        # Check version applicability - only applies to 3.2.x and 4.1.x
+        if not version:
+            return APICheckResult.set_warning(
+                check_name,
+                "ND version not available for API check",
+                recommendation="Verify ND version and run check manually if needed."
+            )
+
+        major, minor, patch, suffix = get_version_tuple(version)
+        if not ((major == 3 and minor == 2) or (major == 4 and minor == 1)):
+            return APICheckResult.set_pass(
+                check_name,
+                f"ND version {version} is not 3.2.x or 4.1.x, check not applicable"
+            )
+
+        logger.info(f"[API] ND version {version} is applicable - running reserved tenant name check")
+
+        if not api_client.is_authenticated():
+            logger.warning("[API] API client is not authenticated")
+            return APICheckResult.set_warning(
+                check_name,
+                "API client not authenticated",
+                explanation="Could not authenticate to ND management interface",
+                recommendation="Verify admin credentials and API accessibility."
+            )
+
+        # Fetch tenants from MSO API
+        logger.info("[API] Fetching tenants from /mso/api/v1/tenants")
+        try:
+            data = api_client.get("/mso/api/v1/tenants", suppress_error_log=True)
+        except Exception as fetch_err:
+            # A 404 means the MSO/Orchestration feature is not enabled on this cluster,
+            # so there are no tenants that could hit the reserved-prefix uplift issue.
+            err_code = getattr(fetch_err, 'code', None)
+            if err_code == 404:
+                logger.info("[API] MSO tenant API returned 404 - Orchestration not enabled, no tenants to check")
+                return APICheckResult.set_pass(
+                    check_name,
+                    "Orchestration feature is not enabled on this cluster (HTTP 404) - no tenants to check"
+                )
+            raise  # Re-raise any other error to the outer handler
+
+        tenants = data.get("tenants", []) if isinstance(data, dict) else []
+        logger.info(f"[API] Retrieved {len(tenants)} tenant(s)")
+
+        # Check each tenant name against reserved prefixes
+        flagged = []
+        for tenant in tenants:
+            name = tenant.get("name", "")
+            name_lower = name.lower()
+            for prefix in RESERVED_TENANT_PREFIXES:
+                if name_lower.startswith(prefix):
+                    flagged.append({
+                        "name": name,
+                        "id": tenant.get("id", ""),
+                        "matched_prefix": prefix
+                    })
+                    break
+
+        if flagged:
+            details_lines = [
+                f"Found {len(flagged)} tenant(s) with reserved keyword prefix that will block uplift during upgrade:"
+            ]
+            for t in flagged:
+                details_lines.append(f"  - Tenant '{t['name']}' matches reserved prefix '{t['matched_prefix']}' (ID: {t['id']})")
+
+            logger.info(f"[API] Reserved tenant name check FAILED: {len(flagged)} tenant(s) flagged")
+            return APICheckResult.set_fail(
+                check_name,
+                "\n".join(details_lines),
+                explanation=(
+                    "Tenant uplift during upgrade can fail when existing tenant names begin with "
+                    "reserved keyword prefixes (case-insensitive). The reserved prefixes checked are: "
+                    + ", ".join(RESERVED_TENANT_PREFIXES)
+                ),
+                recommendation="Contact Cisco TAC before proceeding with the upgrade to address the flagged tenant names.",
+                reference="https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwt87466"
+            )
+
+        logger.info("[API] Reserved tenant name check PASSED: no tenants with reserved prefixes found")
+        return APICheckResult.set_pass(
+            check_name,
+            f"No tenants with reserved keyword prefixes found ({len(tenants)} tenant(s) checked)"
+        )
+
+    except Exception as e:
+        logger.debug(f"[API] Error during reserved tenant name check: {str(e)}", exc_info=True)
+        return APICheckResult.set_warning(
+            check_name,
+            f"Error during API check: {str(e)}",
+            explanation="Could not complete reserved tenant name validation",
+            recommendation="Verify API connectivity and check tenant names manually before upgrade."
         )
 
 
@@ -5922,56 +6154,10 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         print(f"\nDetailed results are available in {results_dir}/\n")
         summary_file.write(f"\nDetailed results are available in {results_dir}/\n")
     
-    # Move debug log to final-results directory and create .tgz bundle
-    import shutil
+    # Create .tgz bundle (debug log is already in final-results/ via logging handler)
     import tarfile
     
-    # Get absolute paths to handle WSL/venv environments correctly
-    script_dir = os.path.dirname(os.path.abspath(__file__))
     cwd = os.getcwd()
-    
-    # Search for debug log in multiple possible locations (WSL/venv compatibility)
-    debug_log_search_paths = [
-        os.path.join(script_dir, "nd_validation_debug.log"),  # Script directory
-        os.path.join(cwd, "nd_validation_debug.log"),          # Current working directory
-        os.path.abspath("nd_validation_debug.log")             # Relative to CWD
-    ]
-    
-    debug_log_src = None
-    for path in debug_log_search_paths:
-        if os.path.exists(path):
-            debug_log_src = path
-            logger.info(f"Found debug log at: {debug_log_src}")
-            break
-    
-    # Copy (not move) debug log to final-results directory
-    # Using copy instead of move to ensure original remains if needed
-    debug_log_dst = os.path.join(results_dir, "nd_validation_debug.log")
-    
-    if debug_log_src and os.path.exists(debug_log_src):
-        try:
-            shutil.copy2(debug_log_src, debug_log_dst)
-            logger.info(f"Copied debug log to {debug_log_dst}")
-        except Exception as e:
-            logger.warning(f"Could not copy debug log: {str(e)}")
-            # Try to at least create a placeholder with error info
-            try:
-                with open(debug_log_dst, 'w') as f:
-                    f.write(f"Debug log could not be copied: {str(e)}\n")
-                    f.write(f"Searched in: {', '.join(debug_log_search_paths)}\n")
-            except:
-                pass
-    else:
-        logger.warning(f"Debug log not found in any of: {', '.join(debug_log_search_paths)}")
-        # Create a placeholder file to indicate the issue
-        try:
-            with open(debug_log_dst, 'w') as f:
-                f.write("Debug log file was not found at script execution.\n")
-                f.write(f"Searched in:\n")
-                for path in debug_log_search_paths:
-                    f.write(f"  - {path}\n")
-        except Exception as e:
-            logger.warning(f"Could not create placeholder debug log: {str(e)}")
     
     # Create timestamped .tgz bundle
     timestamp = datetime.now().strftime('%Y-%m-%dT%H-%M-%S')
