@@ -55,6 +55,7 @@ Note: The cloning instructions differ slightly from the video now that the repo 
 | 21 | atom0 NVME check | Verify no NVME drive hardware failures are present in Physical node setups | |
 | 22 | atom0 vg check | Verify there is more than 50% free space in atom0 virtual group | [CSCwr43515](https://bst.cisco.com/bugsearch/bug/CSCwr43515) |
 | 23 | vND App Large check | Verify vND SE-VIRTUAL-APP is not using Large Profile | [CSCws77374](https://bst.cisco.com/bugsearch/bug/CSCws77374), [Documentation 1](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc), [Documentation 2](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-321/nd-deploy-esx-32x.html#concept_zkv_y2g_mmb) |
+| 24 | Tenant reserved keyword check | Verify NDO/MSO tenants do not have reserved keyword prefix | [CSCwt87466](https://bst.cisco.com/bugsearch/bug/CSCwt87466) |
 
 ## Dependencies and Installation
 
@@ -116,23 +117,23 @@ Resolving deltas: 100% (4/4), done.
 
 user@host:~$ ls -lh
 total 12K
-drwxr-xr-x 5 user user 4.0K Feb 19 22:59 Nexus-Dashboard
+drwxr-xr-x 5 user user 4.0K May  1 01:59 Nexus-Dashboard
 
 user@host:~$ ls -lh Nexus-Dashboard/
 total 12K
--rw-r--r-- 1 user user  365 Feb 19 22:59 README.md
-drwxr-xr-x 2 user user 4.0K Feb 19 22:59 plugin
-drwxr-xr-x 2 user user 4.0K Feb 19 22:59 script
+-rw-r--r-- 1 user user  365 May  1 01:59 README.md
+drwxr-xr-x 2 user user 4.0K May  1 01:59 plugin
+drwxr-xr-x 2 user user 4.0K May  1 01:59 script
 
 ## Step 2: Navigate to the /script directory
 
 user@host:~$ cd Nexus-Dashboard/script/
 user@host:~/Nexus-Dashboard/script$ ls -lh
 total 456K
--rw-r--r-- 1 user user 204K Feb 19 22:59 ND-Preupgrade-Validation.py
--rw-r--r-- 1 user user  21K Feb 19 22:59 README.md
--rw-r--r-- 1 user user 2.9K Feb 19 22:59 requirements.txt
--rw-r--r-- 1 user user 224K Feb 19 22:59 worker_functions.py
+-rw-r--r-- 1 user user 204K May  1 01:59 ND-Preupgrade-Validation.py
+-rw-r--r-- 1 user user  21K May  1 01:59 README.md
+-rw-r--r-- 1 user user 2.9K May  1 01:59 requirements.txt
+-rw-r--r-- 1 user user 224K May  1 01:59 worker_functions.py
 
 ## Step 3: Run the ND-Preupgrade-Validation.py script
 
@@ -297,39 +298,38 @@ Report generated on: 2026-02-19 18:50:26
 [Check 21/23] Atom0 Nvme Check...                                                 PASS
 [Check 22/23] Atom0 Vg Check...                                                   PASS
 [Check 23/23] Vnd App Large Check...                                              PASS
-
+[Check 24/24] Reserved Tenant Names Check...                                      PASS
 
 ================================================================================
 REPORT SUMMARY
 ================================================================================
 
-PASS                         : 23
+PASS                         : 24
 WARNING - ATTENTION REQUIRED : 0
 FAIL - UPGRADE FAILURE!!     : 0
 
 Detailed results are available in /home/user/Nexus-Dashboard/script/final-results/
 
-Results Bundle: /home/user/Nexus-Dashboard/script/nd-preupgrade-validation-results_2026-02-19T18-50-26.tgz
+Results Bundle: /home/user/Nexus-Dashboard/script/nd-preupgrade-validation-results_2026-05-01T02-50-26.tgz
 
 user@host:~/Nexus-Dashboard/script$  ls -lh
 total 564K
-drwxr-xr-x. 2 root root  236 Feb 19 18:50 final-results
--rw-r--r--. 1 root root 240K Feb 19 18:45 ND-Preupgrade-Validation.py
--rw-r--r--. 1 root root  16K Feb 19 18:50 nd-preupgrade-validation-results_2026-02-19T18-50-26.tgz
--rw-r--r--. 1 root root  83K Feb 19 18:50 nd_validation_debug.log
--rw-r--r--. 1 root root 222K Feb 19 18:46 worker_functions.py
+drwxr-xr-x. 2 root root  236 May  1 02:50 final-results
+-rw-r--r--. 1 root root 240K May  1 02:45 ND-Preupgrade-Validation.py
+-rw-r--r--. 1 root root  16K May  1 02:50 nd-preupgrade-validation-results_2026-05-01T02-50-26.tgz
+-rw-r--r--. 1 root root 222K May  1 02:46 worker_functions.py
 
 user@host:~/Nexus-Dashboard/script$  ls -lh final-results/
 total 156K
--rw-r--r--. 1 root root  15K Feb 19 18:50 ND1_output.log
--rw-r--r--. 1 root root 2.8K Feb 19 18:50 ND1_results.json
--rw-r--r--. 1 root root  15K Feb 19 18:50 ND2_output.log
--rw-r--r--. 1 root root 2.8K Feb 19 18:50 ND2_results.json
--rw-r--r--. 1 root root  15K Feb 19 18:50 ND3_output.log
--rw-r--r--. 1 root root 2.8K Feb 19 18:50 ND3_results.json
--rw-r--r--. 1 root root  83K Feb 19 18:50 nd_validation_debug.log
--rw-r--r--. 1 root root 7.8K Feb 19 18:50 validation_details.json
--rw-r--r--. 1 root root 2.4K Feb 19 18:50 validation_summary.txt
+-rw-r--r--. 1 root root  15K May  1 02:50 ND1_output.log
+-rw-r--r--. 1 root root 2.8K May  1 02:50 ND1_results.json
+-rw-r--r--. 1 root root  15K May  1 02:50 ND2_output.log
+-rw-r--r--. 1 root root 2.8K May  1 02:50 ND2_results.json
+-rw-r--r--. 1 root root  15K May  1 02:50 ND3_output.log
+-rw-r--r--. 1 root root 2.8K May  1 02:50 ND3_results.json
+-rw-r--r--. 1 root root  83K May  1 02:50 nd_validation_debug.log
+-rw-r--r--. 1 root root 7.8K May  1 02:50 validation_details.json
+-rw-r--r--. 1 root root 2.4K May  1 02:50 validation_summary.txt
 ```
 
 ## Support

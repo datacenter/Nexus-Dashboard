@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.22 (Apr 16, 2026)
+Version: 1.0.23 (May 1, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -1191,9 +1191,28 @@ def check_node_status():
     if version:
         results["version"] = version
     
-    # Get local node info
-    cmd = "hostname -I | awk '{print $1}'"
-    mgmt_ip = run_command(cmd).strip()
+    # Get local node info — prefer IPv4, skip link-local IPv6 (fe80::), fall back to global IPv6
+    cmd = "hostname -I"
+    raw_ips = run_command(cmd).strip()
+    mgmt_ip = ""
+    if raw_ips:
+        for _candidate in raw_ips.split():
+            _candidate = _candidate.strip()
+            if not _candidate:
+                continue
+            # Skip IPv6 link-local addresses (fe80::)
+            if _candidate.lower().startswith("fe80"):
+                continue
+            # Prefer first IPv4 address
+            if "." in _candidate and ":" not in _candidate:
+                mgmt_ip = _candidate
+                break
+            # Accept first global IPv6 as fallback
+            if ":" in _candidate and not mgmt_ip:
+                mgmt_ip = _candidate
+        # If only link-local was found, fall back to the raw first token
+        if not mgmt_ip and raw_ips:
+            mgmt_ip = raw_ips.split()[0]
     
     if mgmt_ip:
         print("Management IP: {0}".format(mgmt_ip))
@@ -1892,11 +1911,16 @@ def check_nxos_discovery_service(tech_file):
         )
         return False
     
-    # Step 1: Check ND version - this check only applies to ND 3.1.1 and later
+    # Step 1: Check ND version - this check only applies to ND 3.1.1 through 3.x
     if not ctx.nd_version:
         return set_warning_status("acs_version file not found")
     
-    # Version check using shared context
+    # Version check using shared context - not applicable on 4.1.x and later
+    if ctx.is_version_applicable(4, 1):
+        print("[PASS] ND version {0} >= 4.1 - NXOS Discovery Service check not applicable".format(ctx.nd_version))
+        CheckResult.set_pass("nxos_discovery_service", "Version 4.1.x or later, check not applicable")
+        return True
+    
     if not ctx.is_version_applicable(3, 1, 1):
         print("[PASS] ND version {0} < 3.1.1 - NXOS Discovery Service check not applicable".format(ctx.nd_version))
         CheckResult.set_pass("nxos_discovery_service", "Version below 3.1.1, check not applicable")
@@ -2005,7 +2029,12 @@ def check_backup_failure(tech_file):
     ctx = get_validation_context()
     cache = ctx.cache
     
-    # Check ND version applicability (only >= 3.2)
+    # Check ND version applicability (only 3.2.x through 3.x)
+    if ctx.is_version_applicable(4, 1):
+        print("[PASS] ND version {0} >= 4.1 - Backup Failure check not applicable".format(ctx.nd_version or "unknown"))
+        CheckResult.set_pass("backup_failure_check", "Version 4.1.x or later, check not applicable")
+        return True
+    
     if not ctx.is_version_applicable(3, 2):
         print("[PASS] ND version {0} < 3.2 - Backup Failure check not applicable".format(ctx.nd_version or "unknown"))
         CheckResult.set_pass("backup_failure_check", "Version below 3.2, check not applicable")
@@ -2175,17 +2204,24 @@ def check_backup_failure(tech_file):
 
 def ping(host):
     """Ping a host and return True if successful. Works with both IPv4 and IPv6."""
-    # In 4.1.x local mode the orchestrator pre-fetches each 'ping -c 3 <ip>' result
+    # In 4.1.x local mode the orchestrator pre-fetches each 'ping [-6] -c 3 <ip>' result
     # from the real ND node via SSH.  Use that instead of pinging from localhost.
-    preloaded_key = "ping -c 3 {0}".format(host)
+    # Detect IPv6 address so we can use the -6 flag, which ensures the correct
+    # ping binary/socket family is selected on platforms where 'ping' is IPv4-only.
+    is_ipv6 = ":" in host
+    if is_ipv6:
+        preloaded_key = "ping -6 -c 3 {0}".format(host)
+    else:
+        preloaded_key = "ping -c 3 {0}".format(host)
     if preloaded_key in PRELOADED_COMMANDS:
         output = PRELOADED_COMMANDS[preloaded_key]
         return "0% packet loss" in output or "0.0% packet loss" in output
 
     try:
-        # On Nexus Dashboard, the regular 'ping' command handles both IPv4 and IPv6
-        # No need for separate ping6 command
-        cmd = "ping -c 3 {0}".format(host)
+        if is_ipv6:
+            cmd = "ping -6 -c 3 {0}".format(host)
+        else:
+            cmd = "ping -c 3 {0}".format(host)
         
         if sys.version_info[0] < 3:
             # Python 2.7 approach
@@ -2804,12 +2840,12 @@ def check_ping_reachability():
             mgmt_ip = parts[5].strip()
         
         # Add valid IPs to the list (remove subnet masks if present)
-        if data_ip and data_ip != "::/0" and not data_ip.startswith('-'):
+        if data_ip and data_ip not in ("::/0", "0.0.0.0/0", "0.0.0.0") and not data_ip.startswith('-'):
             if '/' in data_ip:
                 data_ip = data_ip.split('/')[0]
             node_ips.append((node_name, data_ip, "data"))
             
-        if mgmt_ip and mgmt_ip != "::/0" and not mgmt_ip.startswith('-'):
+        if mgmt_ip and mgmt_ip not in ("::/0", "0.0.0.0/0", "0.0.0.0") and not mgmt_ip.startswith('-'):
             if '/' in mgmt_ip:
                 mgmt_ip = mgmt_ip.split('/')[0]
             node_ips.append((node_name, mgmt_ip, "mgmt"))
@@ -2851,6 +2887,13 @@ def check_CA_CSCwm35992(tech_file):
     """OPTIMIZED: CA certificate bug check using file cache and streaming processing"""
     print_section("Checking CA Certificate Bug (CSCwm35992) - Optimized on {0}".format(NODE_NAME))
     update_status("running", "Optimized CA certificate bug check", 95)
+    
+    # Version check - not applicable on 4.1.x and later
+    ctx = get_validation_context()
+    if ctx.nd_version and ctx.is_version_applicable(4, 1):
+        print("[PASS] ND version {0} >= 4.1 - CA Certificate Bug check not applicable".format(ctx.nd_version))
+        CheckResult.set_pass("certificate_check", "Version 4.1.x or later, check not applicable")
+        return True
     
     search_string = "a valid config key must consist of alphanumeric characters"
     matches = []
@@ -2984,6 +3027,13 @@ def check_ISOs_CSCwn94394(tech_file):
     """OPTIMIZED: Multiple ISOs bug check using file cache and unified commands"""
     print_section("Checking Multiple ISOs (CSCwn94394) - Optimized on {0}".format(NODE_NAME))
     update_status("running", "Optimized multiple ISOs check", 95)
+    
+    # Version check - not applicable on 4.1.x and later
+    ctx = get_validation_context()
+    if ctx.nd_version and ctx.is_version_applicable(4, 1):
+        print("[PASS] ND version {0} >= 4.1 - Multiple ISOs check not applicable".format(ctx.nd_version))
+        CheckResult.set_pass("iso_check", "Version 4.1.x or later, check not applicable")
+        return True
     
     search_string = "invalid number of ISO"
     files_examined = False
@@ -3261,6 +3311,177 @@ def get_cluster_node_count():
         print("[WARNING] Error counting cluster nodes: {0}".format(str(e)))
         return None
 
+
+def _is_valid_ip_address(ip_str):
+    """Return True if ip_str is a valid IPv4 or IPv6 address (supports Python 2 and 3)."""
+    if not ip_str:
+        return False
+    # Prefer ipaddress module (Python 3.3+ / backport) for rigorous validation
+    try:
+        import ipaddress
+        try:
+            ipaddress.ip_address(ip_str)
+            return True
+        except ValueError:
+            return False
+    except ImportError:
+        pass
+    # Python 2 fallback — heuristic validation
+    # Strip CIDR suffix if present (defensive; callers should strip before calling)
+    addr = ip_str.split("/")[0] if "/" in ip_str else ip_str
+    # IPv4: four dot-separated decimal octets, no colons
+    if "." in addr and ":" not in addr:
+        parts = addr.split(".")
+        if len(parts) == 4:
+            try:
+                return all(0 <= int(p) <= 255 for p in parts)
+            except ValueError:
+                return False
+    # IPv6: must contain at least two colons (e.g. 2605:7b40:6e:101::14)
+    if ":" in addr:
+        return addr.count(":") >= 2
+    return False
+
+
+def _check_persistent_ip_from_acs_system_config(cache, ctx, node_count, required_ip_count):
+    """
+    Parse acs_system_config to extract externalIpConfigs for ND >= 4.1.
+
+    The acs_system_config file contains an externalIpConfigs section like:
+        externalIpConfigs:
+        - targetNetwork: Data
+          externalIPs:
+          - 172.16.1.11
+          - 172.16.1.12
+
+    This function counts the externalIPs under targetNetwork: Data and validates
+    that the count meets the required minimum for the cluster size.
+    """
+    print("[INFO] ND version >= 4.1 - checking persistent IPs from acs_system_config")
+
+    config_files = cache.find_files("acs-checks/acs_system_config")
+    if not config_files:
+        print("[WARNING] acs_system_config file not found in tech support")
+        return CheckResult.set_warning(
+            "persistent_ip_check",
+            "Could not locate acs_system_config file in tech support for persistent IP check",
+            explanation="Unable to determine persistent IP configuration - acs_system_config file not found.",
+            recommendation="Verify that at least {0} persistent IP addresses are properly configured before proceeding with upgrade.".format(required_ip_count),
+            reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                     "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
+        )
+
+    config_file = config_files[0]
+    print("Found acs_system_config: {0}".format(config_file))
+
+    try:
+        with open(config_file, 'r') as f:
+            lines = f.readlines()
+
+        # Parse externalIpConfigs section for Data network IPs
+        data_external_ips = []
+        in_external_ip_configs = False
+        in_data_block = False
+        in_external_ips_list = False
+
+        for line in lines:
+            stripped = line.strip()
+
+            # Detect the start of externalIpConfigs section
+            if stripped == "externalIpConfigs:":
+                in_external_ip_configs = True
+                continue
+
+            if not in_external_ip_configs:
+                continue
+
+            # Detect end of externalIpConfigs section (top-level key at indent 0)
+            if line[0:1] not in (' ', '-', '') and ':' in stripped and not stripped.startswith('-'):
+                break
+
+            # Detect a new block item (- targetNetwork: ...)
+            if stripped.startswith("- targetNetwork:"):
+                target = stripped.split(":", 1)[1].strip()
+                in_data_block = (target == "Data")
+                in_external_ips_list = False
+                continue
+
+            if not in_data_block:
+                continue
+
+            # Detect externalIPs list start
+            if stripped == "externalIPs:":
+                in_external_ips_list = True
+                continue
+
+            # Collect IP addresses from the list
+            if in_external_ips_list:
+                if stripped.startswith("- "):
+                    ip_address = stripped[2:].strip()
+                    # Accept both IPv4 and IPv6 addresses
+                    if _is_valid_ip_address(ip_address):
+                        data_external_ips.append(ip_address)
+                        print("  Found data-external-services IP: {0}".format(ip_address))
+                    else:
+                        print("  Skipping invalid IP entry: {0}".format(ip_address))
+                else:
+                    # End of externalIPs list
+                    in_external_ips_list = False
+
+        ip_count = len(data_external_ips)
+
+        if ip_count == 0:
+            print("[FAIL] Found 0 persistent IP addresses in acs_system_config externalIpConfigs (Data)")
+            return CheckResult.set_fail(
+                "persistent_ip_check",
+                "Found 0 persistent IP addresses in acs_system_config Data network configuration (required: {0})".format(required_ip_count),
+                explanation="The acs_system_config externalIpConfigs has ZERO Persistent IP addresses for Data network.\n  "
+                           "This will likely result in upgrade failure as persistent IPs are required for data services.\n  "
+                           "Required: {0} persistent IPs for a {1}-node cluster.".format(required_ip_count, node_count if node_count else "unknown"),
+                recommendation="1. Configure at least {0} persistent IP addresses for the Data network before attempting upgrade.\n  "
+                              "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
+                              "3. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
+                              "4. If the check is still a FAIL, contact Cisco TAC for assistance.".format(required_ip_count),
+                reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                         "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
+            )
+        elif ip_count < required_ip_count:
+            print("[FAIL] Found {0} persistent IP addresses in acs_system_config (less than required {1})".format(ip_count, required_ip_count))
+            return CheckResult.set_fail(
+                "persistent_ip_check",
+                ["Found {0} persistent IP addresses in acs_system_config Data network (required: {1} for {2}-node cluster)".format(
+                    ip_count, required_ip_count, node_count if node_count else "unknown"),
+                 "Data network IPs: {0}".format(", ".join(data_external_ips))],
+                explanation="The acs_system_config is configured with {0} Persistent IP addresses for Data network,\n  "
+                           "which is less than the required minimum of {1} for a {2}-node cluster.\n  "
+                           "This will likely result in upgrade failure.".format(ip_count, required_ip_count, node_count if node_count else "unknown"),
+                recommendation="1. Configure at least {0} persistent IP addresses for the Data network before attempting upgrade.\n  "
+                              "2. Consult the Nexus Dashboard deployment guide for proper persistent IP configuration.\n  "
+                              "3. Re-run the Pre-upgrade script to confirm the check is now a PASS.\n  "
+                              "4. If the check is still a FAIL, contact Cisco TAC for assistance.".format(required_ip_count),
+                reference="https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/"
+                         "cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc"
+            )
+        else:
+            print("[PASS] Found {0} persistent IP addresses (meets minimum requirement of {1} for {2}-node cluster)".format(
+                ip_count, required_ip_count, node_count if node_count else "unknown"))
+            return CheckResult.set_pass(
+                "persistent_ip_check",
+                "Found {0} persistent IP addresses in acs_system_config (required: {1} for {2}-node cluster)".format(
+                    ip_count, required_ip_count, node_count if node_count else "unknown")
+            )
+
+    except Exception as e:
+        print("[ERROR] Failed to parse acs_system_config for persistent IPs: {0}".format(str(e)))
+        return CheckResult.set_fail(
+            "persistent_ip_check",
+            ["Failed to parse acs_system_config for persistent IP config: {0}".format(str(e))],
+            explanation="Could not determine persistent IP configuration due to parsing error",
+            recommendation="1. Verify that at least {0} persistent IP addresses are configured before attempting upgrade.\n  "
+                          "2. Contact Cisco TAC for assistance if required.".format(required_ip_count)
+        )
+
+
 @robust_check("persistent_ip_check")
 def check_persistent_ip_config(tech_file):
     """
@@ -3313,6 +3534,25 @@ def check_persistent_ip_config(tech_file):
             print("[WARNING] Could not determine cluster size - defaulting to {0} persistent IP requirement".format(required_ip_count))
         else:
             print("[INFO] {0}-node cluster detected - requiring {1} persistent IPs".format(node_count, required_ip_count))
+    
+    # For ND >= 4.1, check persistent IPs from acs_system_config instead of externalipconfigs.yaml.
+    # When version detection fails (acs_version file missing from tech support), also fall back
+    # to acs_system_config if the file exists and contains an externalIpConfigs section —
+    # on ND 4.1+, k8-externalipconfigs.yaml data-external-services has empty IPs while the
+    # actual persistent IP config lives in acs_system_config.
+    _use_acs_config = ctx.is_version_applicable(4, 1)
+    if not _use_acs_config:
+        _acs_probe = cache.find_files("acs-checks/acs_system_config")
+        if _acs_probe:
+            try:
+                with open(_acs_probe[0], 'r') as _f:
+                    if "externalIpConfigs:" in _f.read():
+                        print("[INFO] Found externalIpConfigs in acs_system_config — using acs_system_config path")
+                        _use_acs_config = True
+            except Exception:
+                pass
+    if _use_acs_config:
+        return _check_persistent_ip_from_acs_system_config(cache, ctx, node_count, required_ip_count)
     
     # Try both possible external IP config file paths
     config_files = []
@@ -3437,12 +3677,10 @@ def check_persistent_ip_config(tech_file):
                 
                 # Process external IP addresses
                 if in_external_ip_section:
-                    if line_stripped.startswith("- ") and "." in line_stripped:
-                        # Extract IP address
+                    if line_stripped.startswith("- ") and ("." in line_stripped or ":" in line_stripped):
+                        # Extract IP address (supports both IPv4 and IPv6)
                         ip_address = line_stripped[2:].strip()
-                        # Basic IP validation
-                        ip_parts = ip_address.split(".")
-                        if len(ip_parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in ip_parts):
+                        if _is_valid_ip_address(ip_address):
                             current_config["externalIPs"].append(ip_address)
                             all_external_ips.append(ip_address)
                             # Only count IPs from data-external-services for the requirement check
