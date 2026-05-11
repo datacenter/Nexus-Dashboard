@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.23 (May 1, 2026)
+Version: 1.0.24 (May 11, 2026)
 """
 
 import re
@@ -3693,7 +3693,7 @@ def _collect_local_worker_results(node_name, staging_dir, results_dir):
         return None
 
 
-def _run_api_checks(node_manager, version, password):
+def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_username=None, api_password=None):
     """
     Run the cluster-level API checks (telemetry_inband_epg and nxapi_cert_verify_state)
     and return the (api_check_result, api_check_results) tuple.
@@ -3726,9 +3726,29 @@ def _run_api_checks(node_manager, version, password):
         )
         return api_check_result, api_check_results
 
+    _api_user = api_username or "admin"
+    _api_pass = api_password or password
     try:
-        api_client = NDAPIClient(node_manager.nd_ip, "admin", password)
+        api_client = NDAPIClient(node_manager.nd_ip, _api_user, _api_pass, domain=domain)
         auth_success, error_type, error_message = api_client.authenticate()
+
+        # On AUTH_FAILURE with the default domain, prompt the user to enter a custom
+        # login domain and retry once.  Also collects API username/password since a
+        # non-default domain may require different credentials from rescue-user.
+        if not auth_success and error_type == 'AUTH_FAILURE' and domain == "DefaultAuth":
+            if sys.stdin.isatty():
+                print(f"\n{WARNING} Authentication failed using domain 'DefaultAuth'.")
+                print("  Your ND may be configured with a non-default login domain (e.g. LDAP, TACACS+).")
+                print("  Contact your ND administrator for the configured login domain name.")
+                print("  Tip: Re-run with --domain/--api-username/--api-password flags to skip these prompts next time.")
+                retry_domain = input("  Enter login domain (or press Enter to skip): ").strip()
+                if retry_domain:
+                    _u = input(f"  Enter API username for domain '{retry_domain}' [admin]: ").strip()
+                    _api_user = _u if _u else "admin"
+                    _p = getpass.getpass(f"  Enter API password for '{_api_user}@{retry_domain}' (press Enter to use rescue-user password): ")
+                    _api_pass = _p if _p else password
+                    api_client = NDAPIClient(node_manager.nd_ip, _api_user, _api_pass, domain=retry_domain)
+                    auth_success, error_type, error_message = api_client.authenticate()
 
         if not auth_success:
             logger.error(f"[API] Authentication failed: {error_type} - {error_message}")
@@ -3843,7 +3863,7 @@ def _run_api_checks(node_manager, version, password):
     return api_check_result, api_check_results
 
 
-def process_all_nodes_local(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None):
+def process_all_nodes_local(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None, domain="DefaultAuth", api_username=None, api_password=None):
     """
     4.1.x execution path: download tech supports locally, run worker_functions.py
     on the local machine.
@@ -4212,7 +4232,7 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
     # ---------------------------------------------------------------
     print_section("Running API Checks")
     print("Running cluster-level API checks...")
-    api_check_result, api_check_results = _run_api_checks(node_manager, version, password)
+    api_check_result, api_check_results = _run_api_checks(node_manager, version, password, domain=domain, api_username=api_username, api_password=api_password)
 
     if api_check_result["status"] != "NOTRUN":
         if api_check_results:
@@ -4282,14 +4302,14 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
     return all_results
 
 
-def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None, use_local_mode=False):
+def process_all_nodes(node_manager, tech_choice, version=None, password=None, debug_mode=False, skipped_nodes_info=None, storage_check_result=None, use_local_mode=False, domain="DefaultAuth", api_username=None, api_password=None):
     """Process all nodes with validation script using optimal resource-based concurrency.
 
     For ND 4.1.x, delegates to process_all_nodes_local() which downloads tech supports
     to the local machine before running worker_functions.py locally.
     """
     if use_local_mode:
-        return process_all_nodes_local(node_manager, tech_choice, version, password, debug_mode, skipped_nodes_info, storage_check_result)
+        return process_all_nodes_local(node_manager, tech_choice, version, password, debug_mode, skipped_nodes_info, storage_check_result, domain=domain, api_username=api_username, api_password=api_password)
 
     # Record process start time
     process_start_time = time.time()
@@ -4560,10 +4580,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
     # Helper function to run API check
     def run_api_check():
         try:
-            # Use the same password as rescue-user (admin and rescue-user share the same password)
-            admin_password = password
-            
-            if not admin_password:
+            if not effective_api_password:
                 logger.warning("No password provided for API check")
                 result = APICheckResult.set_warning(
                     "telemetry_inband_epg",
@@ -4585,7 +4602,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             
             # Create API client and authenticate
             logger.info(f"[API] Initializing ND API client for checks")
-            api_client = NDAPIClient(node_manager.nd_ip, "admin", admin_password)
+            api_client = NDAPIClient(node_manager.nd_ip, effective_api_username, effective_api_password, domain=effective_domain)
             
             # Authenticate and get detailed error information
             auth_success, error_type, error_message = api_client.authenticate()
@@ -4597,7 +4614,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 if error_type == 'AUTH_FAILURE':
                     conn_details = f"Authentication failed: {error_message}"
                     conn_explanation = "Invalid credentials or authentication rejected by ND API"
-                    conn_recommendation = f"Verify the admin username and password are correct.\n\n{MANUAL_VERIFICATION_STEPS}"
+                    conn_recommendation = f"Verify the admin username and password are correct. If your ND uses a non-default login domain, re-run the script with --domain <name> (e.g. --domain LDAP).\n\n{MANUAL_VERIFICATION_STEPS}"
                 elif error_type == 'CONNECTION_FAILURE':
                     conn_details = f"Cannot connect to {node_manager.nd_ip}:443 - {error_message}"
                     conn_explanation = "Cannot establish connection to ND management interface (port 443 unreachable)"
@@ -4731,6 +4748,29 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             )
             api_check_result.update(result)
     
+    # Resolve the login domain interactively in the main thread, before any
+    # worker-node output begins, so the prompt is never interleaved with
+    # parallel processing output.  A lightweight probe auth is attempted only
+    # when the default domain is being used and a TTY is present.
+    effective_domain = domain
+    effective_api_username = api_username or "admin"
+    effective_api_password = api_password or password
+    if password and version and sys.stdin.isatty() and effective_domain == "DefaultAuth":
+        _probe = NDAPIClient(node_manager.nd_ip, "admin", password, domain="DefaultAuth")
+        _ok, _etype, _ = _probe.authenticate()
+        if not _ok and _etype == 'AUTH_FAILURE':
+            print(f"\n{WARNING} Authentication failed using domain 'DefaultAuth'.")
+            print("  Your ND may be configured with a non-default login domain (e.g. LDAP, TACACS+).")
+            print("  Contact your ND administrator for the configured login domain name.")
+            print("  Tip: Re-run with --domain/--api-username/--api-password flags to skip these prompts next time.")
+            _retry_domain = input("  Enter login domain (or press Enter to skip): ").strip()
+            if _retry_domain:
+                effective_domain = _retry_domain
+                _u = input(f"  Enter API username for domain '{_retry_domain}' [admin]: ").strip()
+                effective_api_username = _u if _u else "admin"
+                _p = getpass.getpass(f"  Enter API password for '{effective_api_username}@{_retry_domain}' (press Enter to use rescue-user password): ")
+                effective_api_password = _p if _p else password
+
     # Start API check thread
     api_check_thread = threading.Thread(target=run_api_check, daemon=True)
     api_check_thread.start()
@@ -5072,7 +5112,7 @@ class NDAPIClient:
     Security: Password is stored as private attribute and never logged or printed.
     """
     
-    def __init__(self, nd_ip, username, password):
+    def __init__(self, nd_ip, username, password, domain="DefaultAuth"):
         """
         Initialize API client with connection parameters.
         
@@ -5080,10 +5120,12 @@ class NDAPIClient:
             nd_ip: Nexus Dashboard management IP address
             username: Username for API authentication (typically 'admin')
             password: Password for API authentication (stored securely, never logged)
+            domain: Login domain for ND API authentication (default: 'DefaultAuth')
         """
         self.nd_ip = nd_ip
         self.username = username
         self._password = password  # Private - never log or print
+        self.domain = domain
         self._token = None  # Bearer token obtained after authentication
         self.logger = logging.getLogger(__name__)
         
@@ -5137,11 +5179,11 @@ class NDAPIClient:
         login_data = json.dumps({
             "userName": self.username,
             "userPasswd": self._password,  # Never log this
-            "domain": "DefaultAuth"
+            "domain": self.domain
         })
         
         # Log authentication attempt without password
-        self.logger.info(f"[API] Authenticating to ND API at {login_url} as {self.username}")
+        self.logger.info(f"[API] Authenticating to ND API at {login_url} as {self.username} (domain: {self.domain})")
         
         try:
             data_bytes = login_data.encode('utf-8') if self.python3 else login_data
@@ -5165,8 +5207,18 @@ class NDAPIClient:
             return True, None, None
             
         except self.urllib_error.HTTPError as e:
-            # HTTP errors indicate the connection succeeded but authentication failed
-            error_msg = f"HTTP {e.code}: {e.reason}"
+            # HTTP errors indicate the connection succeeded but authentication failed.
+            # Read the response body for a more specific error message from ND
+            # (e.g. "Invalid Login Domain" vs "Invalid Username/Password, or Account is locked").
+            detail = ""
+            err_body_raw = ""
+            try:
+                err_body_raw = e.read().decode('utf-8', errors='replace') if self.python3 else e.read()
+                err_json = json.loads(err_body_raw)
+                detail = err_json.get("error", "")
+            except Exception:
+                pass
+            error_msg = f"HTTP {e.code}: {detail}" if detail else f"HTTP {e.code}: {e.reason}"
             if e.code in [401, 403]:
                 self.logger.error(f"[API] Authentication failed (invalid credentials): {error_msg}")
                 return False, 'AUTH_FAILURE', error_msg
@@ -6168,6 +6220,10 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         with tarfile.open(tgz_path, "w:gz") as tar:
             # Add the entire final-results directory
             tar.add(results_dir, arcname="final-results")
+            # Include local tech support staging directory if it exists (4.1.x local mode)
+            local_ts_dir = os.path.join(cwd, "nd-preupgrade-local-ts")
+            if os.path.isdir(local_ts_dir):
+                tar.add(local_ts_dir, arcname="nd-preupgrade-local-ts")
         
         print(f"Results Bundle: {os.path.abspath(tgz_path)}\n")
         logger.info(f"Created results bundle: {tgz_path}")
@@ -6225,6 +6281,9 @@ def main():
     parser.add_argument("--ndip", help="IP address or hostname of the Nexus Dashboard")
     parser.add_argument("-p", "--password", help="Password for rescue-user")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging to console and preserve temp files")
+    parser.add_argument("--domain", default=None, help="Login domain for ND API authentication (default: DefaultAuth). Use if your ND is configured with a non-default login domain (e.g. LDAP, TACACS+).")
+    parser.add_argument("--api-username", default=None, dest="api_username", help="Username for ND API authentication (default: admin). Use with --domain when the API account differs from 'admin'.")
+    parser.add_argument("--api-password", default=None, dest="api_password", help="Password for ND API authentication. Defaults to the rescue-user password if not specified.")
     parser.add_argument("-b", "--bash", action="store_true", help="Run in GitBash/Windows mode (no sshpass)")
     parser.add_argument("--diagnose", action="store_true", help="Run diagnostic tests only (check Python interpreters and worker script execution)")
 
@@ -6253,6 +6312,18 @@ def main():
     password = args.password
     if not password:
         password = getpass.getpass("Enter password for rescue-user: ")
+
+    # Collect API credentials if a non-default domain was explicitly specified.
+    # The API account (e.g. an LDAP/TACACS+ user) may differ from rescue-user.
+    api_username = args.api_username or "admin"
+    api_password = args.api_password or None
+    if args.domain and args.domain != "DefaultAuth":
+        if not args.api_username:
+            _u = input(f"Enter API username for domain '{args.domain}' [admin]: ").strip()
+            api_username = _u if _u else "admin"
+        if not args.api_password:
+            _p = getpass.getpass(f"Enter API password for '{api_username}@{args.domain}' (press Enter to use rescue-user password): ")
+            api_password = _p if _p else None
 
     print()  # Add blank line
 
@@ -6667,7 +6738,7 @@ def main():
 
         # Process all nodes - resource-optimized
         # Save the results to ensure we can access debug_data after the report is generated
-        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info, storage_check_result, use_local_mode)
+        results = process_all_nodes(node_manager, tech_choice, version, password, args.debug, skipped_nodes_info, storage_check_result, use_local_mode, domain=args.domain or "DefaultAuth", api_username=api_username, api_password=api_password)
 
         # Display debug mode warning at the very end, after the report
         if args.debug and results and "_debug_info" in results:
