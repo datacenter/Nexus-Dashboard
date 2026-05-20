@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.24 (May 11, 2026)
+Version: 1.0.25 (May 20, 2026)
 """
 
 import re
@@ -1336,8 +1336,8 @@ class TechSupportManager:
             
             # Get file listing with a SINGLE command that includes all info we need
             # Format: timestamp size path
-            # Only match system-ts and all-ts files (the types this script can process)
-            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
+            # Match system-ts, all-ts, and plain ts files (ND 2.x uses '-ts-' without prefix)
+            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' -o -name '*-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
             
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
@@ -1392,8 +1392,8 @@ class TechSupportManager:
             
             # Get file listing with a SINGLE command that includes all info we need
             # Format: timestamp size path
-            # Only match system-ts and all-ts files (the types this script can process)
-            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
+            # Match system-ts, all-ts, and plain ts files (ND 2.x uses '-ts-' without prefix)
+            cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' -o -name '*-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
             
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
@@ -1579,8 +1579,8 @@ class TechSupportManager:
             # Don't print to console - we'll show status when file is detected
             
             # Record all existing tech support files to detect new ones
-            # Only match system-ts and all-ts files for this node
-            cmd_existing = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-{node['name']}.tgz' -o -name '*-all-ts-{node['name']}.tgz' \\) -type f -printf '%T@ %p\\n'")
+            # Match system-ts, all-ts, and plain ts files for this node (ND 2.x uses '-ts-' without prefix)
+            cmd_existing = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-{node['name']}*' -o -name '*-all-ts-{node['name']}*' -o -name '*-ts-{node['name']}*' \\) -name '*.tgz' -type f -printf '%T@ %p\\n'")
             process = subprocess.Popen(cmd_existing, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
             
@@ -1639,17 +1639,21 @@ class TechSupportManager:
                 
                 # Determine the tech support file pattern based on ND version
                 # Version 4.x and later use "all-ts", earlier versions use "system-ts"
+                # ND 2.x uses plain "-ts-" without system/all prefix
                 techsupport_cmd = self.node_manager.get_techsupport_command()
                 if "collect -s system" in techsupport_cmd:
-                    ts_pattern = f"*-system-ts-{node['name']}.tgz"
+                    ts_pattern = f"*-system-ts-{node['name']}*"
                     ts_type = "system-ts"
                 else:
-                    ts_pattern = f"*-all-ts-{node['name']}.tgz"
+                    ts_pattern = f"*-all-ts-{node['name']}*"
                     ts_type = "all-ts"
                 
+                # Also search for plain '-ts-' pattern (ND 2.x format) and require .tgz extension
+                ts_pattern_plain = f"*-ts-{node['name']}*"
+                
                 # List all tech support files, sorted by timestamp (newest first)
-                cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} -name '{ts_pattern}' -type f -printf '%T@ %s %p\\n' | sort -nr")
-                logger.debug(f"Looking for tech support files with pattern: {ts_pattern}")
+                cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '{ts_pattern}' -o -name '{ts_pattern_plain}' \\) -name '*.tgz' -type f -printf '%T@ %s %p\\n' | sort -nr")
+                logger.debug(f"Looking for tech support files with pattern: {ts_pattern} or {ts_pattern_plain}")
                 process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, stderr = process.communicate()
                 
@@ -1683,9 +1687,18 @@ class TechSupportManager:
                     logger.debug(f"Found potential new tech support: {filename}, size: {size_bytes} bytes")
                     
                     # Extract timestamp from filename - format like 2025-05-04T21-09-06Z-system-ts-nd2.tgz or 2025-05-04T21-09-06Z-all-ts-nd2.tgz
-                    if date_prefix in filename and (f'-{ts_type}-' in filename):
-                        # Extract just the timestamp part before -system-ts- or -all-ts-
-                        ts_part = filename.split(f'-{ts_type}-')[0]
+                    # ND 2.x uses plain '-ts-' format like 2026-05-19T16-39-54Z-ts-NDO2.SJHH-NDO.case.local.tgz
+                    # Determine which ts_type variant is in this filename
+                    if f'-{ts_type}-' in filename:
+                        actual_ts_type = ts_type
+                    elif '-ts-' in filename:
+                        actual_ts_type = 'ts'
+                    else:
+                        actual_ts_type = None
+                    
+                    if date_prefix in filename and actual_ts_type:
+                        # Extract just the timestamp part before the ts type marker
+                        ts_part = filename.split(f'-{actual_ts_type}-')[0]
                         
                         # Handle the Z part if present
                         if 'Z' in ts_part:

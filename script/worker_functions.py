@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.24 (May 11, 2026)
+Version: 1.0.25 (May 20, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -4311,7 +4311,9 @@ def generate_techsupport(nd_version=None):
             print("Output: {0}".format(output.strip()))
             
             # Get the existing tech support files before we started
-            existing_files = set(glob.glob("/techsupport/*{0}.tgz".format(NODE_NAME)))
+            # Match both exact node name and FQDN variants (ND 2.x uses FQDN in filename)
+            existing_files = set(f for f in glob.glob("/techsupport/*-ts-{0}*.tgz".format(NODE_NAME))
+                                 if os.path.basename(f).split('-ts-')[-1].startswith(NODE_NAME))
             
             # Get current timestamp to match with new tech support file
             current_time = datetime.datetime.now()
@@ -4333,7 +4335,8 @@ def generate_techsupport(nd_version=None):
                     update_status("running", "Waiting for tech support generation", progress)
                 
                 # Check for new tech support files
-                current_files = set(glob.glob("/techsupport/*{0}.tgz".format(NODE_NAME)))
+                current_files = set(f for f in glob.glob("/techsupport/*-ts-{0}*.tgz".format(NODE_NAME))
+                                    if os.path.basename(f).split('-ts-')[-1].startswith(NODE_NAME))
                 new_files = current_files - existing_files
                 
                 # Look for a file with today's timestamp that's growing in size
@@ -4364,7 +4367,8 @@ def generate_techsupport(nd_version=None):
                 print("[WARNING] No new tech support file found after waiting")
                 update_status("warning", "No new tech support found", 70)
                 # Try to find any tech support file for this node
-                candidates = glob.glob("/techsupport/*{0}.tgz".format(NODE_NAME))
+                candidates = [f for f in glob.glob("/techsupport/*-ts-{0}*.tgz".format(NODE_NAME))
+                              if os.path.basename(f).split('-ts-')[-1].startswith(NODE_NAME)]
                 if candidates:
                     # Sort by modification time, newest first
                     candidates.sort(key=lambda x: os.path.getmtime(x), reverse=True)
@@ -4405,7 +4409,9 @@ def select_techsupport(specific_file=None):
         return specific_file
     
     # Otherwise, get all tech support files for this node
-    tech_files = glob.glob("/techsupport/*{0}.tgz".format(NODE_NAME))
+    # Match both exact node name and FQDN variants (e.g., NDO2.tgz and NDO2.domain.tgz)
+    tech_files = [f for f in glob.glob("/techsupport/*-ts-{0}*.tgz".format(NODE_NAME))
+                  if os.path.basename(f).split('-ts-')[-1].startswith(NODE_NAME)]
     
     if not tech_files:
         print("[FAIL] No tech support files found for {0}".format(NODE_NAME))
