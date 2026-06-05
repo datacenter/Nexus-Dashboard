@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.25 (May 20, 2026)
+Version: 1.0.26 (June 5, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -2291,27 +2291,53 @@ def check_nameserver_duplicates(tech_file):
     # Use the first found config file
     config_file = config_files[0]
     print("Parsing acs_system_config: {0}".format(os.path.basename(config_file)))
-    
+
     try:
-        # Read and parse the YAML file
+        # Read the config file
         with open(config_file, 'r') as f:
             content = f.read()
-        
-        # Parse YAML to get nameServers list
-        import yaml
-        config_data = yaml.safe_load(content)
-        
-        if not config_data or 'nameServers' not in config_data:
+
+        # Parse the nameServers list.
+        # Prefer PyYAML when available; fall back to a simple line scanner for
+        # environments where the script runs locally (4.1.x mode) and PyYAML is
+        # not installed on the admin machine.
+        # The fallback is safe because acs_system_config is a flat, fixed-format
+        # file — the nameServers block is a plain YAML sequence with no nesting,
+        # anchors, or multi-line scalars, so a line scanner is fully correct.
+        if yaml is not None:
+            config_data = yaml.safe_load(content)
+            nameservers = config_data.get('nameServers') if config_data else None
+        else:
+            print("[INFO] PyYAML not available; using built-in line scanner for acs_system_config")
+            nameservers = []
+            in_nameservers = False
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped == 'nameServers:':
+                    in_nameservers = True
+                    continue
+                if in_nameservers:
+                    # A YAML list item under nameServers starts with '- '
+                    if stripped.startswith('- '):
+                        value = stripped[2:].strip()
+                        if value:
+                            nameservers.append(value)
+                    elif stripped and not stripped.startswith('#'):
+                        # Any non-empty, non-comment line that is not a list item
+                        # signals the start of the next top-level key
+                        break
+            if not nameservers:
+                nameservers = None
+
+        if not nameservers:
             print("[WARNING] No nameServers section found in acs_system_config")
             results["checks"]["nameserver_duplicate_check"]["status"] = "WARNING"
             results["checks"]["nameserver_duplicate_check"]["details"] = [
                 "No nameServers configuration found in acs_system_config"
             ]
             return False
-        
-        nameservers = config_data['nameServers']
-        
-        if not nameservers or not isinstance(nameservers, list):
+
+        if not isinstance(nameservers, list):
             print("[WARNING] nameServers is empty or not a list")
             results["checks"]["nameserver_duplicate_check"]["status"] = "WARNING"
             results["checks"]["nameserver_duplicate_check"]["details"] = [
