@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.26 (June 5, 2026)
+Version: 1.0.27 (July 28, 2026)
 """
 
 import re
@@ -5647,6 +5647,55 @@ def check_nxapi_cert_verify_state(api_client, version):
 RESERVED_TENANT_PREFIXES = ("default", "all", "none", "null", "mgmt")
 
 
+def _summarize_orchestration_clusters(data):
+    """
+    Return aggregate ND 4.1 Orchestration state from /api/v1/infra/clusters.
+
+    A structurally valid cluster list is authoritative for this check:
+    Orchestration applies when at least one APIC cluster reports
+    spec.aci.orchestration.status=enabled.  The summary intentionally excludes
+    cluster names and other customer-specific data.
+
+    Returns:
+        dict: Aggregate counts for a valid response.
+        None: The response shape is not sufficient to determine applicability.
+    """
+    if isinstance(data, list):
+        clusters = data
+    elif isinstance(data, dict) and isinstance(data.get("clusters"), list):
+        clusters = data["clusters"]
+    else:
+        return None
+
+    apic_count = 0
+    enabled_count = 0
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            return None
+
+        spec = cluster.get("spec")
+        if not isinstance(spec, dict):
+            return None
+
+        aci = spec.get("aci")
+        if aci is None:
+            continue
+        if not isinstance(aci, dict):
+            return None
+
+        apic_count += 1
+        orchestration = aci.get("orchestration")
+        status = orchestration.get("status") if isinstance(orchestration, dict) else None
+        if isinstance(status, str) and status.strip().lower() == "enabled":
+            enabled_count += 1
+
+    return {
+        "cluster_count": len(clusters),
+        "apic_cluster_count": apic_count,
+        "orchestration_enabled_count": enabled_count
+    }
+
+
 def check_reserved_tenant_names(api_client, version):
     """
     API-based check for tenant names that start with reserved keyword prefixes (CSCwt87466).
@@ -5700,29 +5749,104 @@ def check_reserved_tenant_names(api_client, version):
                 recommendation="Verify admin credentials and API accessibility."
             )
 
-        # Fetch tenants from MSO API
+        # In unified ND 4.1, Orchestration is an ACI-only feature and the Infra
+        # cluster API is authoritative for its per-fabric enabled state.  Do not
+        # apply this shortcut to ND 3.2, whose legacy NDO service could manage
+        # NDFC fabrics independently of this ACI-specific response.
+        orchestration_summary = None
+        if major == 4 and minor == 1:
+            try:
+                logger.info("[API] Determining Orchestration applicability from /api/v1/infra/clusters")
+                infra_data = api_client.get("/api/v1/infra/clusters", suppress_error_log=True)
+                orchestration_summary = _summarize_orchestration_clusters(infra_data)
+            except Exception as infra_err:
+                logger.info(
+                    "[API] Could not determine Orchestration applicability from the Infra API "
+                    f"({str(infra_err)}); falling back to the tenant API"
+                )
+        else:
+            logger.info(
+                "[API] ND 3.2 uses the tenant API directly because the ND 4.1 "
+                "ACI Orchestration feature-state shortcut is not applicable"
+            )
+
+        if major == 4 and minor == 1:
+            if orchestration_summary is None:
+                logger.warning(
+                    "[API] Infra API response did not establish Orchestration applicability; "
+                    "falling back to the tenant API"
+                )
+            elif orchestration_summary["orchestration_enabled_count"] == 0:
+                cluster_count = orchestration_summary["cluster_count"]
+                apic_count = orchestration_summary["apic_cluster_count"]
+                logger.info(
+                    "[API] No APIC fabric has Orchestration enabled "
+                    f"({apic_count} APIC, {cluster_count} total) - check not applicable"
+                )
+                return APICheckResult.set_pass(
+                    check_name,
+                    "No APIC fabric has Orchestration enabled "
+                    f"({apic_count} APIC fabric(s), {cluster_count} total cluster(s) reported) "
+                    "- reserved tenant name check not applicable"
+                )
+            else:
+                logger.info(
+                    "[API] Infra API reported "
+                    f"{orchestration_summary['orchestration_enabled_count']} APIC fabric(s) "
+                    "with Orchestration enabled"
+                )
+
+        # Fetch tenants only when Orchestration is enabled, the ND 4.1 Infra API
+        # could not establish applicability, or this is an ND 3.2 deployment.
+        # HTTP errors alone never imply that Orchestration is disabled.
         logger.info("[API] Fetching tenants from /mso/api/v1/tenants")
         try:
             data = api_client.get("/mso/api/v1/tenants", suppress_error_log=True)
         except Exception as fetch_err:
-            # A 404 means the MSO/Orchestration feature is not enabled on this cluster,
-            # so there are no tenants that could hit the reserved-prefix uplift issue.
             err_code = getattr(fetch_err, 'code', None)
-            if err_code == 404:
-                logger.info("[API] MSO tenant API returned 404 - Orchestration not enabled, no tenants to check")
-                return APICheckResult.set_pass(
-                    check_name,
-                    "Orchestration feature is not enabled on this cluster (HTTP 404) - no tenants to check"
+            if err_code is not None:
+                failure = f"HTTP {err_code}"
+            else:
+                failure = str(fetch_err)
+            logger.warning(f"[API] Could not query the MSO tenant API: {failure}")
+            return APICheckResult.set_warning(
+                check_name,
+                f"Could not retrieve Orchestration tenants ({failure})",
+                explanation=(
+                    "The Infra API did not report Orchestration as disabled, and an "
+                    "HTTP error from the tenant endpoint does not establish feature state."
+                ),
+                recommendation=(
+                    "Verify Orchestration service health and API accessibility, then "
+                    "check tenant names manually before upgrade."
                 )
-            raise  # Re-raise any other error to the outer handler
+            )
 
-        tenants = data.get("tenants", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict) or not isinstance(data.get("tenants"), list):
+            logger.warning("[API] Tenant API returned an unexpected response format")
+            return APICheckResult.set_warning(
+                check_name,
+                "Unexpected tenant API response format (expected a JSON object containing a tenants list)",
+                explanation="Could not safely determine the configured Orchestration tenant names.",
+                recommendation="Verify the Orchestration API response and check tenant names manually before upgrade."
+            )
+
+        tenants = data["tenants"]
         logger.info(f"[API] Retrieved {len(tenants)} tenant(s)")
 
         # Check each tenant name against reserved prefixes
         flagged = []
         for tenant in tenants:
-            name = tenant.get("name", "")
+            if not isinstance(tenant, dict) or not isinstance(tenant.get("name"), str):
+                logger.warning("[API] Tenant API returned an invalid tenant object")
+                return APICheckResult.set_warning(
+                    check_name,
+                    "Tenant API returned an invalid tenant object",
+                    explanation="Could not safely determine every configured Orchestration tenant name.",
+                    recommendation="Verify the Orchestration API response and check tenant names manually before upgrade."
+                )
+
+            name = tenant["name"]
             name_lower = name.lower()
             for prefix in RESERVED_TENANT_PREFIXES:
                 if name_lower.startswith(prefix):

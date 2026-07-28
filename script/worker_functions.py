@@ -1410,7 +1410,7 @@ def check_disk_space(tech_file):
                     try:
                         use_percent_int = int(use_percent)
                         
-                        if use_percent_int >= 70:
+                        if use_percent_int >= 80:
                             print("[FAIL] {0} is {1}% full".format(mount_point, use_percent))
                             high_usage_dirs.append("{0} is {1}% full".format(mount_point, use_percent))
                     except ValueError:
@@ -1462,7 +1462,7 @@ def check_disk_space(tech_file):
                 if mount_point.startswith('/data/services/oci_repo/boot-disk'):
                     continue
                 try:
-                    if int(use_percent) >= 70:
+                    if int(use_percent) >= 80:
                         print("[FAIL] {0} is {1}% full".format(mount_point, use_percent))
                         high_usage_dirs.append("{0} is {1}% full".format(mount_point, use_percent))
                     else:
@@ -1482,15 +1482,15 @@ def check_disk_space(tech_file):
             results["checks"]["disk_space"]["recommendation"] = "Contact Cisco TAC for assistance to reduce disk space utilization before proceeding\n  with the upgrade."
         
         elif under_threshold_count > 0:
-            print("[PASS] All directories under 70% usage")
-            results["checks"]["disk_space"]["details"] = ["All directories are under 70% usage"]
+            print("[PASS] All directories under 80% usage")
+            results["checks"]["disk_space"]["details"] = ["All directories are under 80% usage"]
         else:
             print("[WARNING] No filesystem usage data could be parsed")
             results["checks"]["disk_space"]["status"] = "WARNING"
             results["checks"]["disk_space"]["details"].append("No filesystem usage data could be parsed")
     else:
-        print("[PASS] All directories under 70% usage (source: {0})".format(file_path_used))
-        results["checks"]["disk_space"]["details"] = ["All directories are under 70% usage"]
+        print("[PASS] All directories under 80% usage (source: {0})".format(file_path_used))
+        results["checks"]["disk_space"]["details"] = ["All directories are under 80% usage"]
 
 @robust_check("pod_status")
 def check_pods(tech_file=None):
