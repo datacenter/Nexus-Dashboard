@@ -9,6 +9,11 @@ The script can be run from any Linux server with the required dependencies. If A
 - Port 443 connectivity is required between the host running the script and the Nexus Dashboard cluster for API related checks to run successfully. If Port 443 is not open, the API related checks will not work, but all other checks will complete successfully.
 - If you have feedback or are encountering an issue running the script, please send an email to nd-preupgrade-validation@cisco.com
 
+**Ports required to be open between the local host and the ND cluster:**
+- Port 22: Used for SSH and SCP operations
+- Port 443: Used for API-based checks
+
+
 <video src="https://github.com/user-attachments/assets/0bcbc1f0-98c0-4e8f-8cfe-20265f52779e" controls></video>
 Note: The cloning instructions differ slightly from the video now that the repo has moved. 
 - The clone command required is `git clone https://github.com/datacenter/Nexus-Dashboard.git`
