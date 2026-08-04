@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.26 (June 5, 2026)
+Version: 1.0.28 (August 4, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -25,6 +25,13 @@ import logging
 import traceback
 import signal
 import atexit
+import shutil
+
+try:
+    from shlex import quote as shell_quote
+except ImportError:
+    # Python 2 compatibility
+    from pipes import quote as shell_quote
 
 # Handle Python 2/3 differences for ipaddress module
 try:
@@ -667,14 +674,8 @@ def cleanup_processes():
         except Exception as e:
             print("Error finding child processes: {0}".format(e))
         
-        # Also try to kill any remaining extraction processes (tar, gzip)
-        # This is more aggressive but may be necessary
-        try:
-            # Use os.popen().close() to ensure proper waiting
-            os.popen("pkill -9 -f 'tar -x[z]f' || true").close()
-            os.popen("pkill -9 -f gzip || true").close()
-        except:
-            pass
+        # Never use a system-wide pkill here. Parallel node workers may be
+        # extracting at the same time; cleanup must remain scoped to child PIDs.
             
     except Exception as e:
         print("Error during process cleanup: {0}".format(e))
@@ -819,13 +820,13 @@ def extract_from_techsupport(tech_file, file_pattern, destination=None):
         # Python 2/3 compatible directory creation
         if not os.path.exists(destination):
             os.makedirs(destination)
-        dest_arg = "-C {0}".format(destination)
+        dest_arg = "-C {0}".format(shell_quote(destination))
     else:
         dest_arg = ""
     
     # Use unified command runner for consistent behavior
-    extract_cmd = "tar -xzf {0} {1} --wildcards '{2}' 2>/dev/null || tar -xf {0} {1} --wildcards '{2}'".format(
-        tech_file, dest_arg, file_pattern)
+    extract_cmd = "tar -xzf {0} {1} --wildcards {2} 2>/dev/null || tar -xf {0} {1} --wildcards {2}".format(
+        shell_quote(tech_file), dest_arg, shell_quote(file_pattern))
     
     try:
         stdout, stderr, returncode = run_command_unified(extract_cmd, timeout=600)
@@ -835,8 +836,9 @@ def extract_from_techsupport(tech_file, file_pattern, destination=None):
         
         # Get list of extracted files
         if destination:
-            list_cmd = "find {0} -type f -path '*{1}*'".format(
-                destination, file_pattern.replace('*', '')
+            list_cmd = "find {0} -type f -path {1}".format(
+                shell_quote(destination),
+                shell_quote('*{0}*'.format(file_pattern.replace('*', '')))
             )
         else:
             list_cmd = "find . -type f -path '*{0}*'".format(
@@ -1621,7 +1623,7 @@ def check_pods(tech_file=None):
             else:
                 print("[ERROR] Unable to extract any files from tech support")
                 # Check the tech support contents to help diagnose
-                tar_list = run_command("tar -tvf {0} | grep -i 'acs.*health' | head -10".format(tech_file))
+                tar_list = run_command("tar -tvf {0} | grep -i 'acs.*health' | head -10".format(shell_quote(tech_file)))
                 if tar_list:
                     print("Sample health-related files in tech support:\n{0}".format(tar_list))
     
@@ -1802,7 +1804,7 @@ def check_system_health(tech_file=None):
                     print("[WARNING] Error reading health file from tech support: {0}".format(str(e)))
             else:
                 # Search more broadly if not found in expected paths
-                find_cmd = "find {0} -name 'acs_health' -type f -print".format(node_dir)
+                find_cmd = "find {0} -name 'acs_health' -type f -print".format(shell_quote(node_dir))
                 found_files = run_command(find_cmd).strip().split('\n')
                 found_files = [f for f in found_files if f]
 
@@ -2956,7 +2958,8 @@ def check_CA_CSCwm35992(tech_file):
         
         # Use a single unified command to search all SM log files at once
         # This is more efficient than searching each file individually
-        search_cmd = "zgrep '{0}' {1}/logs/k8_infra/sm/sm.log*.gz 2>/dev/null || zgrep '{0}' {1}/logs/k8_infra/sm/sm.log* 2>/dev/null || echo 'No matches found'".format(search_string, node_dir)
+        quoted_node_dir = shell_quote(node_dir)
+        search_cmd = "zgrep '{0}' {1}/logs/k8_infra/sm/sm.log*.gz 2>/dev/null || zgrep '{0}' {1}/logs/k8_infra/sm/sm.log* 2>/dev/null || echo 'No matches found'".format(search_string, quoted_node_dir)
         print("Searching all SM log files with unified command")
         output = run_command(search_cmd)
         
@@ -2965,7 +2968,7 @@ def check_CA_CSCwm35992(tech_file):
             print("Found {0} matches in SM log files".format(len(matches)))
     else:
         # Verify if SM directories exist but have no log files
-        find_sm_dirs_cmd = "find {0} -type d -path '*/sm' -print".format(node_dir)
+        find_sm_dirs_cmd = "find {0} -type d -path '*/sm' -print".format(shell_quote(node_dir))
         sm_dirs = run_command(find_sm_dirs_cmd).strip().split("\n")
         sm_dirs = [d for d in sm_dirs if d]
         
@@ -3007,7 +3010,7 @@ def check_CA_CSCwm35992(tech_file):
             print("[WARNING] No SM log files found to search for certificate check")
             
             # Additional diagnostic output
-            find_cmd = "find {0} | grep -i sm".format(node_dir)
+            find_cmd = "find {0} | grep -i sm".format(shell_quote(node_dir))
             find_result = run_command(find_cmd)
             if find_result:
                 print("Available paths with 'sm' in the name:\n{0}".format(find_result))
@@ -3076,7 +3079,7 @@ def check_ISOs_CSCwn94394(tech_file):
         
         # Use a unified search command that works with both .gz and regular files
         # This is more efficient than searching each file individually
-        search_cmd = "find {0} -type f -name 'boot-hook*' -print0 | xargs -0 zgrep '{1}' 2>/dev/null || true".format(node_dir, search_string)
+        search_cmd = "find {0} -type f -name 'boot-hook*' -print0 | xargs -0 zgrep '{1}' 2>/dev/null || true".format(shell_quote(node_dir), search_string)
         print("Searching all boot-hook files for ISO errors")
         output = run_command(search_cmd)
         
@@ -3131,7 +3134,8 @@ def check_ISOs_CSCwn94394(tech_file):
         iso_list = []
         
         # Look for ISO list with a similar unified approach for efficiency
-        iso_search_cmd = "zgrep 'iso list' {0}/conf-diag/boot-hook* 2>/dev/null || zgrep 'iso list' {0}/boot-hook* 2>/dev/null || true".format(node_dir)        
+        quoted_node_dir = shell_quote(node_dir)
+        iso_search_cmd = "zgrep 'iso list' {0}/conf-diag/boot-hook* 2>/dev/null || zgrep 'iso list' {0}/boot-hook* 2>/dev/null || true".format(quoted_node_dir)
         iso_output = run_command(iso_search_cmd)
         
         if iso_output and "iso list" in iso_output:
@@ -4536,7 +4540,7 @@ def extract_techsupport_optimized(tech_file, node_dir):
     print("Tech support size: {0}".format(tech_size_human))
     
     # Quick disk space check using unified command runner
-    stdout, stderr, returncode = run_command_unified("df -B1 {0} | tail -1".format(node_dir))
+    stdout, stderr, returncode = run_command_unified("df -B1 {0} | tail -1".format(shell_quote(node_dir)))
     if returncode == 0 and stdout:
         parts = stdout.split()
         if len(parts) >= 4:
@@ -4550,14 +4554,16 @@ def extract_techsupport_optimized(tech_file, node_dir):
     
     # 1: Single-command extraction with error handling
     print("Extracting tech support (optimized path)...")
-    extract_cmd = "cd {0} && tar -xzf {1} 2>/dev/null || tar -xf {1}".format(node_dir, tech_file)
+    extract_cmd = "cd {0} && tar -xzf {1} 2>/dev/null || tar -xf {1}".format(
+        shell_quote(node_dir), shell_quote(tech_file))
     
     stdout, stderr, returncode = run_command_unified(extract_cmd, timeout=1800)
     
     if returncode != 0:
         # Fallback extraction method
         print("[WARNING] Primary extraction failed, trying fallback")
-        fallback_cmd = "cd {0} && gzip -dc {1} | tar -xf -".format(node_dir, tech_file)
+        fallback_cmd = "cd {0} && gzip -dc {1} | tar -xf -".format(
+            shell_quote(node_dir), shell_quote(tech_file))
         stdout, stderr, returncode = run_command_unified(fallback_cmd, timeout=1800)
         
         if returncode != 0:
@@ -4567,7 +4573,8 @@ def extract_techsupport_optimized(tech_file, node_dir):
     logs_path = "{0}/logs.tgz".format(node_dir)
     if os.path.exists(logs_path):
         print("Extracting nested logs.tgz...")
-        logs_cmd = "cd {0} && tar -xzf logs.tgz 2>/dev/null || tar -xf logs.tgz".format(node_dir)
+        logs_cmd = "cd {0} && tar -xzf logs.tgz 2>/dev/null || tar -xf logs.tgz".format(
+            shell_quote(node_dir))
         run_command_unified(logs_cmd, timeout=600)  # Shorter timeout for logs
     
     # 3: Initialize file cache after extraction
@@ -4630,14 +4637,16 @@ def extract_techsupport(node_dir, file_name):
         
         # EXTRACT: One-step complete extraction
         print("Extracting complete tech support (this may take a while)...")
-        extract_cmd = "cd {0} && tar -xzf {1}".format(node_dir, file_path)
+        extract_cmd = "cd {0} && tar -xzf {1}".format(
+            shell_quote(node_dir), shell_quote(file_path))
         
         # Use run_extraction_command with timeout and proper process management
         success = run_extraction_command(extract_cmd, timeout=1800)
         
         if not success:
             print("[WARNING] Complete extraction failed, trying alternative method")
-            alt_extract_cmd = "cd {0} && tar -xf {1}".format(node_dir, file_path)
+            alt_extract_cmd = "cd {0} && tar -xf {1}".format(
+                shell_quote(node_dir), shell_quote(file_path))
             success = run_extraction_command(alt_extract_cmd, timeout=1800)
             
             if not success:
@@ -4654,12 +4663,12 @@ def extract_techsupport(node_dir, file_name):
         # If we find logs.tgz, extract it
         if os.path.exists(logs_path):
             print("Found logs.tgz, extracting...")
-            logs_extract_cmd = "cd {0} && tar -xzf logs.tgz".format(node_dir)
+            logs_extract_cmd = "cd {0} && tar -xzf logs.tgz".format(shell_quote(node_dir))
             success = run_extraction_command(logs_extract_cmd, timeout=1800)
             
             if not success:
                 print("[WARNING] logs.tgz extraction failed, trying alternative method")
-                logs_extract_cmd = "cd {0} && tar -xf logs.tgz".format(node_dir)
+                logs_extract_cmd = "cd {0} && tar -xf logs.tgz".format(shell_quote(node_dir))
                 success = run_extraction_command(logs_extract_cmd, timeout=1800)
         
         # Verify extraction results by checking for expected directories
@@ -4706,16 +4715,33 @@ def extract_techsupport(node_dir, file_name):
 
 def save_results():
     """Save results to a JSON file"""
+    temporary_path = "{0}.tmp.{1}".format(RESULTS_FILE, os.getpid())
     try:
         # Make parent directory if it doesn't exist
         if not os.path.exists(os.path.dirname(RESULTS_FILE)):
             os.makedirs(os.path.dirname(RESULTS_FILE))
             
-        with open(RESULTS_FILE, 'w') as f:
+        with open(temporary_path, 'w') as f:
             json.dump(results, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if hasattr(os, "replace"):
+            os.replace(temporary_path, RESULTS_FILE)
+        else:
+            if os.path.exists(RESULTS_FILE):
+                os.remove(RESULTS_FILE)
+            os.rename(temporary_path, RESULTS_FILE)
         print("\nResults saved to {0}".format(RESULTS_FILE))
+        return True
     except Exception as e:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except Exception:
+            pass
         print("Error saving results: {0}".format(str(e)))
+        return False
 
 def cleanup_processes():
     """Cleanup any leftover processes spawned by this script"""
@@ -4816,31 +4842,8 @@ def cleanup_processes():
         except Exception as e:
             print("Error finding child processes: {0}".format(str(e)))
         
-        # Also try to kill any remaining extraction processes (tar, gzip)
-        # This is more aggressive but may be necessary
-        try:
-            if sys.version_info[0] < 3:
-                # Python 2.7 approach - using os.popen().close() to ensure proper waiting
-                os.popen("pkill -9 -f 'tar -x[z]f' || true").close()
-                os.popen("pkill -9 -f gzip || true").close()
-            else:
-                # Python 3.x approach
-                subprocess.run(
-                    "pkill -9 -f 'tar -x[z]f' || true",
-                    shell=True,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-                subprocess.run(
-                    "pkill -9 -f gzip || true",
-                    shell=True,
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
-                )
-        except:
-            pass
+        # Do not issue system-wide pkill commands. The orchestrator tracks each
+        # local worker's process group for timeout cleanup.
             
     except Exception as e:
         print("Error during process cleanup: {0}".format(str(e)))
@@ -4944,7 +4947,12 @@ def main():
         dest_path = "{0}/{1}".format(node_dir, file_name)
         
         print("Copying {0} to {1}...".format(tech_file, dest_path))
-        run_command("cp {0} {1}".format(tech_file, dest_path))
+        if os.path.realpath(tech_file) == os.path.realpath(dest_path):
+            print("Tech support is already in the working directory; copy not required")
+        else:
+            shutil.copy2(tech_file, dest_path)
+        if not os.path.isfile(dest_path):
+            raise Exception("Tech support copy did not create {0}".format(dest_path))
         
         # Extract the tech support file
         extract_techsupport(node_dir, file_name)
@@ -5086,8 +5094,9 @@ def main():
                     results["checks"][check]["details"] = ["Check did not run: {0}".format(str(e))]
         
         # Save results to file
+        if not save_results():
+            raise Exception("Failed to save validation results")
         update_status("complete", "All operations completed", 100)
-        save_results()
         
         print("\nValidation complete on node {0}".format(NODE_NAME))
         return 0
