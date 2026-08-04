@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.27 (July 28, 2026)
+Version: 1.0.28 (August 4, 2026)
 """
 
 import re
@@ -88,6 +88,11 @@ def setup_logging():
 
 # Initialize logger as None - will be set up in main()
 logger = None  
+
+# Directly launched local workers stay tracked so they can be reaped and do not
+# accumulate as zombie child processes during a long validation run.
+_LOCAL_WORKER_PROCESSES = {}
+_LOCAL_WORKER_PROCESSES_LOCK = threading.Lock()
 
 # Set up formatting constants
 PASS = "\033[1;32mPASS\033[0m"
@@ -481,8 +486,12 @@ class NDNodeManager:
         # SCP requires IPv6 addresses wrapped in brackets because ':' separates host from path
         ssh_opts_str = " ".join(ssh_opts)
         scp_ip = bracket_ipv6(node_ip)
+        remote_spec = f"{self.username}@{scp_ip}:{remote_file}"
         # Use SSHPASS environment variable method which is more reliable than -p flag
-        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {local_file} {self.username}@{scp_ip}:{remote_file}"
+        return (
+            f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} "
+            f"{shlex.quote(str(local_file))} {shlex.quote(remote_spec)}"
+        )
 
     def build_scp_download_command(self, node_ip, remote_file, local_file):
         """Build SCP command to download a file FROM a node TO localhost"""
@@ -496,7 +505,11 @@ class NDNodeManager:
 
         ssh_opts_str = " ".join(ssh_opts)
         scp_ip = bracket_ipv6(node_ip)
-        return f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} {self.username}@{scp_ip}:{remote_file} {local_file}"
+        remote_spec = f"{self.username}@{scp_ip}:{remote_file}"
+        return (
+            f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} "
+            f"{shlex.quote(remote_spec)} {shlex.quote(str(local_file))}"
+        )
 
     def enable_legacy_ssh_mode(self):
         """Enable legacy SSH mode (ssh-rsa) for compatibility with older ND versions"""
@@ -2988,8 +3001,10 @@ class _MultiBarDisplay:
     """
 
     BAR_WIDTH = 28
-    BAR_FILL  = "\u2588"   # █
-    BAR_EMPTY = "\u2591"   # ░
+    # ASCII bars remain readable when terminal output is captured or decoded
+    # with a non-UTF-8 code page (the customer log rendered █/░ as mojibake).
+    BAR_FILL  = "#"
+    BAR_EMPTY = "-"
     CYAN      = "\033[96m"
     GREEN     = "\033[92m"
     RED       = "\033[91m"
@@ -3022,7 +3037,7 @@ class _MultiBarDisplay:
         s = self._states[name]
         if final_size is not None:
             s["transferred"] = final_size
-        elif s["total"]:
+        elif success and s["total"]:
             s["transferred"] = s["total"]
         s["done"]   = True
         s["failed"] = not success
@@ -3203,7 +3218,7 @@ class LocalTechSupportManager:
 
         A background thread polls the growing local file every 0.5 s and renders:
 
-            [████████████░░░░░░░░░░░░]  48.3%  1.06 GB / 2.20 GB  18.4 MB/s  ETA 01:01
+            [############------------]  48.3%  1.06 GB / 2.20 GB  18.4 MB/s  ETA 01:01
 
         When state_ref is provided (_MultiBarDisplay parallel mode), all terminal
         writes are suppressed; the progress loop just sets state_ref["transferred"]
@@ -3214,16 +3229,19 @@ class LocalTechSupportManager:
         Returns (returncode, stderr_text).
           returncode == -1  ->  60-minute timeout hit
           returncode == -2  ->  failed to launch SCP process
+          returncode == -3  ->  downloaded file failed local size validation
         """
         import threading
         import time
 
         CYAN      = "\033[96m"
+        GREEN     = "\033[92m"
         GREY      = "\033[90m"
+        RED       = "\033[91m"
         BOLD      = "\033[1m"
         RESET     = "\033[0m"
-        BAR_FILL  = "\u2588"   # █
-        BAR_EMPTY = "\u2591"   # ░
+        BAR_FILL  = "#"
+        BAR_EMPTY = "-"
         BAR_WIDTH = 30
 
         def _fmt_bytes(n):
@@ -3249,7 +3267,7 @@ class LocalTechSupportManager:
                 pct_str  = f"{BOLD}{pct * 100:5.1f}%{RESET}"
                 size_str = f"{_fmt_bytes(transferred)} / {_fmt_bytes(total_bytes)}"
             else:
-                spinner  = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+                spinner  = "|/-\\"
                 bar      = f"[{CYAN}{spinner[tick % len(spinner)]}{' ' * (BAR_WIDTH - 1)}{RESET}]"
                 pct_str  = "  ???  "
                 size_str = _fmt_bytes(transferred)
@@ -3365,19 +3383,53 @@ class LocalTechSupportManager:
             stop_event.set()
             progress_thread.join(timeout=2)
 
+        try:
+            final_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
+        except OSError:
+            final_size = 0
+        if state_ref is not None:
+            # Capture the final observed byte count before download_tech_support()
+            # removes a failed partial file.
+            state_ref["transferred"] = final_size
+
+        # SCP returning zero is not sufficient proof that a large archive arrived
+        # intact.  Validate the local file against the remote stat result before
+        # showing a successful completion or allowing the worker to consume it.
+        if returncode == 0:
+            validation_error = None
+            if not os.path.exists(local_path):
+                validation_error = "SCP exited successfully but the local file was not created"
+            elif total_bytes and final_size != total_bytes:
+                validation_error = (
+                    f"Downloaded file size mismatch: expected {total_bytes} bytes, "
+                    f"received {final_size} bytes"
+                )
+            elif final_size <= 0:
+                validation_error = "Downloaded file is empty"
+
+            if validation_error:
+                returncode = -3
+                existing_error = stderr_data.decode("utf-8", errors="replace").strip()
+                combined_error = f"{existing_error}; {validation_error}" if existing_error else validation_error
+                stderr_data = combined_error.encode("utf-8")
+
         if is_tty:
-            try:
-                final_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
-            except OSError:
-                final_size = 0
-            if returncode == 0 and total_bytes:
-                # Clean completion: fully-filled bar + "Done" label
-                bar      = f"[{CYAN}{BAR_FILL * BAR_WIDTH}{RESET}]"
-                size_str = f"{_fmt_bytes(total_bytes)} / {_fmt_bytes(total_bytes)}"
-                sys.stdout.write(f"\r  {bar} {BOLD}100.0%{RESET}  {size_str}  Done\033[K\n")
+            if returncode == 0:
+                if total_bytes:
+                    # Clean completion: fully-filled bar + "Done" label
+                    bar      = f"[{CYAN}{BAR_FILL * BAR_WIDTH}{RESET}]"
+                    size_str = f"{_fmt_bytes(total_bytes)} / {_fmt_bytes(total_bytes)}"
+                    sys.stdout.write(f"\r  {bar} {BOLD}100.0%{RESET}  {size_str}  Done\033[K\n")
+                else:
+                    # A remote stat is not always available.  A non-empty file and
+                    # successful SCP still constitute a valid unknown-size download.
+                    sys.stdout.write(
+                        f"\r{_render(0, final_size, 0.0, -1.0)}  {GREEN}Done{RESET}\033[K\n"
+                    )
             else:
-                display = total_bytes or final_size
-                sys.stdout.write(f"\r{_render(0, display, 0.0, -1.0)}\033[K\n")
+                sys.stdout.write(
+                    f"\r{_render(0, final_size, 0.0, -1.0)}  {RED}FAILED{RESET}\033[K\n"
+                )
             sys.stdout.flush()
 
         return returncode, stderr_data.decode("utf-8", errors="replace")
@@ -3400,6 +3452,7 @@ class LocalTechSupportManager:
         filename = os.path.basename(remote_path)
         node_dir = self._ensure_node_dir(node_name)
         local_path = os.path.join(node_dir, filename)
+        total_bytes = self.get_remote_file_size_bytes(node, remote_path)
 
         # --- re-run safety ---
         if os.path.exists(local_path):
@@ -3408,40 +3461,59 @@ class LocalTechSupportManager:
                 print(f"  Found existing local file for {node_name}: {filename}")
                 print(f"  Verifying integrity (md5sum)...")
 
-            remote_md5 = self.get_remote_md5(node, remote_path)
-            local_md5 = self.get_local_md5(local_path)
+            try:
+                local_size = os.path.getsize(local_path)
+            except OSError:
+                local_size = 0
 
-            if remote_md5 and local_md5:
-                if remote_md5 == local_md5:
+            # Size is cheap to obtain and prevents an old truncated file from
+            # being accepted when the remote md5 command is unavailable.
+            if local_size <= 0 or (total_bytes and local_size != total_bytes):
+                if state_ref is None:
+                    print(f"  {WARNING} Existing local file size is invalid — re-downloading...")
+                logger.warning(
+                    f"[LocalTS] {node_name}: existing local size mismatch "
+                    f"(local={local_size} remote={total_bytes}), re-downloading"
+                )
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+            else:
+                remote_md5 = self.get_remote_md5(node, remote_path)
+                local_md5 = self.get_local_md5(local_path)
+
+                if remote_md5 and local_md5:
+                    if remote_md5 == local_md5:
+                        if state_ref is None:
+                            print(f"  {PASS} md5sum matches — reusing existing file.")
+                        logger.info(f"[LocalTS] {node_name}: md5sum match, reusing {local_path}")
+                        return local_path
+                    else:
+                        if state_ref is None:
+                            print(f"  {WARNING} md5sum mismatch — local file may be corrupt. Re-downloading...")
+                        logger.warning(f"[LocalTS] {node_name}: md5sum mismatch (local={local_md5} remote={remote_md5}), re-downloading")
+                        try:
+                            os.remove(local_path)
+                        except OSError:
+                            pass
+                elif remote_md5 is None and local_md5:
+                    # Remote checksum is unavailable.  Reuse only after the
+                    # known remote size (when available) matched above.
                     if state_ref is None:
-                        print(f"  {PASS} md5sum matches — reusing existing file.")
-                    logger.info(f"[LocalTS] {node_name}: md5sum match, reusing {local_path}")
+                        print(f"  Remote md5 unavailable; accepting size-validated local file.")
+                    logger.info(f"[LocalTS] {node_name}: remote md5 unavailable, accepting local file")
                     return local_path
                 else:
                     if state_ref is None:
-                        print(f"  {WARNING} md5sum mismatch — local file may be corrupt. Re-downloading...")
-                    logger.warning(f"[LocalTS] {node_name}: md5sum mismatch (local={local_md5} remote={remote_md5}), re-downloading")
+                        print(f"  {WARNING} Could not compute md5sum — re-downloading to be safe...")
+                    logger.warning(f"[LocalTS] {node_name}: md5 computation failed, re-downloading")
                     try:
                         os.remove(local_path)
-                    except Exception:
+                    except OSError:
                         pass
-            elif remote_md5 is None and local_md5:
-                # Remote file gone — accept local file without point-of-reference
-                if state_ref is None:
-                    print(f"  Remote file no longer accessible; accepting local file as-is.")
-                logger.info(f"[LocalTS] {node_name}: remote md5 unavailable, accepting local file")
-                return local_path
-            else:
-                if state_ref is None:
-                    print(f"  {WARNING} Could not compute md5sum — re-downloading to be safe...")
-                logger.warning(f"[LocalTS] {node_name}: md5 computation failed, re-downloading")
-                try:
-                    os.remove(local_path)
-                except Exception:
-                    pass
 
         # --- download ---
-        total_bytes = self.get_remote_file_size_bytes(node, remote_path)
         size_hint   = f"  ({total_bytes / (1024 ** 3):.2f} GB)" if total_bytes else ""
         if state_ref is None:
             print(f"  Downloading {filename} from {node_name}{size_hint}...")
@@ -3453,17 +3525,42 @@ class LocalTechSupportManager:
             if state_ref is None:
                 print(f"  {FAIL} SCP download timed out for {node_name}")
             logger.error(f"[LocalTS] SCP download timed out for {node_name}")
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
             return None
         if returncode != 0:
             if state_ref is None:
                 print(f"  {FAIL} SCP download failed for {node_name}: {err_text.strip()}")
             logger.error(f"[LocalTS] SCP download failed for {node_name}: {err_text.strip()}")
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
             return None
 
         if not os.path.exists(local_path):
             if state_ref is None:
                 print(f"  {FAIL} Download appeared to succeed but file not found: {local_path}")
             logger.error(f"[LocalTS] File missing after download: {local_path}")
+            return None
+
+        actual_size = os.path.getsize(local_path)
+        if actual_size <= 0 or (total_bytes and actual_size != total_bytes):
+            if state_ref is None:
+                print(
+                    f"  {FAIL} Downloaded file size is invalid "
+                    f"(expected {total_bytes or 'unknown'}, received {actual_size} bytes)"
+                )
+            logger.error(
+                f"[LocalTS] Downloaded file size invalid for {node_name}: "
+                f"expected={total_bytes} actual={actual_size}"
+            )
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
             return None
 
         if state_ref is None:
@@ -3581,6 +3678,204 @@ def _collect_live_node_data(node, node_manager):
     return data
 
 
+def _local_worker_artifact_paths(node_name, staging_dir):
+    """Return the run-state files used by one local worker."""
+    return {
+        "results": os.path.join(staging_dir, f"{node_name}_results.json"),
+        "status": os.path.join(staging_dir, f"{node_name}_status.json"),
+        "log": os.path.join(staging_dir, f"{node_name}_output.log"),
+        "live_data": os.path.join(staging_dir, f"{node_name}_live_data.json"),
+        "pid": os.path.join(staging_dir, f"{node_name}_worker.pid"),
+    }
+
+
+def _remove_local_artifact(path):
+    """Remove one stale local-run file, returning False on a real error."""
+    try:
+        if os.path.lexists(path):
+            os.remove(path)
+        return True
+    except OSError as exc:
+        logger.error(f"[LocalExec] Could not remove stale artifact {path}: {exc}")
+        return False
+
+
+def _terminate_local_worker(node_name, staging_dir):
+    """Safely stop a tracked local worker process group, if one is running."""
+    pid_file = _local_worker_artifact_paths(node_name, staging_dir)["pid"]
+    with _LOCAL_WORKER_PROCESSES_LOCK:
+        tracked_process = _LOCAL_WORKER_PROCESSES.get(node_name)
+
+    if tracked_process is not None:
+        returncode = tracked_process.poll()
+        if returncode is not None:
+            try:
+                tracked_process.wait(timeout=0)
+            except Exception:
+                pass
+            with _LOCAL_WORKER_PROCESSES_LOCK:
+                _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+            _remove_local_artifact(pid_file)
+            return True
+        pid = tracked_process.pid
+    else:
+        if not os.path.exists(pid_file):
+            return True
+
+        try:
+            with open(pid_file, "r") as stream:
+                pid = int(stream.read().strip())
+            if pid <= 1:
+                raise ValueError("invalid PID")
+        except (OSError, ValueError) as exc:
+            logger.warning(f"[LocalExec] Ignoring invalid worker PID file for {node_name}: {exc}")
+            _remove_local_artifact(pid_file)
+            return True
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        if tracked_process is not None:
+            try:
+                tracked_process.wait(timeout=0)
+            except Exception:
+                pass
+            with _LOCAL_WORKER_PROCESSES_LOCK:
+                _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+        _remove_local_artifact(pid_file)
+        return True
+    except PermissionError as exc:
+        logger.error(f"[LocalExec] Cannot inspect worker PID {pid} for {node_name}: {exc}")
+        return False
+
+    if tracked_process is None:
+        # Do not signal a recycled/unrelated PID.  Local mode is Linux-only in
+        # practice, so /proc gives us a reliable identity check before killpg().
+        cmdline_path = f"/proc/{pid}/cmdline"
+        try:
+            with open(cmdline_path, "rb") as stream:
+                cmdline = stream.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
+        except OSError as exc:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                _remove_local_artifact(pid_file)
+                return True
+            except OSError:
+                pass
+            logger.warning(f"[LocalExec] Could not verify worker PID {pid} for {node_name}: {exc}")
+            return False
+
+        if "worker_functions.py" not in cmdline or node_name not in cmdline:
+            logger.warning(
+                f"[LocalExec] PID {pid} no longer belongs to the worker for {node_name}; "
+                "leaving the process untouched"
+            )
+            _remove_local_artifact(pid_file)
+            return True
+
+    logger.warning(f"[LocalExec] Terminating local worker PID {pid} for {node_name}")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        if tracked_process is not None:
+            try:
+                tracked_process.wait(timeout=0)
+            except Exception:
+                pass
+            with _LOCAL_WORKER_PROCESSES_LOCK:
+                _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+        _remove_local_artifact(pid_file)
+        return True
+    except OSError as exc:
+        logger.error(f"[LocalExec] Could not terminate worker PID {pid} for {node_name}: {exc}")
+        return False
+
+    for _ in range(50):
+        if tracked_process is not None and tracked_process.poll() is not None:
+            try:
+                tracked_process.wait(timeout=0)
+            except Exception:
+                pass
+            with _LOCAL_WORKER_PROCESSES_LOCK:
+                _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+            _remove_local_artifact(pid_file)
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            if tracked_process is not None:
+                try:
+                    tracked_process.wait(timeout=0)
+                except Exception:
+                    pass
+                with _LOCAL_WORKER_PROCESSES_LOCK:
+                    _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+            _remove_local_artifact(pid_file)
+            return True
+        except PermissionError:
+            break
+        time.sleep(0.1)
+
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        logger.error(f"[LocalExec] Could not force-stop worker PID {pid} for {node_name}: {exc}")
+        return False
+
+    if tracked_process is not None:
+        try:
+            tracked_process.wait(timeout=1)
+        except Exception:
+            pass
+        with _LOCAL_WORKER_PROCESSES_LOCK:
+            _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+    _remove_local_artifact(pid_file)
+    return True
+
+
+def _reap_local_worker(node_name, staging_dir):
+    """Reap a normally completed local worker and remove its PID file."""
+    with _LOCAL_WORKER_PROCESSES_LOCK:
+        process = _LOCAL_WORKER_PROCESSES.get(node_name)
+    if process is None:
+        return _remove_local_artifact(
+            _local_worker_artifact_paths(node_name, staging_dir)["pid"]
+        )
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        # A results file is the completion marker, but give the process a bounded
+        # grace period before stopping an unexpectedly lingering worker.
+        return _terminate_local_worker(node_name, staging_dir)
+    except Exception as exc:
+        logger.warning(f"[LocalExec] Could not reap worker for {node_name}: {exc}")
+        return False
+    with _LOCAL_WORKER_PROCESSES_LOCK:
+        _LOCAL_WORKER_PROCESSES.pop(node_name, None)
+    return _remove_local_artifact(
+        _local_worker_artifact_paths(node_name, staging_dir)["pid"]
+    )
+
+
+def _clear_stale_local_node_artifacts(node_name, staging_dir, results_dir=None):
+    """Clear old worker metadata/results without deleting a reusable archive."""
+    stopped = _terminate_local_worker(node_name, staging_dir)
+    paths = _local_worker_artifact_paths(node_name, staging_dir)
+    cleared = True
+    for key in ("results", "status", "log", "live_data"):
+        cleared = _remove_local_artifact(paths[key]) and cleared
+
+    if results_dir:
+        for suffix in ("_results.json", "_output.log"):
+            path = os.path.join(results_dir, f"{node_name}{suffix}")
+            cleared = _remove_local_artifact(path) and cleared
+
+    return stopped and cleared
+
+
 def _run_worker_locally(node_name, local_ts_path, nd_version, operation, staging_dir, worker_script_path,
                         live_data_file=None):
     """
@@ -3594,12 +3889,26 @@ def _run_worker_locally(node_name, local_ts_path, nd_version, operation, staging
 
     Returns True if the script was launched (not necessarily completed).
     """
-    live_data_arg = f"{shlex.quote(live_data_file)} " if live_data_file else ""
     # Ensure staging dir exists; the worker will create its own sub-directories inside it
     os.makedirs(staging_dir, exist_ok=True)
+    if not os.path.isfile(worker_script_path):
+        logger.error(f"[LocalExec] Worker script not found: {worker_script_path}")
+        return False
+    if not os.path.isfile(local_ts_path):
+        logger.error(f"[LocalExec] Downloaded tech support not found: {local_ts_path}")
+        return False
 
-    log_file = os.path.join(staging_dir, f"{node_name}_output.log")
-    status_file = os.path.join(staging_dir, f"{node_name}_status.json")
+    paths = _local_worker_artifact_paths(node_name, staging_dir)
+    log_file = paths["log"]
+    status_file = paths["status"]
+
+    # A prior results file must never make a rerun appear complete before the
+    # newly launched worker has processed the current archive.
+    if not _terminate_local_worker(node_name, staging_dir):
+        return False
+    for key in ("results", "status", "log", "pid"):
+        if not _remove_local_artifact(paths[key]):
+            return False
 
     # Seed a status file immediately so the monitor loop doesn't see an empty state
     init_status = {"status": "initializing", "current_operation": "Starting local validation", "progress": 0,
@@ -3607,8 +3916,9 @@ def _run_worker_locally(node_name, local_ts_path, nd_version, operation, staging
     try:
         with open(status_file, 'w') as f:
             json.dump(init_status, f)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.error(f"[LocalExec] Could not initialize worker status for {node_name}: {exc}")
+        return False
 
     python_cmd = "python3"
     try:
@@ -3616,23 +3926,61 @@ def _run_worker_locally(node_name, local_ts_path, nd_version, operation, staging
     except Exception:
         python_cmd = "python"
 
-    # Pass staging_dir as argv[5] and optional live_data_file as argv[6]
-    cmd = (
-        f"cd {shlex.quote(staging_dir)} && "
-        f"echo '[Starting local worker at $(date)]' > {shlex.quote(os.path.basename(log_file))} 2>&1 && "
-        f"nohup {python_cmd} -u {shlex.quote(worker_script_path)} {operation} "
-        f"{shlex.quote(local_ts_path)} {shlex.quote(nd_version or 'unknown')} {shlex.quote(node_name)} "
-        f"{shlex.quote(staging_dir)} {live_data_arg}"
-        f">> {shlex.quote(os.path.basename(log_file))} 2>&1 &"
-    )
+    # Pass staging_dir as argv[5] and optional live_data_file as argv[6].  Launch
+    # directly (no shell) and start a new session so the PID/process group can be
+    # safely tracked and terminated if monitoring times out.
+    # Run from beside the archive and pass relative archive/base paths.  The
+    # standalone worker contains legacy shell-based checks; keeping their path
+    # operands free of the caller's absolute CWD prevents a directory such as
+    # "upgrade scripts" from being split by those commands.  Worker results
+    # still resolve to the same absolute staging_dir files collected below.
+    worker_cwd = os.path.dirname(os.path.abspath(local_ts_path))
+    worker_tech_path = os.path.basename(local_ts_path)
+    worker_base_dir = os.path.relpath(os.path.abspath(staging_dir), worker_cwd)
 
+    argv = [
+        python_cmd,
+        "-u",
+        worker_script_path,
+        operation,
+        worker_tech_path,
+        nd_version or "unknown",
+        node_name,
+        worker_base_dir,
+    ]
+    if live_data_file:
+        argv.append(live_data_file)
+
+    process = None
     try:
-        process = subprocess.Popen(cmd, shell=True)
-        process.wait(timeout=5)
-        logger.info(f"[LocalExec] Launched worker for {node_name} (log: {log_file})")
+        with open(log_file, "w") as log_stream:
+            log_stream.write(f"[Starting local worker at {datetime.now().isoformat()}]\n")
+            log_stream.flush()
+            process = subprocess.Popen(
+                argv,
+                cwd=worker_cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        with open(paths["pid"], "w") as stream:
+            stream.write(str(process.pid))
+        with _LOCAL_WORKER_PROCESSES_LOCK:
+            _LOCAL_WORKER_PROCESSES[node_name] = process
+        logger.info(
+            f"[LocalExec] Launched worker PID {process.pid} for {node_name} "
+            f"(log: {log_file})"
+        )
         return True
     except Exception as e:
         logger.error(f"[LocalExec] Failed to launch worker for {node_name}: {e}")
+        if process is not None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+        _remove_local_artifact(paths["pid"])
         return False
 
 
@@ -3650,6 +3998,20 @@ def _check_local_worker_status(node_name, staging_dir):
     # Completion: results file exists (highest priority)
     if os.path.exists(results_file):
         return {"status": "complete", "current_operation": "Validation complete", "progress": 100}
+
+    # Detect a worker that exited before producing results (missing script,
+    # OOM/SIGKILL, import failure, etc.) instead of waiting the full 30 minutes.
+    with _LOCAL_WORKER_PROCESSES_LOCK:
+        tracked_process = _LOCAL_WORKER_PROCESSES.get(node_name)
+    if tracked_process is not None:
+        returncode = tracked_process.poll()
+        if returncode is not None:
+            return {
+                "status": "error",
+                "current_operation": f"Local worker exited with code {returncode} before producing results",
+                "progress": 0,
+                "error": True,
+            }
 
     # Check the output log for fatal errors or completion markers
     if os.path.exists(log_file):
@@ -3692,6 +4054,38 @@ def _collect_local_worker_results(node_name, staging_dir, results_dir):
     try:
         with open(results_file, 'r') as f:
             data = json.load(f)
+        if not isinstance(data, dict) or not isinstance(data.get("checks"), dict) or not data["checks"]:
+            logger.error(
+                f"[LocalExec] Results file for {node_name} has no non-empty checks object: "
+                f"{results_file}"
+            )
+            return None
+        if data.get("node_name") not in (None, node_name):
+            logger.error(
+                f"[LocalExec] Results node mismatch: expected {node_name}, "
+                f"received {data.get('node_name')}"
+            )
+            return None
+        for check_name, check_result in data["checks"].items():
+            if not isinstance(check_result, dict):
+                logger.error(
+                    f"[LocalExec] Invalid check result '{check_name}' for {node_name}: "
+                    "expected an object"
+                )
+                return None
+            if check_result.get("status") not in ("PASS", "WARNING", "FAIL"):
+                logger.error(
+                    f"[LocalExec] Invalid status for '{check_name}' on {node_name}: "
+                    f"{check_result.get('status')}"
+                )
+                return None
+            details = check_result.get("details")
+            if not isinstance(details, list) or any(not isinstance(item, str) for item in details):
+                logger.error(
+                    f"[LocalExec] Invalid details for '{check_name}' on {node_name}: "
+                    "expected a list of strings"
+                )
+                return None
         os.makedirs(results_dir, exist_ok=True)
         dest = os.path.join(results_dir, f"{node_name}_results.json")
         with open(dest, 'w') as f:
@@ -3704,6 +4098,56 @@ def _collect_local_worker_results(node_name, staging_dir, results_dir):
     except Exception as e:
         logger.error(f"[LocalExec] Could not collect results for {node_name}: {e}")
         return None
+
+
+def _local_techsupport_failure_result(node_name, detail, explanation, recommendation=None):
+    """Build a reportable per-node failure for the 4.1.x local workflow."""
+    if recommendation is None:
+        recommendation = (
+            "Review final-results/nd_validation_debug.log, correct the local "
+            "download or worker error, and rerun validation for this node."
+        )
+    return {
+        "node_name": node_name,
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "checks": {
+            "techsupport": {
+                "status": "FAIL",
+                "details": [detail],
+                "explanation": explanation,
+                "recommendation": recommendation,
+            }
+        }
+    }
+
+
+def _persist_local_node_result(node_result, results_dir):
+    """Persist an aggregate node result so bundles cannot retain an older result."""
+    node_name = node_result.get("node_name") if isinstance(node_result, dict) else None
+    if not node_name:
+        logger.error("[LocalExec] Cannot persist a node result without node_name")
+        return False
+    try:
+        os.makedirs(results_dir, exist_ok=True)
+        destination = os.path.join(results_dir, f"{node_name}_results.json")
+        fd, temporary_path = tempfile.mkstemp(
+            prefix=f".{node_name}_results_", suffix=".tmp", dir=results_dir
+        )
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(node_result, stream, indent=2)
+                stream.write("\n")
+            os.replace(temporary_path, destination)
+        except Exception:
+            try:
+                os.remove(temporary_path)
+            except OSError:
+                pass
+            raise
+        return True
+    except Exception as exc:
+        logger.error(f"[LocalExec] Could not persist result for {node_name}: {exc}")
+        return False
 
 
 def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_username=None, api_password=None):
@@ -3906,6 +4350,23 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
     staging_dir = local_ts_mgr.staging_dir
     worker_script_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker_functions.py"))
 
+    # Remove only prior run metadata/results, never the downloaded archive in
+    # staging/<node>/ (which download_tech_support may safely reuse after checks).
+    # This prevents an old PASS result from completing or contaminating a rerun.
+    pre_download_failures = {}
+    usable_nodes = []
+    for node in nodes:
+        node_name = node["name"]
+        if _clear_stale_local_node_artifacts(node_name, staging_dir, results_dir):
+            usable_nodes.append(node)
+        else:
+            pre_download_failures[node_name] = _local_techsupport_failure_result(
+                node_name,
+                "Could not safely initialize local validation state for this node.",
+                "Stale worker metadata or a prior local worker could not be cleared.",
+            )
+    nodes = usable_nodes
+
     # ---------------------------------------------------------------
     # STEP 1 — Tech support selection / generation (identical UX)
     # ---------------------------------------------------------------
@@ -3929,13 +4390,26 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                     else:
                         failed_nodes.append(node_name)
                         logger.error(f"Failed to generate tech support on {node_name}")
+                        pre_download_failures[node_name] = _local_techsupport_failure_result(
+                            node_name,
+                            "Tech support generation failed; local validation was not run for this node.",
+                            "The Nexus Dashboard node did not return a generated tech support path.",
+                        )
                 except Exception as exc:
                     failed_nodes.append(node_name)
                     print(f"{FAIL} Error generating tech support for {node_name}: {exc}")
+                    logger.error(f"Failed to generate tech support on {node_name}: {exc}")
+                    pre_download_failures[node_name] = _local_techsupport_failure_result(
+                        node_name,
+                        "Tech support generation raised an error; local validation was not run for this node.",
+                        "The script could not generate a tech support archive on the Nexus Dashboard node.",
+                    )
 
         if not tech_support_paths:
-            print(f"{FAIL} No tech supports were generated. Exiting.")
-            return {}
+            print(f"{FAIL} No tech supports were generated; local validation cannot run.")
+            if not pre_download_failures:
+                return {}
+            print("Cluster-level API checks will continue and the failures will be included in the report.")
         if failed_nodes:
             print(f"{WARNING} Tech support generation failed on: {', '.join(failed_nodes)}")
     else:
@@ -3952,11 +4426,23 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                         node_tech_support_files[node["name"]] = tech_files
                 except Exception as exc:
                     print(f"{FAIL} Error listing tech support files for {node['name']}: {exc}")
+                    logger.error(f"Error listing tech support files for {node['name']}: {exc}")
+                    pre_download_failures[node["name"]] = _local_techsupport_failure_result(
+                        node["name"],
+                        "Tech support discovery failed; local validation was not run for this node.",
+                        "The script could not list available tech support archives on the Nexus Dashboard node.",
+                    )
 
         for node in nodes:
             node_name = node["name"]
             if node_name not in node_tech_support_files:
                 print(f"{FAIL} No tech support files found for {node_name}")
+                if node_name not in pre_download_failures:
+                    pre_download_failures[node_name] = _local_techsupport_failure_result(
+                        node_name,
+                        "No tech support files were found; local validation was not run for this node.",
+                        "Option 2 requires an existing tech support archive on each node being validated.",
+                    )
                 continue
             tech_files = node_tech_support_files[node_name]
             print(f"\nTech support files available on {node_name} ({node['ip']}):")
@@ -3983,8 +4469,16 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                     print("Please enter a valid number")
 
         if not tech_support_paths:
-            print(f"{FAIL} No tech supports were selected. Exiting.")
-            return {}
+            if not pre_download_failures:
+                print(f"{FAIL} No tech supports were selected. Exiting.")
+                return {}
+            print(f"{FAIL} No tech supports could be selected for local validation.")
+            print("Cluster-level API checks will continue and the failures will be included in the report.")
+
+    # Only selected/generated tech supports belong in the local workflow.  This
+    # preserves an explicit option-2 skip and prevents an unselected node from
+    # being submitted to a download worker with no remote path.
+    nodes = [node for node in nodes if node["name"] in tech_support_paths]
 
     # ---------------------------------------------------------------
     # STEP 2 — Gather remote file sizes for space planning
@@ -4066,8 +4560,8 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
     for i in range(0, len(nodes), effective_concurrency):
         nodes_batches.append(nodes[i:i + effective_concurrency])
 
-    all_results = {}
-    overall_status = "PASS"
+    all_results = dict(pre_download_failures)
+    overall_status = "FAIL" if pre_download_failures else "PASS"
 
     print_section("Downloading Tech Supports and Starting Local Validation")
 
@@ -4089,20 +4583,31 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
         def _download_one(node):
             nd_name    = node["name"]
             state_ref  = _multi_bar.get_state_ref(nd_name) if _is_multi_bar else None
-            local_path = local_ts_mgr.download_tech_support(
-                node, tech_support_paths[nd_name],
-                parallel=(len(batch) > 1),
-                print_lock=_dl_print_lock if (len(batch) > 1 and not _is_multi_bar) else None,
-                state_ref=state_ref,
-            )
-            if _is_multi_bar:
-                try:
-                    final_sz = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
-                except OSError:
-                    final_sz = 0
-                _multi_bar.mark_done(nd_name, success=(local_path is not None),
-                                     final_size=final_sz or ts_sizes_bytes.get(nd_name, 0))
-            return nd_name, local_path
+            local_path = None
+            try:
+                local_path = local_ts_mgr.download_tech_support(
+                    node, tech_support_paths[nd_name],
+                    parallel=(len(batch) > 1),
+                    print_lock=_dl_print_lock if (len(batch) > 1 and not _is_multi_bar) else None,
+                    state_ref=state_ref,
+                )
+                return nd_name, local_path
+            finally:
+                if _is_multi_bar:
+                    try:
+                        if local_path and os.path.exists(local_path):
+                            final_sz = os.path.getsize(local_path)
+                        else:
+                            final_sz = state_ref.get("transferred", 0)
+                    except OSError:
+                        final_sz = state_ref.get("transferred", 0)
+                    # Never substitute the expected remote size on failure: doing
+                    # so made a zero-byte failed transfer render as 100% complete.
+                    _multi_bar.mark_done(
+                        nd_name,
+                        success=(local_path is not None),
+                        final_size=final_sz,
+                    )
 
         _download_results = {}
         with ThreadPoolExecutor(max_workers=len(batch)) as executor:
@@ -4126,9 +4631,18 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                 print(f"{PASS} Downloaded tech support for {nd_name}")
             else:
                 print(f"{FAIL} Download failed for {nd_name}")
+                all_results[nd_name] = _local_techsupport_failure_result(
+                    nd_name,
+                    "Tech support download failed; local validation was not run for this node.",
+                    "The selected tech support could not be copied from the Nexus Dashboard node to the local host.",
+                )
+                overall_status = "FAIL"
 
         if not local_ts_paths:
             print(f"{FAIL} No tech supports downloaded in this batch. Skipping.")
+            if not debug_mode:
+                for node in batch:
+                    local_ts_mgr.cleanup_node_local_dir(node["name"])
             continue
 
         # --- Launch local workers for successfully downloaded nodes ---
@@ -4158,8 +4672,17 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                 print(f"{PASS} Validation started for {node_name}")
             else:
                 print(f"{FAIL} Could not launch local worker for {node_name}")
+                all_results[node_name] = _local_techsupport_failure_result(
+                    node_name,
+                    "Local tech support validation could not be started for this node.",
+                    "The tech support downloaded, but the local worker process failed to launch.",
+                )
+                overall_status = "FAIL"
 
         if not launched_nodes:
+            if not debug_mode:
+                for node in batch:
+                    local_ts_mgr.cleanup_node_local_dir(node["name"])
             continue
 
         # --- Monitor status (identical to display_check_results logic, against local files) ---
@@ -4169,6 +4692,7 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
         start_time = time.time()
         nodes_status = {}
         nodes_results = {}
+        preserve_node_dirs = set()
 
         print(f"\nRunning validation checks on {len(launched_nodes)} Nexus Dashboard nodes...")
         while True:
@@ -4178,6 +4702,15 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                 break
             if (time.time() - start_time) > max_monitoring_time:
                 print(f"\n{WARNING} Monitoring timed out after {max_monitoring_time // 60} minutes")
+                for timed_out_node in incomplete:
+                    timed_out_name = timed_out_node["name"]
+                    nodes_status[timed_out_name] = "timeout"
+                    if not _terminate_local_worker(timed_out_name, staging_dir):
+                        preserve_node_dirs.add(timed_out_name)
+                        print(
+                            f"{WARNING} Could not stop the local worker for {timed_out_name}; "
+                            "its staging files will be preserved."
+                        )
                 break
 
             for node in incomplete:
@@ -4195,35 +4728,41 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
 
             time.sleep(monitoring_interval)
 
-        # --- Collect results, then clean up local staging dir per node ---
-        completed_nodes = [nd for nd in launched_nodes if nodes_status.get(nd["name"]) == "complete"]
-        for node in completed_nodes:
+        # --- Collect every launched node.  Missing output is itself a reportable
+        # validation failure; otherwise API/storage PASS entries can mask it. ---
+        for node in launched_nodes:
             node_name = node["name"]
             result = _collect_local_worker_results(node_name, staging_dir, results_dir)
             if result:
                 nodes_results[node_name] = result
+                _reap_local_worker(node_name, staging_dir)
+                continue
 
-        # For nodes flagged as "error", still attempt result collection — the worker may have
-        # completed despite mid-run tar extraction warnings that triggered the error flag.
-        # If no results file exists, inject a synthetic FAIL so the node appears in the report.
-        error_nodes = [nd for nd in launched_nodes if nodes_status.get(nd["name"]) == "error"]
-        for node in error_nodes:
-            node_name = node["name"]
-            result = _collect_local_worker_results(node_name, staging_dir, results_dir)
-            if result:
-                nodes_results[node_name] = result
+            worker_status = nodes_status.get(node_name)
+            if worker_status == "error":
+                detail = "Local tech support validation failed; the worker did not produce results."
+                explanation = "The local worker reported a fatal error while processing the downloaded tech support."
+            elif worker_status == "complete":
+                detail = "Local tech support validation completed without a readable results file."
+                explanation = "The worker signaled completion, but its results could not be found or parsed."
+            elif worker_status == "timeout":
+                detail = "Local tech support validation timed out before producing results."
+                explanation = "The local worker did not complete within the 30-minute monitoring limit."
             else:
-                nodes_results[node_name] = {
-                    "node_name": node_name,
-                    "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    "checks": {
-                        "techsupport": {
-                            "status": "FAIL",
-                            "details": ["Tech support extraction failed — worker did not produce results"]
-                        }
-                    }
-                }
-                overall_status = "FAIL"
+                detail = "Local tech support validation ended without producing results."
+                explanation = "The local worker stopped or became unavailable before results could be collected."
+
+            if worker_status != "timeout" and not _terminate_local_worker(node_name, staging_dir):
+                preserve_node_dirs.add(node_name)
+                print(
+                    f"{WARNING} Could not stop the local worker for {node_name}; "
+                    "its staging files will be preserved."
+                )
+
+            nodes_results[node_name] = _local_techsupport_failure_result(
+                node_name, detail, explanation
+            )
+            overall_status = "FAIL"
 
         if nodes_results:
             all_results.update(nodes_results)
@@ -4234,11 +4773,27 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
                     elif check_result["status"] == "WARNING" and overall_status != "FAIL":
                         overall_status = "WARNING"
 
-        # Clean up per-node local staging dir immediately (reclaim space for next batch)
+        # Clean up per-node local staging dirs immediately (including failed
+        # downloads and launch failures) to reclaim space for the next batch.
         if not debug_mode:
-            for node in launched_nodes:
+            for node in batch:
+                if node["name"] in preserve_node_dirs:
+                    continue
                 local_ts_mgr.cleanup_node_local_dir(node["name"])
                 print(f"{PASS} Cleaned up local staging files for {node['name']}")
+
+    # Defensive invariant: every selected/eligible node must contribute a node
+    # result.  This makes any unforeseen local-workflow omission visible instead
+    # of allowing unrelated cluster-level PASS checks to produce a green report.
+    for node in nodes:
+        node_name = node["name"]
+        if node_name not in all_results:
+            all_results[node_name] = _local_techsupport_failure_result(
+                node_name,
+                "Local tech support validation did not produce a result for this node.",
+                "The selected node left the local validation workflow without a reportable result.",
+            )
+            overall_status = "FAIL"
 
     # ---------------------------------------------------------------
     # STEP 5 — API checks (cluster-level, identical to non-local path)
@@ -4305,6 +4860,9 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
     timing_info = {"total_time": total_time, "node_times": {}}
 
     if all_results:
+        for node_name, node_result in all_results.items():
+            if not node_name.startswith("_"):
+                _persist_local_node_result(node_result, results_dir)
         generate_report(all_results, version, overall_status, timing_info, skipped_nodes_info)
     else:
         print(f"{FAIL} No results were collected from any nodes.")
