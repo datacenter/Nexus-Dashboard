@@ -6,7 +6,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.28 (August 4, 2026)
+Version: 1.0.29 (August 21, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -3939,7 +3939,7 @@ def check_atom0_vg(tech_file):
     
     Validates that the atom0 VG has at least 50G free space for upgrade.
     This is critical to prevent upgrade failures at 'Deploy Kubernetes Stack' stage.
-    NOTE: This check is bypassed for ND 4.1.1g and later versions.
+    This check applies only to ND 3.0.x (CSCwr43515).
     """
     print_section("Checking atom0 Virtual Group Space on {0}".format(NODE_NAME))
     update_status("running", "Checking atom0 VG space", 98)
@@ -3950,10 +3950,23 @@ def check_atom0_vg(tech_file):
     ctx = get_validation_context()
     cache = ctx.cache
     
-    # Check ND version - bypass check for 4.1.1 and later
-    if ctx.nd_version and ctx.is_version_applicable(4, 1, 1):
-        print("[PASS] ND version {0} >= 4.1.1 - atom0 VG check bypassed".format(ctx.nd_version))
-        return CheckResult.set_pass("atom0_vg_check", "atom0 vg check bypassed for ND nodes on 4.1.1 and later")
+    # CSCwr43515 applies only to ND 3.0.x. Use the parsed numeric tuple so
+    # suffixes such as 3.0.2h remain applicable without string-prefix errors.
+    if not ctx.nd_version or not ctx.nd_version_tuple:
+        print("[WARNING] Unable to determine ND version for atom0 VG check")
+        return CheckResult.set_warning(
+            "atom0_vg_check",
+            "Unable to determine ND version for atom0 VG check"
+        )
+
+    if ctx.nd_version_tuple[:2] != (3, 0):
+        print("[PASS] ND version {0} is not 3.0.x - atom0 VG check not applicable".format(ctx.nd_version))
+        return CheckResult.set_pass(
+            "atom0_vg_check",
+            "ND version {0} is not 3.0.x (check not applicable)".format(ctx.nd_version)
+        )
+
+    print("ND version {0} is 3.0.x - proceeding with atom0 VG check".format(ctx.nd_version))
     
     # Look for lvm-vgs files in storage-diag or similar directories
     vgs_patterns = [
