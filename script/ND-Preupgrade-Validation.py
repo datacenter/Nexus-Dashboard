@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.28 (August 4, 2026)
+Version: 1.0.29 (August 21, 2026)
 """
 
 import re
@@ -98,6 +98,38 @@ _LOCAL_WORKER_PROCESSES_LOCK = threading.Lock()
 PASS = "\033[1;32mPASS\033[0m"
 FAIL = "\033[1;31mFAIL\033[0m"
 WARNING = "\033[1;33mWARNING\033[0m"
+
+
+def parse_system_config_top_level(output):
+    """Parse scalar top-level fields from ``acs system-config`` output.
+
+    The command emits YAML, but the validation script intentionally has no
+    PyYAML dependency. Consumers currently need only top-level scalar fields
+    such as ``deploymentMode``, ``nodeName``, ``model``, and ``nodeRole``.
+    Indented/nested content is ignored so a nested key can never overwrite a
+    cluster- or node-level value with the same name.
+    """
+    fields = {}
+    if not isinstance(output, str):
+        return fields
+
+    for raw_line in output.splitlines():
+        if not raw_line or raw_line[0].isspace() or raw_line.startswith("-"):
+            continue
+
+        key, separator, value = raw_line.partition(":")
+        key = key.strip()
+        if not separator or not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", key):
+            continue
+
+        value = value.strip()
+        if not value:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        fields[key] = value
+
+    return fields
 
 def check_environment():
     """
@@ -438,9 +470,21 @@ class NDNodeManager:
         self.username = username
         self.password = password
         self.nodes = []
+        # Preserve discovery results separately from ``self.nodes``. Later
+        # validation stages narrow ``self.nodes`` when a node is ineligible,
+        # but cluster-wide feature applicability must still consider every
+        # active node that was originally discovered.
+        self.discovered_nodes = []
         self.connection = None
         self.version = None  # Store ND version for version-specific commands
         self.legacy_ssh_mode = False  # Track if we need ssh-rsa compatibility
+        # Collect the entry node's ``acs system-config`` once during startup.
+        # Other nodes are collected lazily only for node-specific consumers.
+        self.system_config = {}
+        self.system_config_raw = ""
+        self.system_config_error = None
+        self._system_config_cache = {}
+        self._system_config_cache_lock = threading.Lock()
 
         # SSH Connection Multiplexing Options for 30-50% performance improvement
         # Start without ssh-rsa for security, add it only if needed
@@ -659,6 +703,155 @@ class NDNodeManager:
         if self.connection:
             self.connection.close()
             self.connection = None
+
+    def get_system_config(self, node=None, refresh=False):
+        """Return cached top-level ``acs system-config`` fields for a node.
+
+        With ``node=None`` the command targets the entry address supplied to
+        the script and stores that snapshot in ``self.system_config`` for
+        cluster-level checks. Cache entries are indexed by both target address
+        and returned ``nodeName`` so a later discovered-node lookup can reuse
+        an entry collected through a VIP or hostname.
+
+        Returns:
+            tuple: (fields, error_message). A collection or parse failure
+            returns an empty dict and a non-empty error message; it is non-fatal
+            to the rest of the validation pipeline.
+        """
+        target = self.nd_ip if node is None else node.get("ip", self.nd_ip)
+        requested_name = None if node is None else node.get("name")
+        cache_keys = [("address", target)]
+        if requested_name:
+            cache_keys.append(("name", requested_name))
+
+        if not refresh:
+            with self._system_config_cache_lock:
+                for cache_key in cache_keys:
+                    cached = self._system_config_cache.get(cache_key)
+                    if cached is not None:
+                        if node is None:
+                            self.system_config = dict(cached["fields"])
+                            self.system_config_raw = cached["raw"]
+                            self.system_config_error = cached["error"] or None
+                        return dict(cached["fields"]), cached["error"]
+
+        command_label = requested_name or target
+        logger.info(f"Collecting Nexus Dashboard system configuration from {command_label}")
+        process = None
+        output = ""
+        try:
+            cmd = self.build_ssh_command(target, "acs system-config")
+            process = subprocess.Popen(
+                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            stdout, stderr = process.communicate(timeout=30)
+
+            if process.returncode != 0:
+                stderr_text = stderr.decode("utf-8", "replace").strip()
+                error = "Failed to get system config"
+                if stderr_text:
+                    error += f": {stderr_text}"
+                fields = {}
+            else:
+                output = stdout.decode("utf-8", "replace").strip()
+                fields = parse_system_config_top_level(output)
+                error = "" if fields else "acs system-config returned no parseable top-level fields"
+
+        except subprocess.TimeoutExpired:
+            if process is not None:
+                process.kill()
+                process.communicate()
+            fields = {}
+            error = "Command timeout while getting system config"
+        except Exception as exc:
+            fields = {}
+            error = f"Unexpected error while getting system config: {str(exc)}"
+
+        parsed_name = fields.get("nodeName") if fields else None
+        if (
+            not error
+            and requested_name
+            and parsed_name
+            and requested_name.strip().lower() != parsed_name.strip().lower()
+        ):
+            error = (
+                f"System config identity mismatch: requested {requested_name}, "
+                f"received {parsed_name}"
+            )
+            fields = {}
+
+        entry = {
+            "fields": fields,
+            "raw": output,
+            "error": error,
+            "source": target,
+            "collected_at": time.time(),
+        }
+        # Do not cache failures: a non-fatal startup miss must not prevent a
+        # later node-specific consumer from retrying the live command.
+        if not error:
+            with self._system_config_cache_lock:
+                self._system_config_cache[("address", target)] = entry
+                if requested_name:
+                    self._system_config_cache[("name", requested_name)] = entry
+                if parsed_name:
+                    self._system_config_cache[("name", parsed_name)] = entry
+
+        if node is None or (not error and not self.system_config):
+            self.system_config = dict(fields)
+            self.system_config_raw = output
+            self.system_config_error = error or None
+
+        if error:
+            logger.warning(f"Could not collect system configuration from {command_label}: {error}")
+        else:
+            logger.info(
+                "Cached system configuration from "
+                f"{parsed_name or command_label} "
+                f"(deploymentMode={fields.get('deploymentMode', 'unknown')})"
+            )
+
+        return dict(fields), error
+
+    def get_running_deployment_mode(self):
+        """Return one confirmed running deployment mode for active nodes.
+
+        ``deploymentMode`` is cluster-scoped, but comparing every active node's
+        cached snapshot prevents a stale or transitional node from turning the
+        reserved-tenant check into a false not-applicable PASS. Missing,
+        conflicting, or unreadable values return ``None`` so callers retain
+        their conservative fallback.
+        """
+        cluster_nodes = self.discovered_nodes or self.nodes
+        active_nodes = [
+            node for node in cluster_nodes
+            if not node.get("status") or node.get("status", "").lower() == "active"
+        ]
+        if not active_nodes:
+            mode = self.system_config.get("deploymentMode")
+            return mode.strip().lower() if isinstance(mode, str) and mode.strip() else None
+
+        modes = set()
+        for node in active_nodes:
+            fields, error = self.get_system_config(node)
+            mode = fields.get("deploymentMode") if not error else None
+            if not isinstance(mode, str) or not mode.strip():
+                logger.warning(
+                    "Could not confirm a running deployment mode for all active nodes; "
+                    "reserved tenant applicability will use the conservative fallback"
+                )
+                return None
+            modes.add(mode.strip().lower())
+
+        if len(modes) != 1:
+            logger.warning(
+                "Active nodes reported conflicting deployment modes "
+                f"({', '.join(sorted(modes))}); reserved tenant applicability "
+                "will use the conservative fallback"
+            )
+            return None
+
+        return next(iter(modes))
 
     def get_techsupport_command(self):
         """
@@ -1013,6 +1206,7 @@ class NDNodeManager:
             # Parse the node output
             logger.debug("Node output to parse: " + node_output)
             self.nodes = self._parse_node_output(node_output)
+            self.discovered_nodes = [dict(node) for node in self.nodes]
 
             # If we didn't get any nodes, inform the user instead of using hardcoded values
             if not self.nodes:
@@ -1194,54 +1388,20 @@ class NDNodeManager:
         Returns:
             tuple: (str, str, str) - (node_model, node_role, error_msg)
         """
-        try:
-            logger.info(f"Checking node model and role on {node['name']}")
-            cmd = self.build_ssh_command(node["ip"], "acs system-config")
-            process = subprocess.Popen(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-            )
-            stdout, stderr = process.communicate(timeout=30)
-
-            if process.returncode != 0:
-                error_msg = f"Failed to get system config: {stderr.decode('utf-8')}"
-                logger.error(f"{node['name']}: {error_msg}")
-                return "", error_msg
-
-            # Parse df output
-            sysconfig_output = stdout.decode("utf-8").strip()
-            logger.debug(f"{node['name']} system config:\n{sysconfig_output}")
-            model = None
-            role = None
-            for line in sysconfig_output.split("\n"):
-                # Skip header line and empty lines
-                if not line.strip():
-                    continue
-                if line.startswith("model:"):
-                    parts = line.split(":")
-                    if len(parts) != 2:
-                        continue
-                    model = parts[1]
-                if line.startswith("nodeRole:"):
-                    parts = line.split(":")
-                    if len(parts) != 2:
-                        continue
-                    role = parts[1]
-            if model is None or role is None:
-                return (
-                    "",
-                    "",
-                    f"failed to get node role or model role: {role}, model: {model}",
-                )
-            return model, role, ""
-
-        except subprocess.TimeoutExpired:
-            error_msg = "Command timeout while get system config"
+        logger.info(f"Checking node model and role on {node['name']}")
+        system_config, error_msg = self.get_system_config(node)
+        if error_msg:
             logger.error(f"{node['name']}: {error_msg}")
-            return "", error_msg
-        except Exception as e:
-            error_msg = f"Unexpected error while get system config: {str(e)}"
-            logger.exception(f"{node['name']}: {error_msg}")
-            return "", error_msg
+            return "", "", error_msg
+
+        model = system_config.get("model")
+        role = system_config.get("nodeRole")
+        if not model or not role:
+            error_msg = f"Failed to get node role or model: role={role}, model={model}"
+            logger.error(f"{node['name']}: {error_msg}")
+            return "", "", error_msg
+
+        return model, role, ""
 
     def verify_node_storage(self, node):
         """
@@ -4164,6 +4324,7 @@ def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_u
     """
     api_check_result = {"status": "NOTRUN"}
     api_check_results = {}
+    running_deployment_mode = node_manager.get_running_deployment_mode()
 
     if not password:
         logger.warning("[API] No password provided for API check")
@@ -4251,7 +4412,10 @@ def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_u
                     explanation=conn_explanation, recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
                 )
             # reserved_tenant_names: only 3.2.x or 4.1.x
-            if version and not ((_maj == 3 and _min == 2) or (_maj == 4 and _min == 1)):
+            mode_shortcut = _reserved_tenant_mode_shortcut(version, running_deployment_mode)
+            if mode_shortcut is not None:
+                api_check_results["reserved_tenant_names"] = mode_shortcut
+            elif version and not ((_maj == 3 and _min == 2) or (_maj == 4 and _min == 1)):
                 api_check_results["reserved_tenant_names"] = APICheckResult.set_pass(
                     "reserved_tenant_names", f"ND version {version} is not 3.2.x or 4.1.x, check not applicable"
                 )
@@ -4283,7 +4447,9 @@ def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_u
         logger.info(f"[API] nxapi_cert_verify_state: {result['status']}")
 
         logger.info(f"[API] Running reserved_tenant_names check (ND version {version})")
-        result = check_reserved_tenant_names(api_client, version)
+        result = check_reserved_tenant_names(
+            api_client, version, deployment_mode=running_deployment_mode
+        )
         api_check_results["reserved_tenant_names"] = result
         logger.info(f"[API] reserved_tenant_names: {result['status']}")
 
@@ -5147,6 +5313,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
     api_check_result = {"status": "NOTRUN"}  # Default status (combined for overall_status)
     api_check_results = {}  # Per-check results for report: check_name -> result dict
     api_check_thread = None
+    running_deployment_mode = node_manager.get_running_deployment_mode()
     
     # Helper function to run API check
     def run_api_check():
@@ -5224,7 +5391,10 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                         explanation=conn_explanation, recommendation=NXAPI_CERT_VERIFY_MANUAL_STEPS
                     )
                 # reserved_tenant_names: only 3.2.x or 4.1.x
-                if version and not ((_maj == 3 and _min == 2) or (_maj == 4 and _min == 1)):
+                mode_shortcut = _reserved_tenant_mode_shortcut(version, running_deployment_mode)
+                if mode_shortcut is not None:
+                    api_check_results["reserved_tenant_names"] = mode_shortcut
+                elif version and not ((_maj == 3 and _min == 2) or (_maj == 4 and _min == 1)):
                     api_check_results["reserved_tenant_names"] = APICheckResult.set_pass(
                         "reserved_tenant_names", f"ND version {version} is not 3.2.x or 4.1.x, check not applicable"
                     )
@@ -5267,7 +5437,9 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
                 logger.info(f"[API] API check PASSED (nxapi_cert_verify_state): {result['details']}")
 
             logger.info(f"[API] Starting API check for reserved tenant names with ND version {version}")
-            result = check_reserved_tenant_names(api_client, version)
+            result = check_reserved_tenant_names(
+                api_client, version, deployment_mode=running_deployment_mode
+            )
             api_check_results["reserved_tenant_names"] = result
             if result["status"] == "FAIL":
                 logger.info(f"[API] API check FAILED (reserved_tenant_names): {result['details']}")
@@ -6204,6 +6376,55 @@ def check_nxapi_cert_verify_state(api_client, version):
 # Reserved keyword prefixes that can block tenant uplift during upgrade (CSCwt87466)
 RESERVED_TENANT_PREFIXES = ("default", "all", "none", "null", "mgmt")
 
+# ND 3.2 statically selects the services deployed on the cluster. Only a
+# confirmed running mode is used as negative Orchestrator evidence; an unknown
+# value preserves the tenant-API fallback.
+ND32_NON_ORCHESTRATION_DEPLOYMENT_MODES = frozenset((
+    "ndfc",
+    "ndi",
+    "ndfc-ndi",
+))
+ND32_ORCHESTRATION_DEPLOYMENT_MODES = frozenset(("ndo", "ndo-ndi"))
+
+
+def _nd32_orchestration_deployment_state(deployment_mode):
+    """Return ``(state, normalized_mode)`` for an ND 3.2 deployment mode.
+
+    ``state`` is ``enabled`` or ``disabled`` only for a recognized ND 3.2
+    service-set value, and ``unknown`` for missing or unrecognized values.
+    """
+    if not isinstance(deployment_mode, str):
+        return "unknown", None
+
+    normalized_mode = deployment_mode.strip().lower()
+    if not normalized_mode:
+        return "unknown", None
+    if normalized_mode in ND32_ORCHESTRATION_DEPLOYMENT_MODES:
+        return "enabled", normalized_mode
+    if normalized_mode in ND32_NON_ORCHESTRATION_DEPLOYMENT_MODES:
+        return "disabled", normalized_mode
+    return "unknown", normalized_mode
+
+
+def _reserved_tenant_mode_shortcut(version, deployment_mode):
+    """Return a PASS result when ND 3.2 mode proves NDO is not deployed."""
+    if not version:
+        return None
+
+    major, minor, patch, suffix = get_version_tuple(version)
+    if not (major == 3 and minor == 2):
+        return None
+
+    state, normalized_mode = _nd32_orchestration_deployment_state(deployment_mode)
+    if state != "disabled":
+        return None
+
+    return APICheckResult.set_pass(
+        "reserved_tenant_names",
+        f"ND 3.2 deployment mode '{normalized_mode}' does not include Orchestrator "
+        "- reserved tenant name check not applicable"
+    )
+
 
 def _summarize_orchestration_clusters(data):
     """
@@ -6254,7 +6475,7 @@ def _summarize_orchestration_clusters(data):
     }
 
 
-def check_reserved_tenant_names(api_client, version):
+def check_reserved_tenant_names(api_client, version, deployment_mode=None):
     """
     API-based check for tenant names that start with reserved keyword prefixes (CSCwt87466).
 
@@ -6271,6 +6492,8 @@ def check_reserved_tenant_names(api_client, version):
     Args:
         api_client: Authenticated NDAPIClient instance
         version: ND version string (e.g., "3.2.1e")
+        deployment_mode: Running mode from ``acs system-config``. Used only on
+            ND 3.2, where the mode is the authoritative static service set.
 
     Returns:
         dict: Check result with status, details, explanation, recommendation, reference
@@ -6298,6 +6521,11 @@ def check_reserved_tenant_names(api_client, version):
 
         logger.info(f"[API] ND version {version} is applicable - running reserved tenant name check")
 
+        mode_shortcut = _reserved_tenant_mode_shortcut(version, deployment_mode)
+        if mode_shortcut is not None:
+            logger.info(f"[API] {mode_shortcut['details'][0]}")
+            return mode_shortcut
+
         if not api_client.is_authenticated():
             logger.warning("[API] API client is not authenticated")
             return APICheckResult.set_warning(
@@ -6323,6 +6551,20 @@ def check_reserved_tenant_names(api_client, version):
                     f"({str(infra_err)}); falling back to the tenant API"
                 )
         else:
+            mode_state, normalized_mode = _nd32_orchestration_deployment_state(deployment_mode)
+            if mode_state == "enabled":
+                logger.info(
+                    f"[API] ND 3.2 deployment mode '{normalized_mode}' includes Orchestrator"
+                )
+            elif normalized_mode:
+                logger.warning(
+                    f"[API] ND 3.2 deployment mode '{normalized_mode}' is not recognized; "
+                    "falling back to the tenant API"
+                )
+            else:
+                logger.warning(
+                    "[API] ND 3.2 deployment mode is unavailable; falling back to the tenant API"
+                )
             logger.info(
                 "[API] ND 3.2 uses the tenant API directly because the ND 4.1 "
                 "ACI Orchestration feature-state shortcut is not applicable"
@@ -6367,13 +6609,33 @@ def check_reserved_tenant_names(api_client, version):
             else:
                 failure = str(fetch_err)
             logger.warning(f"[API] Could not query the MSO tenant API: {failure}")
+            if major == 3 and minor == 2:
+                mode_state, normalized_mode = _nd32_orchestration_deployment_state(deployment_mode)
+                if mode_state == "enabled":
+                    fetch_explanation = (
+                        f"ND 3.2 deployment mode '{normalized_mode}' includes Orchestrator, "
+                        f"but the tenant endpoint returned {failure}."
+                    )
+                elif normalized_mode:
+                    fetch_explanation = (
+                        f"ND 3.2 deployment mode '{normalized_mode}' is not recognized, and "
+                        f"the tenant endpoint returned {failure}; Orchestrator applicability "
+                        "could not be established."
+                    )
+                else:
+                    fetch_explanation = (
+                        "The ND 3.2 deployment mode was unavailable and the tenant endpoint "
+                        f"returned {failure}; Orchestrator applicability could not be established."
+                    )
+            else:
+                fetch_explanation = (
+                    "The Infra API did not report Orchestration as disabled, and an "
+                    "HTTP error from the tenant endpoint does not establish feature state."
+                )
             return APICheckResult.set_warning(
                 check_name,
                 f"Could not retrieve Orchestration tenants ({failure})",
-                explanation=(
-                    "The Infra API did not report Orchestration as disabled, and an "
-                    "HTTP error from the tenant endpoint does not establish feature state."
-                ),
+                explanation=fetch_explanation,
                 recommendation=(
                     "Verify Orchestration service health and API accessibility, then "
                     "check tenant names manually before upgrade."
@@ -7032,8 +7294,15 @@ def main():
             print(f"{FAIL} Failed to connect to Nexus Dashboard. Please check credentials and network connectivity.")
             return 1
 
+        # Capture live system configuration once up front. The parsed top-level
+        # fields are cached on node_manager for cluster-level checks (including
+        # ND 3.2 deployment-mode applicability) and for later node consumers.
+        # Failure is non-fatal; dependent checks retain conservative fallbacks.
+        node_manager.get_system_config()
+
         # Get version information (connection already established, so legacy mode is set if needed)
         logger.info("Getting Nexus Dashboard version")
+        version = None
         try:
             import subprocess
 
@@ -7042,7 +7311,6 @@ def main():
             process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = process.communicate()
 
-            version = None
             if process.returncode == 0:
                 output = stdout.decode('utf-8')
                 match = re.search(r'Nexus Dashboard\s+(\S+)', output)
@@ -7059,6 +7327,8 @@ def main():
             print("The script was able to connect but could not parse version output from 'acs version'.")
             print("Please verify the ND is healthy and rerun the script.")
             return 1
+
+        node_manager.version = version
 
         # Determine whether the 4.1.x local-execution path is required.
         # Version 4.1.x has a rescue-user /tmp permission restriction that prevents
