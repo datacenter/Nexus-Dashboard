@@ -1,0 +1,5 @@
+name: nd-preupgrade-validation
+version: "1.0.0"
+description: "Nexus Dashboard Pre-upgrade Validation - runs health checks on the local ND cluster before upgrade"
+min_nd_version: "4.3"
+entry_point: run.sh

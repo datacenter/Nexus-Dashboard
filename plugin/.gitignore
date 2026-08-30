@@ -1,0 +1,7 @@
+dist/
+.staging/
+.build-env/
+.swims-staging/
+keys/*.pem
+*.log
+*.der
