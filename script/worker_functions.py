@@ -7,7 +7,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.30 (November 9, 2026)
+Version: 1.0.31 (November 9, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -85,11 +85,13 @@ results = {
         "ping_check": {"status": "PASS", "details": []},
         "disk_space": {"status": "PASS", "details": []},
         "pod_status": {"status": "PASS", "details": []},
+        "dcnm_lic_check": {"status": "PASS", "details": []},
         "system_health": {"status": "PASS", "details": []},
         "techsupport": {"status": "PASS", "details": []},
         "certificate_check": {"status": "PASS", "details": []},  # CA certificate bug check CSCwm35992
         "iso_check": {"status": "PASS", "details": []},  # Multiple ISOs in boot-hook check CSCwn94394
         "lvm_pvs_check": {"status": "PASS", "details": []},
+        "thindatalv_check": {"status": "PASS", "details": []},
         "persistent_ip_check": {"status": "PASS", "details": []},  # Persistent IP configuration check
         "atom0_nvme_check": {"status": "PASS", "details": []},  # NVME drive health check for physical nodes
         "atom0_vg_check": {"status": "PASS", "details": []},  # atom0 virtual group space check
@@ -915,11 +917,70 @@ def format_size(size_bytes):
 # Basic Checks
 ###############################################################
 
+def _find_exact(relative_path):
+    """Cache lookup that ignores sibling names sharing a prefix (k8-pods.yaml, k8-pods-describe).
+
+    FileCache.find_files also matches substrings, so take only paths that end with the
+    requested relative path.
+    """
+    suffix = "/" + relative_path.lstrip("/")
+    return [path for path in get_file_cache().find_files(relative_path)
+            if path.replace("\\", "/").endswith(suffix) or path == relative_path]
+
+
+def _read_k8_pods():
+    """Read the preferred extracted pods listing, parsing columns by header.
+
+    Return None when the listing is missing; an empty list means no pods.
+    Both remote and local workers use the extracted-techsupport cache.
+    """
+    files = _find_exact("k8-diag/kubectl/k8-pods")
+    if not files:
+        files = _find_exact("k8-diag/k8-pods")
+    if not files:
+        return None
+    pods = []
+    columns = None
+    with open(files[0], 'r') as stream:
+        for line in stream:
+            fields = line.split()
+            if all(name in fields for name in ("NAMESPACE", "NAME", "READY", "STATUS")):
+                columns = dict((name, fields.index(name)) for name in
+                               ("NAMESPACE", "NAME", "READY", "STATUS"))
+                continue
+            if columns is not None and len(fields) > max(columns.values()):
+                pods.append(dict((name, fields[index]) for name, index in columns.items()))
+    return pods
+
+
+def _is_san_deployment():
+    """An explicit persona wins over the older dcnm-san pod indicator."""
+    for path in _find_exact("acs-checks/acs_system_config"):
+        with open(path, 'r') as stream:
+            for line in stream:
+                match = re.match(r'^\s*persona:\s*(.*?)\s*$', line)
+                if match:
+                    persona = match.group(1)
+                    return persona.upper() == "SAN", "persona: {0}".format(persona)
+    for pod in _read_k8_pods() or []:
+        if pod["NAME"].startswith("dcnm-san-"):
+            return True, "pod {0}/{1}".format(pod["NAMESPACE"], pod["NAME"])
+    return False, "No SAN indicator found"
+
+
 def check_subnet_isolation():
     """Check if data network and management network are in different subnets"""
     print_section("Checking Network Isolation on {0}".format(NODE_NAME))
     update_status("running", "Checking subnet isolation", 93)
     
+    is_san, evidence = _is_san_deployment()
+    if is_san:
+        results["checks"]["subnet_check"] = {
+            "status": "PASS",
+            "details": ["SAN deployment ({0}): the management/data subnet separation requirement does not apply".format(evidence)]
+        }
+        return
+
     # Get node information
     cmd = "acs show nodes"
     output = run_command(cmd)
@@ -3257,6 +3318,97 @@ def check_lvm_pvs(tech_file):
             "details": ["No empty Elasticsearch PVs found"]
         }
         return False
+
+@robust_check("dcnm_lic_check")
+def check_dcnm_lic(tech_file):
+    """Detect unready NDFC licensing pods on every ND version (CSCwx53713)."""
+    print_section("Dcnm Lic Readiness Check (CSCwx53713) on {0}".format(NODE_NAME))
+    update_status("running", "Checking dcnm-lic readiness", 95)
+    pods = _read_k8_pods()
+    result = {"status": "PASS", "details": []}
+    results["checks"]["dcnm_lic_check"] = result
+    if pods is None:
+        result.update(status="WARNING", details=["k8-pods not found"])
+    else:
+        licensing_pods = [pod for pod in pods if pod["NAME"].startswith("dcnm-lic-")]
+        for pod in licensing_pods:
+            ready = re.match(r'^(\d+)/(\d+)$', pod["READY"])
+            if ready and int(ready.group(1)) < int(ready.group(2)):
+                result["details"].append("Pod {0}/{1} is {2} but not Ready ({3})".format(
+                    pod["NAMESPACE"], pod["NAME"], pod["STATUS"], pod["READY"]))
+        if result["details"]:
+            result.update(
+                status="FAIL",
+                explanation="Due to CSCwx53713, an ND upgrade can fail and require a re-image and restore when the NDFC licensing pod (dcnm-lic) is Running but not Ready before the upgrade.",
+                recommendation="Do not start the upgrade. Contact Cisco TAC to recover the dcnm-lic pod before upgrading.",
+                reference="https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwx53713")
+        elif licensing_pods:
+            result["details"] = ["All dcnm-lic pods are Ready"]
+        else:
+            result["details"] = ["No dcnm-lic pod found (NDFC not deployed), check not applicable"]
+    print("[{0}] {1}".format(result["status"], "; ".join(result["details"])))
+    return result["status"] != "FAIL"
+
+
+@robust_check("thindatalv_check")
+def check_thindatalv(tech_file):
+    """Check the pre-4.0 ThinDataLV pool's Data% (CSCww74444)."""
+    print_section("ThinDataLV Free Space Check (CSCww74444) on {0}".format(NODE_NAME))
+    update_status("running", "Checking ThinDataLV free space", 95)
+    ctx = get_validation_context()
+    result = {"status": "PASS", "details": []}
+    results["checks"]["thindatalv_check"] = result
+    if ctx.nd_version_tuple and ctx.is_version_applicable(4, 0):
+        result["details"] = ["ND 4.x does not use ThinDataLV, check not applicable"]
+    else:
+        files = _find_exact("lvm-lvs")
+        if not files:
+            result.update(status="WARNING" if ctx.nd_version_tuple else "PASS",
+                          details=["lvm-lvs not found"])
+        else:
+            data_span = None
+            data_percent = None
+            found = False
+            with open(files[0], 'r') as stream:
+                for line in stream:
+                    headers = list(re.finditer(r'\S+', line))
+                    names = [token.group() for token in headers]
+                    if "LV" in names and "Data%" in names:
+                        index = names.index("Data%")
+                        # Include the leading padding: numeric values are right aligned.
+                        start = headers[index - 1].end() if index else 0
+                        end = headers[index + 1].start() if index + 1 < len(headers) else len(line)
+                        data_span = (start, end)
+                        continue
+                    fields = line.split()
+                    if not fields or fields[0] != "ThinDataLV":
+                        continue
+                    found = True
+                    if data_span is not None:
+                        value = line[data_span[0]:data_span[1]].strip()
+                        if re.match(r'^\d+(?:\.\d+)?$', value):
+                            data_percent = float(value)
+                    else:
+                        # Standard lvs layout: LV VG Attr LSize, then optional Pool/Origin.
+                        for token in fields[4:]:
+                            if re.match(r'^\d+\.\d+$', token):
+                                data_percent = float(token)
+                                break
+                    break
+            if data_percent is None:
+                result.update(status="WARNING", details=["Could not parse ThinDataLV Data%" if found else "ThinDataLV not found"])
+            elif data_percent >= 67.0:
+                result.update(
+                    status="FAIL",
+                    details=["ThinDataLV (vg_ifc0) is {0:.2f}% used, only {1:.2f}% free".format(data_percent, 100.0 - data_percent)],
+                    explanation="Due to CSCww74444, the upgrade can stall at 'Disable Services' and fail when the ThinDataLV thin pool has too little free space (the upgrade requires at least 10% free; at least 33% free is recommended before upgrading).",
+                    recommendation="Reboot the ND nodes one at a time to release temporary data held in the thin pool, wait for the cluster to be healthy, and rerun this script. If ThinDataLV is still 67% or more used, contact Cisco TAC before upgrading.",
+                    reference="https://bst.cloudapps.cisco.com/bugsearch/bug/CSCww74444")
+            else:
+                result["details"] = ["ThinDataLV is {0:.2f}% used ({1:.2f}% free)".format(data_percent, 100.0 - data_percent)]
+    print("[{0}] {1}".format(result["status"], "; ".join(result["details"])))
+    return result["status"] != "FAIL"
+
 
 def get_cluster_node_count():
     """
@@ -5931,6 +6083,8 @@ def main():
                 results["checks"]["pod_status"]["status"] = "FAIL"
                 results["checks"]["pod_status"]["details"] = ["Check failed: {0}".format(str(e))]
                 
+            check_dcnm_lic(dest_path)
+
             try:
                 check_system_health(dest_path)
             except Exception as e:
@@ -5994,6 +6148,8 @@ def main():
                 results["checks"]["lvm_pvs_check"]["status"] = "FAIL"
                 results["checks"]["lvm_pvs_check"]["details"] = ["No empty Elasticsearch PVs found"]
                 
+            check_thindatalv(dest_path)
+
             try:
                 check_persistent_ip_config(dest_path)
             except Exception as e:

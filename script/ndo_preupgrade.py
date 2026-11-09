@@ -5,7 +5,7 @@ Must sit next to ND-Preupgrade-Validation.py; loaded only for --ndo modes.
 import sys
 
 NDO_ADDON_INTERFACE = 1
-NDO_SCRIPT_VERSION = "1.0.30-ndo-addon.1"
+NDO_SCRIPT_VERSION = "1.0.31-ndo-addon.1"
 
 
 def bind_controller(controller):

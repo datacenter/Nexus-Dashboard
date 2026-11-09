@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.30 (November 9, 2026)
+Version: 1.0.31 (November 9, 2026)
 """
 
 import re
@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # The optional NDO add-on is never inspected in default mode.
 NDO_ADDON_INTERFACE = 1
-NDO_SCRIPT_VERSION = "1.0.30-ndo-addon.1"
+NDO_SCRIPT_VERSION = "1.0.31-ndo-addon.1"
 _NDO_ADDON = None
 
 
@@ -6891,6 +6891,7 @@ def _aggregate_report_checks(all_results):
         "disk_space",
         "storage_device_check",  # Storage check - cluster-level (after disk_space)
         "pod_status", 
+        "dcnm_lic_check",
         "system_health",
         "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
         "nxapi_cert_verify_state_check",  # API check - cluster-level (after telemetry)
@@ -6902,6 +6903,7 @@ def _aggregate_report_checks(all_results):
         "certificate_check",
         "iso_check",
         "lvm_pvs_check",
+        "thindatalv_check",
         "atom0_nvme_check",
         "atom0_vg_check",
         "vnd_app_large_check"
@@ -7211,7 +7213,10 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             check_status = check_info["status"]
             
             # Format check name for display
-            display_name = check_info.get("name", check_name.replace("_", " ").title())
+            display_name = check_info.get("name", {
+                "thindatalv_check": "ThinDataLV Free Space Check",
+                "dcnm_lic_check": "Dcnm Lic Readiness Check",
+            }.get(check_name, check_name.replace("_", " ").title()))
             
             # Determine the status indicator for console
             if check_status == "FAIL":
