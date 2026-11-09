@@ -44,26 +44,28 @@ Note: The cloning instructions differ slightly from the video now that the repo 
 | 2 | Version | Verify all cluster nodes are running the same version | |
 | 3 | Node status | Verify all cluster nodes are in an Active state | |
 | 4 | Ping check | Verify node can ping all Mgmt and Data IPs in the cluster | |
-| 5 | Subnet check | Verify Mgmt and Data interfaces are on different subnets | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-311/nd-prerequisites-platform-31x.html#concept_fdf_fxg_4mb) |
+| 5 | Subnet check | Verify Mgmt and Data interfaces are on different subnets (not applicable to SAN deployments) | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-311/nd-prerequisites-platform-31x.html#concept_fdf_fxg_4mb) |
 | 6 | Persistent IP check | Verify at lest 5 Persistent IP address are configured in data-external-services | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc) |
 | 7 | Disk space | Verify all directories are under 80% utilization (`/logs/k8/kubelet`: 90% on ND 4.3 and later, where kubelet log rotation keeps that volume near 80%) | |
 | 8 | Storage device check | Verify all storage devices exist | |
 | 9 | Pod status | Verify all Pods and Services are in a healthy state | |
-| 10 | System health | Verify all nodes are healthy using 'acs health' command | |
-| 11 | Telemetry inband EPG check | Verify ACI NDI sites have inband EPG populated | [CSCws23607](https://bst.cisco.com/bugsearch/bug/CSCws23607) |
-| 12 | Nxapi Cert Verify State check | Verify Nxapi Cert is disabled | |
-| 13 | NXOS Discovery Service | Verify cisco-ndfc k8 App is not stuck in Disabling | [CSCwm97680](https://bst.cisco.com/bugsearch/bug/CSCwm97680) |
-| 14 | Backup failure check | Verify latest backup is not in Failed or InProgress state | [CSCwq57968](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwq57968), [CSCwm96512](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwm96512) |
-| 15 | Nameserver duplicate check | Verify no duplicate nameservers exist in acs_system_config | |
-| 16 | Legacy NDI ElasticSearch | Verify legacy NDI ElasticSearch LV does not exist for non-NDI deployments | [CSCwr43810](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr43810) |
-| 17 | NTP authentication check | Verify no NTP servers have authentication enabled | [CSCwr97181](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr97181) |
-| 18 | Certificate check | Verify no certificates have non-alphanumeric characters | [CSCwm35992](https://bst.cisco.com/bugsearch/bug/CSCwm35992) |
-| 19 | ISO check | Verify multiple ISOs aren't found in boothook | [CSCwn94394](https://bst.cisco.com/bugsearch/bug/CSCwn94394) |
-| 20 | Lvm Pvs check | Verify no empty ElasticSearch PVs are found | [CSCwe91228](https://bst.cisco.com/bugsearch/bug/CSCwe91228) |
-| 21 | atom0 NVME check | Verify no NVME drive hardware failures are present in Physical node setups | |
-| 22 | atom0 vg check | Verify there is more than 50% free space in atom0 virtual group | [CSCwr43515](https://bst.cisco.com/bugsearch/bug/CSCwr43515) |
-| 23 | vND App Large check | Verify vND SE-VIRTUAL-APP is not using Large Profile | [CSCws77374](https://bst.cisco.com/bugsearch/bug/CSCws77374), [Documentation 1](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc), [Documentation 2](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-321/nd-deploy-esx-32x.html#concept_zkv_y2g_mmb) |
-| 24 | Tenant reserved keyword check | Verify NDO/MSO tenants do not have reserved keyword prefix | [CSCwt87466](https://bst.cisco.com/bugsearch/bug/CSCwt87466) |
+| 10 | dcnm-lic readiness check | Verify the NDFC licensing pod (dcnm-lic), if present, is Ready (READY x/x) and not just Running | [CSCwx53713](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwx53713) |
+| 11 | System health | Verify all nodes are healthy using 'acs health' command | |
+| 12 | Telemetry inband EPG check | Verify ACI NDI sites have inband EPG populated | [CSCws23607](https://bst.cisco.com/bugsearch/bug/CSCws23607) |
+| 13 | Nxapi Cert Verify State check | Verify Nxapi Cert is disabled | |
+| 14 | NXOS Discovery Service | Verify cisco-ndfc k8 App is not stuck in Disabling | [CSCwm97680](https://bst.cisco.com/bugsearch/bug/CSCwm97680) |
+| 15 | Backup failure check | Verify latest backup is not in Failed or InProgress state | [CSCwq57968](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwq57968), [CSCwm96512](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwm96512) |
+| 16 | Nameserver duplicate check | Verify no duplicate nameservers exist in acs_system_config | |
+| 17 | Legacy NDI ElasticSearch | Verify legacy NDI ElasticSearch LV does not exist for non-NDI deployments | [CSCwr43810](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr43810) |
+| 18 | NTP authentication check | Verify no NTP servers have authentication enabled | [CSCwr97181](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCwr97181) |
+| 19 | Certificate check | Verify no certificates have non-alphanumeric characters | [CSCwm35992](https://bst.cisco.com/bugsearch/bug/CSCwm35992) |
+| 20 | ISO check | Verify multiple ISOs aren't found in boothook | [CSCwn94394](https://bst.cisco.com/bugsearch/bug/CSCwn94394) |
+| 21 | Lvm Pvs check | Verify no empty ElasticSearch PVs are found | [CSCwe91228](https://bst.cisco.com/bugsearch/bug/CSCwe91228) |
+| 22 | ThinDataLV free space check | Verify the ThinDataLV volume has at least 33% free space (less than 67% used). Applies to ND 2.x and 3.x only; ND 4.x does not use ThinDataLV | [CSCww74444](https://bst.cloudapps.cisco.com/bugsearch/bug/CSCww74444) |
+| 23 | atom0 NVME check | Verify no NVME drive hardware failures are present in Physical node setups | |
+| 24 | atom0 vg check | Verify there is more than 50% free space in atom0 virtual group | [CSCwr43515](https://bst.cisco.com/bugsearch/bug/CSCwr43515) |
+| 25 | vND App Large check | Verify vND SE-VIRTUAL-APP is not using Large Profile | [CSCws77374](https://bst.cisco.com/bugsearch/bug/CSCws77374), [Documentation 1](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-deploy-upgrade-41x.html#post-upgrade-tasks__section_vbs_1kz_jgc), [Documentation 2](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-321/nd-deploy-esx-32x.html#concept_zkv_y2g_mmb) |
+| 26 | Tenant reserved keyword check | Verify NDO/MSO tenants do not have reserved keyword prefix | [CSCwt87466](https://bst.cisco.com/bugsearch/bug/CSCwt87466) |
 
 ## Dependencies and Installation
 
@@ -317,36 +319,38 @@ PASS Cleaned up temporary files on ND3
 Total validation time: 4 min 2 sec
 Report generated on: 2026-02-19 18:50:26
 
-[Check  1/23] Techsupport...                                                      PASS
-[Check  2/23] Version Check...                                                    PASS
-[Check  3/23] Node Status...                                                      PASS
-[Check  4/23] Ping Check...                                                       PASS
-[Check  5/23] Subnet Check...                                                     PASS
-[Check  6/23] Persistent Ip Check...                                              PASS
-[Check  7/23] Disk Space...                                                       PASS
-[Check  8/23] Storage Device Check...                                             PASS
-[Check  9/23] Pod Status...                                                       PASS
-[Check 10/23] System Health...                                                    PASS
-[Check 11/23] Telemetry Inband Epg Check...                                       PASS
-[Check 12/23] Nxapi Cert Verify State Check...                                    PASS
-[Check 13/23] Nxos Discovery Service...                                           PASS
-[Check 14/23] Backup Failure Check...                                             PASS
-[Check 15/23] Nameserver Duplicate Check...                                       PASS
-[Check 16/23] Legacy Ndi Elasticsearch Check...                                   PASS
-[Check 17/23] Ntp Auth Check...                                                   PASS
-[Check 18/23] Certificate Check...                                                PASS
-[Check 19/23] Iso Check...                                                        PASS
-[Check 20/23] Lvm Pvs Check...                                                    PASS
-[Check 21/23] Atom0 Nvme Check...                                                 PASS
-[Check 22/23] Atom0 Vg Check...                                                   PASS
-[Check 23/23] Vnd App Large Check...                                              PASS
-[Check 24/24] Reserved Tenant Names Check...                                      PASS
+[Check  1/26] Techsupport...                                                      PASS
+[Check  2/26] Version Check...                                                    PASS
+[Check  3/26] Node Status...                                                      PASS
+[Check  4/26] Ping Check...                                                       PASS
+[Check  5/26] Subnet Check...                                                     PASS
+[Check  6/26] Persistent Ip Check...                                              PASS
+[Check  7/26] Disk Space...                                                       PASS
+[Check  8/26] Storage Device Check...                                             PASS
+[Check  9/26] Pod Status...                                                       PASS
+[Check 10/26] Dcnm Lic Readiness Check...                                         PASS
+[Check 11/26] System Health...                                                    PASS
+[Check 12/26] Telemetry Inband Epg Check...                                       PASS
+[Check 13/26] Nxapi Cert Verify State Check...                                    PASS
+[Check 14/26] Nxos Discovery Service...                                           PASS
+[Check 15/26] Backup Failure Check...                                             PASS
+[Check 16/26] Nameserver Duplicate Check...                                       PASS
+[Check 17/26] Legacy Ndi Elasticsearch Check...                                   PASS
+[Check 18/26] Ntp Auth Check...                                                   PASS
+[Check 19/26] Certificate Check...                                                PASS
+[Check 20/26] Iso Check...                                                        PASS
+[Check 21/26] Lvm Pvs Check...                                                    PASS
+[Check 22/26] ThinDataLV Free Space Check...                                      PASS
+[Check 23/26] Atom0 Nvme Check...                                                 PASS
+[Check 24/26] Atom0 Vg Check...                                                   PASS
+[Check 25/26] Vnd App Large Check...                                              PASS
+[Check 26/26] Reserved Tenant Names Check...                                      PASS
 
 ================================================================================
 REPORT SUMMARY
 ================================================================================
 
-PASS                         : 24
+PASS                         : 26
 WARNING - ATTENTION REQUIRED : 0
 FAIL - UPGRADE FAILURE!!     : 0
 
