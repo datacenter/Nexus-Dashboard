@@ -7,6 +7,7 @@ The script can be run from any Linux server with the required dependencies. If A
 - The script can be run against any ND versions starting from Version 2.1.
 - Due to a /tmp permissions discrepancy in ND version 4.1.1g, running the script against 4.1.1g setup triggers a new mode where the tech supports are downloaded to the local host that is running the script. This behavior is specific to 4.1.1g setups and does not apply to any other version.
 - Port 443 connectivity is required between the host running the script and the Nexus Dashboard cluster for API related checks to run successfully. If Port 443 is not open, the API related checks will not work, but all other checks will complete successfully.
+- **NDO / MSO validation (optional, `--ndo`):** the two base files plus `ndo_preupgrade.py` validate Nexus Dashboard Orchestrator (NDO, formerly MSO). This includes live from an ND cluster, offline from a techsupport or backup, and migration utilities for legacy MSO backups. NDO modes need **Python 3.8 or later** and no extra packages. See [NDO validation](#ndo-validation-optional---ndo).
 - If you have feedback or are encountering an issue running the script, please send an email to nd-preupgrade-validation@cisco.com
 
 **Ports required to be open between the local host and the ND cluster:**
@@ -28,7 +29,9 @@ Note: The cloning instructions differ slightly from the video now that the repo 
   - [Dependencies Overview](#dependencies-overview)
 - [Usage](#usage)
   - [Compatibility Notes](#compatibility-notes)
+  - [Passwords in scripts and automation](#passwords-in-scripts-and-automation)
   - [Example Run](#example-run)
+- [NDO validation (optional, `--ndo`)](#ndo-validation-optional---ndo)
 - [Support](#support)
 
 ## Checks
@@ -43,7 +46,7 @@ Note: The cloning instructions differ slightly from the video now that the repo 
 | 4 | Ping check | Verify node can ping all Mgmt and Data IPs in the cluster | |
 | 5 | Subnet check | Verify Mgmt and Data interfaces are on different subnets | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/3x/deployment/cisco-nexus-dashboard-and-services-deployment-guide-311/nd-prerequisites-platform-31x.html#concept_fdf_fxg_4mb) |
 | 6 | Persistent IP check | Verify at lest 5 Persistent IP address are configured in data-external-services | [Documentation](https://www.cisco.com/c/en/us/td/docs/dcn/nd/4x/deployment/cisco-nexus-dashboard-deployment-guide-41x/nd-prerequisites-41x.html#concept_zkj_3hj_cgc) |
-| 7 | Disk space | Verify all directories are under 70% utilization | |
+| 7 | Disk space | Verify all directories are under 80% utilization (`/logs/k8/kubelet`: 90% on ND 4.3 and later, where kubelet log rotation keeps that volume near 80%) | |
 | 8 | Storage device check | Verify all storage devices exist | |
 | 9 | Pod status | Verify all Pods and Services are in a healthy state | |
 | 10 | System health | Verify all nodes are healthy using 'acs health' command | |
@@ -65,7 +68,20 @@ Note: The cloning instructions differ slightly from the video now that the repo 
 ## Dependencies and Installation
 
 ### Python Requirements
-The main script requires Python 3.7+ while the worker script is compatible with Python 2.7+ to accommodate older ND node versions.
+
+| What you run | Python on the host running the script |
+|---|---|
+| ND validation (default, no `--ndo`) | **Python 3.7+** (also works on 3.6, the default `python3` on RHEL 8) |
+| Any NDO mode (`--ndo ...`) | **Python 3.8+** |
+
+The worker script runs on the ND nodes and is compatible with Python 2.7+ to accommodate older ND node versions. The ND nodes provide it; nothing extra is needed there.
+
+No mode needs additional pip packages; NDO modes use only the Python standard library. If you start an NDO mode on an older Python, the script stops before connecting to anything and says which Python it needs.
+
+**Getting Python 3.8+ for NDO modes** (these are OS packages, not pip):
+- RHEL / Rocky / Alma 8: `sudo dnf install python39`, then run `python3.9 ND-Preupgrade-Validation.py --ndo ...`
+- RHEL 9, Ubuntu 20.04 and later, and current macOS already ship Python 3.8 or later as `python3`.
+- Check your version with `python3 --version`.
 
 ### Installing Dependencies
 Most dependencies are part of Python's standard library. For the few external dependencies:
@@ -103,9 +119,30 @@ Most dependencies are part of Python's standard library. For the few external de
 
 Place the main script `ND-Preupgrade-Validation.py` and the worker script `worker_functions.py` in the same directory and execute the main script with the command `python ND-Preupgrade-Validation.py` or `python3 ND-Preupgrade-Validation.py`
 
+Default ND validation needs only these two files. Every NDO mode (`--ndo`), including
+live, offline and standalone utilities, also needs `ndo_preupgrade.py` from the same
+release in that directory. NDO requires Python 3.8+ and the standard library only.
+The controller loads the add-on only when `--ndo` is supplied; `--help` works without it.
+
+If the add-on is missing, NDO exits with code 1 before logging or connecting:
+
+```text
+Missing ndo_preupgrade.py: it must be in the same folder as ND-Preupgrade-Validation.py. ND-only validation does not need it.
+```
+
+A release/interface mismatch also exits with code 1: download the controller and
+add-on from the same release.
+
 ### Compatibility Notes
-- The main script is currently only compatible with Python 3.7+ but will be modified in the future.
+- ND validation requires Python 3.7+ on the host running the script; it also runs on 3.6. NDO modes require Python 3.8+. See [Python Requirements](#python-requirements).
 - The worker script is Python 2.7+ compatible to accommodate ND nodes on versions prior to 3.0.
+
+### Passwords in scripts and automation
+By default the script prompts for passwords; this is the recommended way. For unattended runs, set the password in the environment instead of on the command line:
+- `ND_RESCUE_PASSWORD`: rescue-user password
+- `ND_API_PASSWORD`: ND API password (optional; defaults to the rescue-user password)
+
+The script reads these once and removes them from its environment. `-p/--password` and `--api-password` still work, but they are deprecated and print a warning. Any user on the same host can read a password given on the command line from the process list, and it is also saved in your shell history.
 
 ### Example Run:
 ```
@@ -336,6 +373,106 @@ total 156K
 -rw-r--r--. 1 root root 7.8K May  1 02:50 validation_details.json
 -rw-r--r--. 1 root root 2.4K May  1 02:50 validation_summary.txt
 ```
+
+## NDO validation (optional, `--ndo`)
+
+Nexus Dashboard Orchestrator (NDO, formerly Multi-Site Orchestrator, MSO) validation is opt-in: add `--ndo`. Without `--ndo` the script behaves exactly as described above. NDO modes need Python 3.8+ and the sibling `ndo_preupgrade.py` add-on, with no extra packages.
+
+The NDO checks and utilities support upgrade migrations, including from very old MSO releases (2.x and 3.x) to modern NDO.
+
+| Mode | Command | What it does |
+|---|---|---|
+| Live ND + NDO | `python3 ND-Preupgrade-Validation.py --ndo --ndip <ND>` | All ND checks above, plus NDO checks on a fresh NDO database export collected during the run |
+| Offline validation | `python3 ND-Preupgrade-Validation.py --ndo --tech-support <file>` | NDO checks on a file you already have. No ND connection and no credentials needed |
+| Extract a backup | `python3 ND-Preupgrade-Validation.py --ndo --extract-backup <file> --output-dir <dir>` | Pulls the NDO Mongo backup out of a techsupport and prints its path and source release |
+| Convert a legacy backup | `python3 ND-Preupgrade-Validation.py --ndo --convert-backup <file> --output-dir <dir> [--validation-only] [--run-ndo-checks --source-release "<MSO/NDO x.y.z>"] [--name <name>]` | Legacy MSO/NDO backup → validation JSON, so you can run the NDO checks on old data. A current-format database dump → a backup NDO can restore. |
+| Native archive to JSON | `python3 ND-Preupgrade-Validation.py --ndo --mongodump-to-json <archive> --output-dir <dir> [--json-mode relaxed\|canonical]` | Converts a native `mongodump` archive to MongoDB Extended JSON |
+| Standalone checks | `python3 ND-Preupgrade-Validation.py --ndo --check-backup <backup> --source-release "<NDO x.y.z>"` (or `--check-defects`) | Runs only the NDO data checks, or only the configuration checks, on a Mongo backup |
+
+**Migrating from old MSO/NDO releases.** Validate first, then follow Cisco's restore-based migration: take a backup on the old release and restore the **original** backup on the intermediate release from the [Cisco migration guide](https://www.cisco.com/c/en/us/td/docs/dcn/mso/use-case/migrating-from-older-mso-ndo-to-nd.html). NDO converts legacy configuration itself during the restore. The converter does not create importable backups from legacy data. Use it to validate the data with `--convert-backup <file> --validation-only --run-ndo-checks` (add `--source-release "<MSO/NDO x.y.z>"` if the release cannot be detected).
+
+**Offline inputs.** These are recognized by content, not file name:
+- unified ND techsupports (`.tar`, `.tgz`);
+- standalone MSO/NDO techsupports (`msc_report_*.zip`);
+- NDO backups (`msc-backup-*.tar.gz`, `*.archive`);
+- direct Mongo JSON exports.
+
+The input file is never modified.
+
+**What is checked.**
+- **Data checks:** backup archive integrity, required Mongo collections, and JSON document integrity.
+- **Configuration checks:** release-aware checks for known upgrade issues:
+  - external-network references;
+  - application BD names;
+  - contract-filter EtherType;
+  - SR-MPLS external subnet scope;
+  - preferred-group shadow EPGs;
+  - SR-MPLS L3Out dependency order;
+  - tenant/site associations;
+  - CloudSec UDP port control;
+  - application-policy reference ownership.
+
+  Only the checks that apply to your upgrade route run. The report shows the recommended upgrade route, based on the Cisco ND 4.3.1 upgrade matrix.
+- **Snapshot age:** an NDO snapshot older than 24 hours is flagged, because you should validate current data.
+
+**Results.**
+- **Live and offline validation** write one report to `final-results/validation_summary.txt`
+  and `final-results/validation_details.json`. With `--ndo`, NDO checks follow ND checks in
+  the same numbered list, with one REPORT SUMMARY, NEXT STEPS block and UPGRADE ROUTE.
+  Offline validation uses the same layout with only NDO rows.
+- Each NDO finding includes an explanation and recommendation. The terminal and summary
+  show an aligned table of at most five affected objects per finding; `ndo-findings.txt`
+  contains every affected object. Snapshot timestamps use UTC and ages use hours, days or years.
+- Per-node `<node>_output.log`, `<node>_results.json`, and `nd_validation_debug.log` remain
+  at the top level for troubleshooting. NDO configuration diagnostics and retained export
+  archives are under `ndo-evidence/`. Export bundle size limits still apply.
+- `validation_details.json` retains the existing ND check mapping. Only `--ndo` adds an
+  `ndo` object, containing NDO checks with global check numbers, full findings, snapshot,
+  upgrade route, coverage and summary counts. Incomplete NDO coverage is `status: "WARNING"`
+  with `coverage: "incomplete"`. A check that does not apply to the release is PASS and
+  explains why.
+
+For example, the end of a live report with 24 ND checks and four NDO checks looks like:
+
+```text
+[Check 25/28] NDO: Backup Archive Integrity...  PASS
+[Check 26/28] NDO: Required Collections...      PASS
+[Check 27/28] NDO: Document Integrity...        PASS
+[Check 28/28] NDO: Configuration Checks...      WARNING - ATTENTION REQUIRED
+  Finding 1 of 1: External network reference consistency (27 affected objects)
+  Schema    Template  Site    Bridge domain  L3Out
+  --------  --------  ------  -------------  -------
+  Schema-A  Tmpl-1    Site-1  BD-web         L3Out-1
+  Schema-A  Tmpl-1    Site-1  BD-app         L3Out-2
+  Schema-A  Tmpl-1    Site-1  BD-db          L3Out-3
+  Schema-A  Tmpl-1    Site-2  BD-web         L3Out-4
+  Schema-A  Tmpl-1    Site-2  BD-app         L3Out-5
+  ... 22 more (full list: final-results/ndo-findings.txt)
+
+  Explanation:
+  A bridge domain names an L3Out but has no saved reference to it.
+
+  Recommendation:
+  Re-select the L3Out in NDO and redeploy the affected template.
+```
+
+The usual `nd-preupgrade-validation-results_*.tgz` bundle is created in the current
+working directory. It includes both reports, per-node files, debug log, complete
+NDO findings and NDO evidence within the configured archive size limit. Upload it
+to a TAC SR when asked. The duplicate `summary.txt`, `details.json` and
+`diagnostics/nd/` copies are no longer produced by live/offline validation.
+Default mode without `--ndo` retains its existing report, file layout and behavior.
+
+**Standalone utilities.** `--extract-backup`, `--convert-backup`, `--mongodump-to-json`,
+`--check-backup` and `--check-defects` keep their existing output formats and destinations.
+The unified report applies to live/offline validation only.
+
+**Exit codes (live/offline NDO validation).**
+
+- **0:** no failed checks and complete NDO coverage. Review warnings.
+- **2:** a failed check or incomplete NDO coverage. Incomplete coverage is displayed as
+  `WARNING - COULD NOT FULLY EVALUATE` and included in the WARNING summary count.
+- **1:** execution or input error. Argument usage errors return **2**.
 
 ## Support
 

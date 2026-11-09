@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 Worker script for Nexus Dashboard Pre-upgrade Validation
 
@@ -6,7 +7,7 @@ This is a standalone script that runs on each node to perform validation checks.
 It is loaded and packaged by the main script at runtime.
 
 Author: joelebla@cisco.com
-Version: 1.0.29 (August 21, 2026)
+Version: 1.0.30 (November 9, 2026)
 """
 
 # Future imports for Python 2/3 compatibility
@@ -26,6 +27,12 @@ import traceback
 import signal
 import atexit
 import shutil
+import errno
+import stat
+import tarfile
+import gzip
+import tempfile
+import uuid
 
 try:
     from shlex import quote as shell_quote
@@ -611,74 +618,8 @@ def process_large_file_streaming(filepath, search_patterns, max_matches=100):
     
     return matches
 
-def cleanup_processes():
-    """Cleanup any leftover processes spawned by this script"""
-    try:
-        # Get our process ID
-        our_pid = os.getpid()
-        print("Cleaning up processes for PID {0}".format(our_pid))
-        
-        # First try to find any children directly using ps
-        try:
-            cmd = "ps -eo pid,ppid,stat,cmd | grep {0}".format(our_pid)
-            process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-            stdout, stderr = process.communicate()
-            ps_output = stdout
-            
-            # Extract child PIDs
-            child_pids = []
-            for line in ps_output.strip().split('\n'):
-                if str(our_pid) in line and "grep" not in line:
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[1] == str(our_pid):
-                        child_pids.append(parts[0])
-            
-            # Try to terminate children
-            for pid in child_pids:
-                try:
-                    print("Terminating child process {0}".format(pid))
-                    kill_process = subprocess.Popen(
-                        "kill -TERM {0}".format(pid),
-                        shell=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
-                    kill_process.communicate()
-                except:
-                    pass
-            
-            # If there were children, wait briefly then check again
-            if child_pids:
-                time.sleep(1)
-                
-                # Check if any processes still need SIGKILL
-                for pid in child_pids:
-                    try:
-                        if os.path.exists("/proc/{0}".format(pid)):
-                            print("Force killing child process {0}".format(pid))
-                            kill_process = subprocess.Popen(
-                                "kill -9 {0}".format(pid),
-                                shell=True,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE
-                            )
-                            kill_process.communicate()
-                    except:
-                        pass
-        except Exception as e:
-            print("Error finding child processes: {0}".format(e))
-        
-        # Never use a system-wide pkill here. Parallel node workers may be
-        # extracting at the same time; cleanup must remain scoped to child PIDs.
-            
-    except Exception as e:
-        print("Error during process cleanup: {0}".format(e))
+# (A duplicate cleanup_processes() that was always overridden by the later
+# definition has been removed; see deliberate fix 7.)
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C interruption"""
@@ -695,9 +636,12 @@ def update_status(status_value, operation, progress=0):
     status["progress"] = progress
     status["last_updated"] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
+    # Atomic replace: the controller polls this file while the worker runs.
+    temporary_path = "{0}.tmp.{1}".format(STATUS_FILE, os.getpid())
     try:
-        with open(STATUS_FILE, 'w') as f:
+        with open(temporary_path, 'w') as f:
             json.dump(status, f)
+        os.rename(temporary_path, STATUS_FILE)
     except Exception as e:
         print("Error updating status file: {0}".format(str(e)))
 
@@ -1352,6 +1296,38 @@ def check_node_status():
         results["checks"]["node_status"]["status"] = "WARNING"
         results["checks"]["node_status"]["details"].append("Could not get node status information")
 
+# Upstream bug fix: ignore the platform-managed rescue container rootfs.
+_RESCUE_USER_ROOT_FILESYSTEM_PREFIX = "/dev/mapper/"
+_RESCUE_USER_ROOT_FILESYSTEM_SUFFIX = "-lxcsh--rescue--user"
+_RESCUE_USER_ROOT_MOUNT_POINTS = frozenset((
+    "/",
+    "/config/lxcsh/lxc/lxcsh-rescue-user/rootfs",
+))
+
+
+def _is_platform_managed_rescue_root(filesystem, mount_point):
+    """Identify the appliance-managed rescue shell, not an ND data volume."""
+    return (
+        filesystem.startswith(_RESCUE_USER_ROOT_FILESYSTEM_PREFIX)
+        and filesystem.endswith(_RESCUE_USER_ROOT_FILESYSTEM_SUFFIX)
+        and mount_point in _RESCUE_USER_ROOT_MOUNT_POINTS
+    )
+
+
+# Deliberate fix 6: ND 4.3 caps /logs/k8/kubelet by rotation at ~72-82% of its
+# volume, so the generic 80% gate flaps; 4.2.1 and earlier keep 80%.
+_KUBELET_LOG_MOUNT = "/logs/k8/kubelet"
+
+
+def _disk_usage_threshold(mount_point):
+    """Return the failure threshold (percent) for one mount on this ND release."""
+    if mount_point == _KUBELET_LOG_MOUNT:
+        ctx = get_validation_context()
+        if ctx.nd_version and ctx.is_version_applicable(4, 3):
+            return 90
+    return 80
+
+
 def check_disk_space(tech_file):
     """Check disk space from tech support file"""
     print_section("Checking Disk Space on {0}".format(NODE_NAME))
@@ -1401,6 +1377,8 @@ def check_disk_space(tech_file):
                     
                     # Skip /tmp/isomount* directories - these are temporary ISO mount points
                     # 100% usage is normal when an upgrade ISO is mounted
+                    if _is_platform_managed_rescue_root(parts[0], mount_point):
+                        continue
                     if mount_point.startswith('/tmp/isomount'):
                         continue
                     
@@ -1412,7 +1390,7 @@ def check_disk_space(tech_file):
                     try:
                         use_percent_int = int(use_percent)
                         
-                        if use_percent_int >= 80:
+                        if use_percent_int >= _disk_usage_threshold(mount_point):
                             print("[FAIL] {0} is {1}% full".format(mount_point, use_percent))
                             high_usage_dirs.append("{0} is {1}% full".format(mount_point, use_percent))
                     except ValueError:
@@ -1440,11 +1418,11 @@ def check_disk_space(tech_file):
         # instead of the localhost filesystem.
         print("[WARNING] No disk space data found in tech support, trying live command")
         df_output = run_command("df -h")
+        under_threshold_count = 0  # Deliberate fix 7: empty live df must not raise.
         if df_output:
             lines = df_output.splitlines()
             if lines:
                 lines = lines[1:]  # skip header
-            under_threshold_count = 0
             for line in lines:
                 parts = line.split()
                 if len(parts) < 5:
@@ -1459,12 +1437,14 @@ def check_disk_space(tech_file):
                         break
                 if use_percent is None or mount_point is None:
                     continue
+                if _is_platform_managed_rescue_root(parts[0], mount_point):
+                    continue
                 if mount_point.startswith('/tmp/isomount'):
                     continue
                 if mount_point.startswith('/data/services/oci_repo/boot-disk'):
                     continue
                 try:
-                    if int(use_percent) >= 80:
+                    if int(use_percent) >= _disk_usage_threshold(mount_point):
                         print("[FAIL] {0} is {1}% full".format(mount_point, use_percent))
                         high_usage_dirs.append("{0} is {1}% full".format(mount_point, use_percent))
                     else:
@@ -1484,15 +1464,15 @@ def check_disk_space(tech_file):
             results["checks"]["disk_space"]["recommendation"] = "Contact Cisco TAC for assistance to reduce disk space utilization before proceeding\n  with the upgrade."
         
         elif under_threshold_count > 0:
-            print("[PASS] All directories under 80% usage")
-            results["checks"]["disk_space"]["details"] = ["All directories are under 80% usage"]
+            print("[PASS] All directories under the usage threshold (80%; /logs/k8/kubelet 90% on ND 4.3+)")
+            results["checks"]["disk_space"]["details"] = ["All directories are under the usage threshold (80%; /logs/k8/kubelet 90% on ND 4.3+)"]
         else:
             print("[WARNING] No filesystem usage data could be parsed")
             results["checks"]["disk_space"]["status"] = "WARNING"
             results["checks"]["disk_space"]["details"].append("No filesystem usage data could be parsed")
     else:
-        print("[PASS] All directories under 80% usage (source: {0})".format(file_path_used))
-        results["checks"]["disk_space"]["details"] = ["All directories are under 80% usage"]
+        print("[PASS] All directories under the usage threshold (80%; /logs/k8/kubelet 90% on ND 4.3+) (source: {0})".format(file_path_used))
+        results["checks"]["disk_space"]["details"] = ["All directories are under the usage threshold (80%; /logs/k8/kubelet 90% on ND 4.3+)"]
 
 @robust_check("pod_status")
 def check_pods(tech_file=None):
@@ -1506,6 +1486,10 @@ def check_pods(tech_file=None):
     completed_pod_count = 0
     problem_pod_count = 0
     
+    # Deliberate fix 7: defined on every path; a missing archive used to raise
+    # UnboundLocalError below instead of falling back to the live check.
+    pod_info_extracted = False
+
     # If tech_file is provided, extract pod info from it
     if tech_file and os.path.exists(tech_file):
         print("Extracting pod information from tech support file")
@@ -4370,6 +4354,7 @@ def generate_techsupport(nd_version=None):
             
             # Basic text indicator for waiting
             new_tech_file = None
+            last_size = 0
             while time.time() - start_time < max_wait_time:
                 # Add time-based progress percentage (from 15% to 70% over 20 minutes)
                 elapsed = time.time() - start_time
@@ -4726,6 +4711,938 @@ def extract_techsupport(node_dir, file_name):
         results["checks"]["techsupport"]["details"].append("Error extracting tech support file: {0}".format(str(e)))
         update_status("error", "Error extracting tech support file: {0}".format(str(e)), 70)
 
+NDO_DUMP_SUFFIX = (
+    "data", "services", "app_logs", "cisco-mso-mso-logging", "ndomongodump"
+)
+NDO_DUMP_SHORT_SUFFIX = (
+    "cisco-mso-mso-logging", "ndomongodump"
+)
+NDO_DUMP_SUFFIXES = (
+    NDO_DUMP_SUFFIX,
+    (
+        "data", "services", "app_logs", "cisco-mso-mso-logging",
+        "ndo", "mongodump",
+    ),
+    NDO_DUMP_SHORT_SUFFIX,
+    ("cisco-mso-mso-logging", "ndo", "mongodump"),
+)
+NDO_ARCHIVE_MAX_MEMBERS = 250000
+NDO_ARCHIVE_MAX_EXPANDED_BYTES = 500 * 1024 * 1024 * 1024
+NDO_ARCHIVE_READ_CHUNK = 1024 * 1024
+
+
+class NDODumpArchiveError(RuntimeError):
+    """Safe nested NDO archive validation failure."""
+
+
+class _BudgetedArchiveStream(object):
+    """Account for each byte reached in one decompressed tar stream."""
+
+    def __init__(self, stream, budget):
+        self._stream = stream
+        self._budget = budget
+        self._accounted_until = 0
+
+    def tell(self):
+        position = self._stream.tell()
+        if position < 0:
+            raise NDODumpArchiveError("Invalid nested archive")
+        return position
+
+    def _bounded_read_size(self, position, requested):
+        remaining = (
+            NDO_ARCHIVE_MAX_EXPANDED_BYTES - self._budget["bytes"]
+        )
+        if remaining < 0:
+            raise NDODumpArchiveError("Nested archive limit exceeded")
+        # One byte beyond the limit is enough to prove the violation.  Never
+        # pass a maliciously large tar read request through to gzip.
+        safe_end = self._accounted_until + remaining + 1
+        available = safe_end - position
+        if available <= 0:
+            raise NDODumpArchiveError("Nested archive limit exceeded")
+        if requested is None or requested < 0:
+            requested = NDO_ARCHIVE_READ_CHUNK
+        return min(requested, NDO_ARCHIVE_READ_CHUNK, available)
+
+    def _charge_through(self, end_position):
+        if end_position <= self._accounted_until:
+            return
+        self._budget["bytes"] += (
+            end_position - self._accounted_until
+        )
+        self._accounted_until = end_position
+        if self._budget["bytes"] > NDO_ARCHIVE_MAX_EXPANDED_BYTES:
+            raise NDODumpArchiveError("Nested archive limit exceeded")
+
+    def read(self, size=-1):
+        try:
+            requested = int(size)
+        except (TypeError, ValueError, OverflowError):
+            raise NDODumpArchiveError("Invalid nested archive")
+        if requested == 0:
+            return self._stream.read(0)
+        position = self.tell()
+        read_size = self._bounded_read_size(position, requested)
+        data = self._stream.read(read_size)
+        if data is None or len(data) > read_size:
+            raise NDODumpArchiveError("Invalid nested archive")
+        self._charge_through(position + len(data))
+        return data
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError, OverflowError):
+            raise NDODumpArchiveError("Invalid nested archive")
+
+        current = self.tell()
+        if whence == os.SEEK_SET:
+            target = offset
+        elif whence == os.SEEK_CUR:
+            target = current + offset
+        elif whence == os.SEEK_END:
+            while self.read(NDO_ARCHIVE_READ_CHUNK):
+                pass
+            target = self.tell() + offset
+        else:
+            raise NDODumpArchiveError("Invalid nested archive")
+        if target < 0:
+            raise NDODumpArchiveError("Invalid nested archive")
+
+        if target <= self._accounted_until:
+            self._stream.seek(target, os.SEEK_SET)
+            return self.tell()
+
+        # Seeking forward on GzipFile decompresses the skipped range.  Advance
+        # via bounded reads so skipped headers, payloads, and padding are both
+        # validated and charged without an unbounded allocation.
+        if current != self._accounted_until:
+            self._stream.seek(self._accounted_until, os.SEEK_SET)
+        while self.tell() < target:
+            distance = target - self.tell()
+            data = self.read(min(distance, NDO_ARCHIVE_READ_CHUNK))
+            if not data:
+                raise NDODumpArchiveError("Truncated nested archive")
+        return self.tell()
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+
+def _valid_ndo_timestamp(value):
+    """Return whether value is a calendar-valid NDO dump timestamp."""
+    if not re.match(r"^[0-9]{14}$", value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y%m%d%H%M%S")
+        return True
+    except ValueError:
+        return False
+
+
+def _is_expected_ndo_parent(path):
+    """Return whether path ends with the exact NDO dump parent suffix."""
+    parts = tuple(os.path.normpath(path).split(os.sep))
+    for suffix in NDO_DUMP_SUFFIXES:
+        if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
+            return True
+    return False
+
+
+def _regular_ndo_collection_files(dump_dir):
+    """List direct regular, non-symlink NDO collection files."""
+    collection_files = []
+    for name in sorted(os.listdir(dump_dir)):
+        path = os.path.join(dump_dir, name)
+        if not fnmatch.fnmatch(name, "msc_*.json"):
+            continue
+        path_stat = os.lstat(path)
+        if not stat.S_ISREG(path_stat.st_mode):
+            return []
+        collection_files.append(path)
+    return collection_files
+
+
+def _safe_archive_member_name(name):
+    """Return a normalized POSIX archive name or reject unsafe syntax."""
+    if not isinstance(name, string_types) or not name:
+        raise NDODumpArchiveError("Invalid nested archive")
+    normalized = name.replace("\\", "/")
+    if (normalized.startswith("/") or "\x00" in normalized
+            or re.match(r"^[A-Za-z]:", normalized)):
+        raise NDODumpArchiveError("Invalid nested archive")
+    if normalized.endswith("/"):
+        normalized = normalized.rstrip("/")
+    parts = []
+    for part in normalized.split("/"):
+        if part == "..":
+            raise NDODumpArchiveError("Invalid nested archive")
+        if part in ("", "."):
+            continue
+        parts.append(part)
+    if not parts:
+        return "."
+    return "/".join(parts)
+
+
+def _validate_archive_link(member, member_name):
+    """Reject link targets that can resolve outside the archive namespace."""
+    target = member.linkname
+    if not isinstance(target, string_types) or not target:
+        raise NDODumpArchiveError("Invalid nested archive")
+    normalized = target.replace("\\", "/")
+    if (normalized.startswith("/") or "\x00" in normalized
+            or re.match(r"^[A-Za-z]:", normalized)):
+        raise NDODumpArchiveError("Invalid nested archive")
+
+    if member.issym():
+        resolved = member_name.split("/")[:-1]
+    else:
+        # Tar hardlink names are relative to the archive root.
+        resolved = []
+    for part in normalized.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise NDODumpArchiveError("Invalid nested archive")
+            resolved.pop()
+            continue
+        resolved.append(part)
+
+
+def _validate_archive_members(archive, budget):
+    """Validate every member within the shared decompressed-stream budget."""
+    validated = []
+    seen_names = set()
+    while True:
+        try:
+            member = archive.next()
+        except Exception:
+            raise NDODumpArchiveError("Invalid nested archive")
+        if member is None:
+            break
+        name = _safe_archive_member_name(member.name)
+        if name in seen_names:
+            raise NDODumpArchiveError("Ambiguous nested archive")
+        seen_names.add(name)
+
+        if member.ischr() or member.isblk() or member.isfifo():
+            raise NDODumpArchiveError("Invalid nested archive")
+        if member.issym() or member.islnk():
+            _validate_archive_link(member, name)
+        elif not (member.isreg() or member.isdir()):
+            raise NDODumpArchiveError("Invalid nested archive")
+
+        budget["members"] += 1
+        if budget["members"] > NDO_ARCHIVE_MAX_MEMBERS:
+            raise NDODumpArchiveError("Nested archive limit exceeded")
+        if member.isreg():
+            try:
+                declared_size = int(member.size)
+            except (TypeError, ValueError, OverflowError):
+                raise NDODumpArchiveError("Invalid nested archive")
+            if declared_size < 0:
+                raise NDODumpArchiveError("Invalid nested archive")
+            if declared_size > (
+                    NDO_ARCHIVE_MAX_EXPANDED_BYTES - budget["bytes"]
+            ):
+                raise NDODumpArchiveError("Nested archive limit exceeded")
+        validated.append((member, name))
+    return validated
+
+
+def _copy_archive_member(archive, member, destination=None):
+    """Read exactly one regular member, optionally into a private file."""
+    source = None
+    try:
+        source = archive.extractfile(member)
+        if source is None:
+            raise NDODumpArchiveError("Invalid nested archive")
+        remaining = int(member.size)
+        while remaining:
+            data = source.read(min(NDO_ARCHIVE_READ_CHUNK, remaining))
+            if not data:
+                raise NDODumpArchiveError("Truncated nested archive")
+            remaining -= len(data)
+            if destination is not None:
+                destination.write(data)
+        if source.read(1):
+            raise NDODumpArchiveError("Invalid nested archive")
+    except NDODumpArchiveError:
+        raise
+    except Exception:
+        raise NDODumpArchiveError("Invalid nested archive")
+    finally:
+        if source is not None:
+            source.close()
+
+
+def _verify_archive_payloads(archive, validated):
+    """Drain every regular member so corrupt/truncated payloads are rejected."""
+    for member, _name in validated:
+        if member.isreg():
+            _copy_archive_member(archive, member)
+
+
+def _verify_archive_stream_end(archive, budget):
+    """Read the rest of the decompressed stream through its bounded wrapper."""
+    try:
+        while True:
+            data = archive.fileobj.read(NDO_ARCHIVE_READ_CHUNK)
+            if not data:
+                break
+    except NDODumpArchiveError:
+        raise
+    except Exception:
+        raise NDODumpArchiveError("Truncated nested archive")
+
+
+@contextlib.contextmanager
+def _open_regular_worker_file(path):
+    """Open a regular, non-symlink worker file without following path swaps."""
+    file_descriptor = None
+    file_object = None
+    try:
+        path_stat = os.lstat(path)
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise NDODumpArchiveError("Invalid nested archive")
+        file_descriptor = os.open(
+            path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        )
+        opened_stat = os.fstat(file_descriptor)
+        if (not stat.S_ISREG(opened_stat.st_mode)
+                or (path_stat.st_dev, path_stat.st_ino)
+                != (opened_stat.st_dev, opened_stat.st_ino)):
+            raise NDODumpArchiveError("Invalid nested archive")
+        file_object = os.fdopen(file_descriptor, "rb")
+        file_descriptor = None
+        yield file_object
+    except NDODumpArchiveError:
+        raise
+    except Exception:
+        raise NDODumpArchiveError("Invalid nested archive")
+    finally:
+        if file_object is not None:
+            file_object.close()
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+
+
+@contextlib.contextmanager
+def _open_validated_archive(path, budget):
+    """Open, fully validate, and integrity-read a worker-owned archive."""
+    archive = None
+    gzip_stream = None
+    with _open_regular_worker_file(path) as source:
+        try:
+            signature = source.read(2)
+            source.seek(0, os.SEEK_SET)
+            decompressed_stream = source
+            if signature == b"\x1f\x8b":
+                gzip_stream = gzip.GzipFile(fileobj=source, mode="rb")
+                decompressed_stream = gzip_stream
+            budgeted_stream = _BudgetedArchiveStream(
+                decompressed_stream, budget
+            )
+            archive = tarfile.open(fileobj=budgeted_stream, mode="r:")
+            validated = _validate_archive_members(archive, budget)
+            _verify_archive_payloads(archive, validated)
+            _verify_archive_stream_end(archive, budget)
+            yield archive, validated
+        except NDODumpArchiveError:
+            raise
+        except Exception:
+            raise NDODumpArchiveError("Invalid nested archive")
+        finally:
+            if archive is not None:
+                archive.close()
+            if gzip_stream is not None:
+                gzip_stream.close()
+
+
+def _new_private_stage_file(stage_dir, suffix):
+    """Create a unique mode-0600 file inside the private NDO stage."""
+    for _attempt in range(10):
+        path = os.path.join(
+            stage_dir, ".{0}{1}".format(uuid.uuid4().hex, suffix)
+        )
+        file_descriptor = None
+        created = False
+        try:
+            file_descriptor = os.open(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            created = True
+            os.fchmod(file_descriptor, 0o600)
+            file_object = os.fdopen(file_descriptor, "wb")
+            file_descriptor = None
+            return path, file_object
+        except OSError as exc:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+            if created:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            if not created and exc.errno == errno.EEXIST:
+                continue
+            raise NDODumpArchiveError("Nested archive staging failed")
+        except Exception:
+            if file_descriptor is not None:
+                try:
+                    os.close(file_descriptor)
+                except OSError:
+                    pass
+            if created:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise NDODumpArchiveError("Nested archive staging failed")
+    raise NDODumpArchiveError("Nested archive staging failed")
+
+
+def _nested_dump_descriptor(name):
+    """Return (recognized, valid timestamp) for a known inner dump archive."""
+    parts = tuple(name.split("/"))
+    for suffix in NDO_DUMP_SUFFIXES:
+        needed = len(suffix) + 2
+        if len(parts) < needed or parts[-needed:-2] != suffix:
+            continue
+        directory = parts[-2]
+        archive_name = parts[-1]
+        if not directory.startswith("mso_db_json_"):
+            return True, None
+        # Direct unified exports use this directory as their collection root.
+        # It is not an attempted inner archive and must be left for
+        # _direct_nested_collection_descriptor below.
+        if archive_name == "backup":
+            return False, None
+        timestamp = directory[len("mso_db_json_"):]
+        if archive_name != directory + ".tar.gz":
+            return True, None
+        if not _valid_ndo_timestamp(timestamp):
+            return True, None
+        return True, timestamp
+    return False, None
+
+
+def _direct_nested_collection_descriptor(name):
+    """Describe a collection JSON stored directly in unified app_logs.tgz.
+
+    ND 4.1.1+ techsupport can retain the JSON export directly below
+    ``ndomongodump/mso_db_json_<timestamp>/backup`` instead of retaining a
+    second ``mso_db_json_<timestamp>.tar.gz`` archive.  Do not use the short
+    suffixes here: the logging archive can contain a duplicate under ``logs``
+    and only the canonical application-data path is the collection source.
+    """
+    parts = tuple(name.split("/"))
+    direct_suffixes = NDO_DUMP_SUFFIXES[:2]
+    for suffix in direct_suffixes:
+        needed = len(suffix) + 3
+        if len(parts) < needed or parts[-needed:-3] != suffix:
+            continue
+        directory, backup_directory, collection_name = parts[-3:]
+        if not directory.startswith("mso_db_json_"):
+            return True, None, None
+        timestamp = directory[len("mso_db_json_"):]
+        if backup_directory != "backup" or not _valid_ndo_timestamp(timestamp):
+            return True, None, None
+        # The export also contains service records under backup/mno-*/.  They
+        # are not validator collections and must not turn a valid dump into an
+        # archive error merely because they are directories.
+        if not fnmatch.fnmatch(collection_name, "msc_*.json"):
+            return False, None, None
+        return True, timestamp, collection_name
+    return False, None, None
+
+
+def _inner_collection_output_name(name, timestamp):
+    """Map an allowed direct/backup inner member to its output basename."""
+    parts = name.split("/")
+    expected_root = "mso_db_json_" + timestamp
+    if parts and parts[0] == expected_root:
+        parts = parts[1:]
+    if len(parts) == 1:
+        output_name = parts[0]
+    elif len(parts) == 2 and parts[0] == "backup":
+        output_name = parts[1]
+    else:
+        return None
+    if not fnmatch.fnmatch(output_name, "msc_*.json"):
+        return None
+    return output_name
+
+
+def _materialize_inner_dump(inner_path, timestamp, stage_dir, budget):
+    """Validate an inner dump archive and materialize only collection JSON."""
+    with _open_validated_archive(inner_path, budget) as opened:
+        archive, validated = opened
+        selected = []
+        selected_names = set()
+        for member, name in validated:
+            output_name = _inner_collection_output_name(name, timestamp)
+            if output_name is None:
+                continue
+            if not member.isreg() or output_name in selected_names:
+                raise NDODumpArchiveError("Ambiguous nested archive")
+            selected_names.add(output_name)
+            selected.append((member, output_name))
+        if not selected:
+            return None
+
+        candidate_root = tempfile.mkdtemp(
+            prefix=".candidate_", dir=stage_dir
+        )
+        os.chmod(candidate_root, 0o700)
+        dump_dir = os.path.join(
+            candidate_root, "mso_db_json_" + timestamp
+        )
+        os.mkdir(dump_dir, 0o700)
+        collection_paths = []
+        for member, output_name in sorted(
+                selected, key=lambda item: item[1]
+        ):
+            output_path = os.path.join(dump_dir, output_name)
+            file_descriptor = os.open(
+                output_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            output_file = os.fdopen(file_descriptor, "wb")
+            try:
+                os.fchmod(output_file.fileno(), 0o600)
+                _copy_archive_member(archive, member, output_file)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            finally:
+                output_file.close()
+            collection_paths.append(output_path)
+        return dump_dir, collection_paths
+
+
+def _materialize_direct_nested_dump(
+        app_archive, timestamp, members, stage_dir
+):
+    """Copy a directly embedded unified JSON export into a private candidate."""
+    candidate_root = tempfile.mkdtemp(prefix=".candidate_", dir=stage_dir)
+    os.chmod(candidate_root, 0o700)
+    dump_dir = os.path.join(candidate_root, "mso_db_json_" + timestamp)
+    os.mkdir(dump_dir, 0o700)
+    collection_paths = []
+    for output_name, member in sorted(members.items()):
+        output_path = os.path.join(dump_dir, output_name)
+        file_descriptor = os.open(
+            output_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        output_file = os.fdopen(file_descriptor, "wb")
+        try:
+            os.fchmod(output_file.fileno(), 0o600)
+            _copy_archive_member(app_archive, member, output_file)
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        finally:
+            output_file.close()
+        collection_paths.append(output_path)
+    return dump_dir, collection_paths
+
+
+def _discover_app_log_archives(node_dir):
+    """Find exact regular app_logs.tgz files without following symlink trees."""
+    archives = []
+    for current, directories, files in os.walk(node_dir):
+        directories[:] = sorted(
+            directory for directory in directories
+            if not os.path.islink(os.path.join(current, directory))
+        )
+        if "app_logs.tgz" not in files:
+            continue
+        archive_path = os.path.join(current, "app_logs.tgz")
+        archive_stat = os.lstat(archive_path)
+        if not stat.S_ISREG(archive_stat.st_mode):
+            raise NDODumpArchiveError("Invalid nested archive")
+        archives.append(archive_path)
+    return sorted(archives)
+
+
+def _collect_nested_ndo_candidates(
+        node_dir, stage_dir, budget
+):
+    """Return validated nested dump candidates and invalid-candidate count."""
+    candidates = []
+    invalid_count = 0
+    for app_archive_path in _discover_app_log_archives(node_dir):
+        private_inner_archives = []
+        with _open_validated_archive(app_archive_path, budget) as opened:
+            app_archive, validated = opened
+            direct_members = {}
+            for member, name in validated:
+                recognized, timestamp = _nested_dump_descriptor(name)
+                if recognized:
+                    if not member.isreg():
+                        raise NDODumpArchiveError("Invalid nested archive")
+                    if timestamp is None:
+                        invalid_count += 1
+                    else:
+                        inner_path, inner_file = _new_private_stage_file(
+                            stage_dir, ".tar.gz"
+                        )
+                        try:
+                            _copy_archive_member(app_archive, member, inner_file)
+                            inner_file.flush()
+                            os.fsync(inner_file.fileno())
+                        finally:
+                            inner_file.close()
+                        private_inner_archives.append((timestamp, inner_path))
+                    continue
+
+                recognized, timestamp, collection_name = (
+                    _direct_nested_collection_descriptor(name)
+                )
+                if not recognized:
+                    continue
+                if not member.isreg():
+                    raise NDODumpArchiveError("Invalid nested archive")
+                if timestamp is None:
+                    invalid_count += 1
+                    continue
+                collections = direct_members.setdefault(timestamp, {})
+                if collection_name in collections:
+                    raise NDODumpArchiveError("Ambiguous nested archive")
+                collections[collection_name] = member
+
+            for timestamp, collections in sorted(direct_members.items()):
+                dump_dir, collection_paths = _materialize_direct_nested_dump(
+                    app_archive, timestamp, collections, stage_dir
+                )
+                candidates.append(
+                    (
+                        timestamp,
+                        dump_dir,
+                        collection_paths,
+                        os.path.join(
+                            "nested_app_logs", "mso_db_json_" + timestamp
+                        ),
+                    )
+                )
+
+        for timestamp, inner_path in private_inner_archives:
+            materialized = _materialize_inner_dump(
+                inner_path, timestamp, stage_dir, budget
+            )
+            if materialized is None:
+                invalid_count += 1
+                continue
+            dump_dir, collections = materialized
+            candidates.append(
+                (
+                    timestamp,
+                    dump_dir,
+                    collections,
+                    os.path.join(
+                        "nested_app_logs", "mso_db_json_" + timestamp
+                    ),
+                )
+            )
+    return candidates, invalid_count
+
+
+def _normalized_error_type(exc):
+    """Return a safe exception type without exposing exception details."""
+    error_type = exc.__class__.__name__
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", error_type):
+        return "Exception"
+    return error_type
+
+
+def _remove_private_ndo_stage(stage_dir, attempts=3):
+    """Retry removal of the exact private stage and confirm it is gone."""
+    for _attempt in range(attempts):
+        if not os.path.lexists(stage_dir):
+            return True
+        try:
+            stage_stat = os.lstat(stage_dir)
+            if (not stat.S_ISDIR(stage_stat.st_mode)
+                    or stat.S_ISLNK(stage_stat.st_mode)):
+                return False
+            shutil.rmtree(stage_dir)
+        except OSError:
+            pass
+    return not os.path.lexists(stage_dir)
+
+
+def _remove_published_ndo_artifact(
+        artifact_path, artifact_identity, attempts=3
+):
+    """Remove only the verified artifact inode published by this collection."""
+    for _attempt in range(attempts):
+        if not os.path.lexists(artifact_path):
+            return True
+        try:
+            artifact_stat = os.lstat(artifact_path)
+            if (not stat.S_ISREG(artifact_stat.st_mode)
+                    or (artifact_stat.st_dev, artifact_stat.st_ino)
+                    != artifact_identity):
+                return False
+            os.unlink(artifact_path)
+        except OSError:
+            pass
+    return not os.path.lexists(artifact_path)
+
+
+def collect_ndo_dump(node_dir, output_dir, node_name):
+    """Package the newest usable NDO JSON dump extracted from techsupport."""
+    candidates = []
+    invalid_count = 0
+    stage_dir = None
+    result_metadata = None
+    published_artifact_path = None
+    published_artifact_identity = None
+    try:
+        for current, directories, _files in os.walk(node_dir):
+            if not _is_expected_ndo_parent(current):
+                directories[:] = [
+                    directory for directory in directories
+                    if not os.path.islink(os.path.join(current, directory))
+                ]
+                continue
+            for dirname in list(directories):
+                if not dirname.startswith("mso_db_json_"):
+                    continue
+                timestamp = dirname[len("mso_db_json_"):]
+                dump_dir = os.path.join(current, dirname)
+                dump_stat = os.lstat(dump_dir)
+                if (os.path.islink(dump_dir)
+                        or not stat.S_ISDIR(dump_stat.st_mode)):
+                    invalid_count += 1
+                    continue
+                collections = _regular_ndo_collection_files(dump_dir)
+                if not _valid_ndo_timestamp(timestamp) or not collections:
+                    invalid_count += 1
+                    continue
+                candidates.append(
+                    (
+                        timestamp,
+                        dump_dir,
+                        collections,
+                        os.path.relpath(dump_dir, node_dir),
+                    )
+                )
+            directories[:] = []
+
+        stage_dir = tempfile.mkdtemp(
+            prefix=".ndo_dump_stage_", dir=node_dir
+        )
+        os.chmod(stage_dir, 0o700)
+        archive_budget = {"members": 0, "bytes": 0}
+        nested_candidates, nested_invalid = _collect_nested_ndo_candidates(
+            node_dir, stage_dir, archive_budget
+        )
+        candidates.extend(nested_candidates)
+        invalid_count += nested_invalid
+
+        seen_timestamps = set()
+        for candidate in candidates:
+            if candidate[0] in seen_timestamps:
+                raise NDODumpArchiveError("Ambiguous nested archive")
+            seen_timestamps.add(candidate[0])
+
+        if not candidates:
+            result_metadata = {
+                "status": "MISSING",
+                "candidate_count": 0,
+                "invalid_candidate_count": invalid_count,
+            }
+            return result_metadata
+
+        timestamp, dump_dir, collections, source_relative_path = sorted(
+            candidates, key=lambda candidate: candidate[0]
+        )[-1]
+        safe_node = re.sub(r"[^A-Za-z0-9_.-]", "_", node_name) or "node"
+        artifact_name = "{0}_ndo_db_json_{1}_{2}.tgz".format(
+            safe_node, timestamp, uuid.uuid4().hex
+        )
+        legacy_partial_path = os.path.join(output_dir, artifact_name + ".part")
+        if os.path.lexists(legacy_partial_path):
+            if (not os.path.islink(legacy_partial_path)
+                    and os.path.isdir(legacy_partial_path)):
+                raise ValueError("Unsafe worker techsupport partial")
+            try:
+                os.unlink(legacy_partial_path)
+            except OSError:
+                if os.path.lexists(legacy_partial_path):
+                    raise
+        partial_path = os.path.join(
+            output_dir,
+            ".{0}.{1}.part".format(artifact_name, uuid.uuid4().hex),
+        )
+        artifact_path = os.path.join(output_dir, artifact_name)
+        partial_fd = None
+        partial_file = None
+        publication_created = False
+        publication_verified = False
+        try:
+            partial_fd = os.open(
+                partial_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(partial_fd, 0o600)
+            partial_file = os.fdopen(partial_fd, "wb")
+            partial_fd = None
+            with tarfile.open(
+                    fileobj=partial_file, mode="w:gz", dereference=False
+            ) as archive:
+                archive.add(
+                    dump_dir,
+                    arcname=os.path.basename(dump_dir),
+                    recursive=False,
+                )
+                for path in collections:
+                    archive.add(
+                        path,
+                        arcname=os.path.join(
+                            os.path.basename(dump_dir), os.path.basename(path)
+                        ),
+                        recursive=False,
+                    )
+            partial_file.flush()
+            os.fsync(partial_file.fileno())
+            staged_stat = os.fstat(partial_file.fileno())
+            # Keep the staged descriptor open across publication.  Python 2
+            # cannot request linkat(AT_EMPTY_PATH), and /proc/self/fd linking
+            # is not portable, so reject if either pathname stops naming the
+            # inode that was actually written and synced.
+            os.link(partial_path, artifact_path)
+            publication_created = True
+            published_stat = os.lstat(artifact_path)
+            partial_stat = os.lstat(partial_path)
+            if (not stat.S_ISREG(published_stat.st_mode)
+                    or not stat.S_ISREG(partial_stat.st_mode)
+                    or (published_stat.st_dev, published_stat.st_ino)
+                    != (staged_stat.st_dev, staged_stat.st_ino)
+                    or (partial_stat.st_dev, partial_stat.st_ino)
+                    != (staged_stat.st_dev, staged_stat.st_ino)):
+                raise ValueError("Unsafe worker techsupport artifact")
+            os.unlink(partial_path)
+            partial_file.close()
+            partial_file = None
+            publication_verified = True
+            published_artifact_path = artifact_path
+            published_artifact_identity = (
+                published_stat.st_dev, published_stat.st_ino
+            )
+        finally:
+            try:
+                if partial_file is not None:
+                    partial_file.close()
+            finally:
+                try:
+                    if partial_fd is not None:
+                        os.close(partial_fd)
+                finally:
+                    try:
+                        if publication_created and not publication_verified:
+                            try:
+                                os.unlink(artifact_path)
+                            except OSError:
+                                pass
+                    finally:
+                        try:
+                            os.unlink(partial_path)
+                        except OSError:
+                            pass
+
+        result_metadata = {
+            "status": "FOUND",
+            "timestamp": timestamp,
+            "source_relative_path": source_relative_path,
+            "artifact_filename": artifact_name,
+            "collection_file_count": len(collections),
+            "candidate_count": len(candidates),
+            "invalid_candidate_count": invalid_count,
+        }
+        return result_metadata
+    except Exception as exc:
+        result_metadata = {
+            "status": "ERROR",
+            "error_type": _normalized_error_type(exc),
+            "candidate_count": len(candidates),
+            "invalid_candidate_count": invalid_count,
+        }
+        return result_metadata
+    finally:
+        if stage_dir is not None:
+            cleanup_confirmed = _remove_private_ndo_stage(stage_dir)
+            if not cleanup_confirmed and result_metadata is not None:
+                if (published_artifact_path is not None
+                        and published_artifact_identity is not None):
+                    _remove_published_ndo_artifact(
+                        published_artifact_path,
+                        published_artifact_identity,
+                    )
+                result_metadata.clear()
+                result_metadata.update(
+                    {
+                        "status": "ERROR",
+                        "error_type": "NDODumpStageCleanupError",
+                        "candidate_count": len(candidates),
+                        "invalid_candidate_count": invalid_count,
+                    }
+                )
+
+
+def _clear_stale_node_dir(node_dir, tech_file):
+    """Remove leftovers from earlier runs (stale extractions or NDO dumps).
+
+    The selected tech support is kept when it already lives in node_dir.
+    """
+    real_node_dir = os.path.realpath(node_dir)
+    if os.path.dirname(real_node_dir) != os.path.realpath(BASE_DIR):
+        print("[WARNING] Not clearing {0}: not a direct child of {1}".format(node_dir, BASE_DIR))
+        return
+    keep = os.path.realpath(tech_file)
+    for entry in os.listdir(real_node_dir):
+        path = os.path.join(real_node_dir, entry)
+        real_path = os.path.realpath(path)
+        # Keep the selected archive and any directory that contains it.
+        if real_path == keep or keep.startswith(real_path + os.sep):
+            continue
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+
+
+def collect_ndo_dump_after_extraction(
+        node_dir, output_dir, node_name, extraction_status
+):
+    """Collect an NDO dump only after techsupport extraction passes."""
+    if extraction_status != "PASS":
+        return {
+            "status": "MISSING",
+            "candidate_count": 0,
+            "invalid_candidate_count": 0,
+        }
+    return collect_ndo_dump(node_dir, output_dir, node_name)
+
 def save_results():
     """Save results to a JSON file"""
     temporary_path = "{0}.tmp.{1}".format(RESULTS_FILE, os.getpid())
@@ -4958,6 +5875,8 @@ def main():
         # Copy the tech support file to the working directory
         file_name = os.path.basename(tech_file)
         dest_path = "{0}/{1}".format(node_dir, file_name)
+        # Leftovers from an interrupted run would otherwise mix into this run's checks.
+        _clear_stale_node_dir(node_dir, tech_file)
         
         print("Copying {0} to {1}...".format(tech_file, dest_path))
         if os.path.realpath(tech_file) == os.path.realpath(dest_path):
@@ -4969,6 +5888,11 @@ def main():
         
         # Extract the tech support file
         extract_techsupport(node_dir, file_name)
+        if os.environ.get("ND_PREUPGRADE_COLLECT_NDO") == "1":
+            results["ndo_dump"] = collect_ndo_dump_after_extraction(
+                node_dir, BASE_DIR, NODE_NAME,
+                results["checks"]["techsupport"]["status"]
+            )
         
         try:
             # Run the checks - wrap each check in try-except to catch individual failures

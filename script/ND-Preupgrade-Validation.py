@@ -8,7 +8,7 @@ This script performs health checks on a Nexus Dashboard cluster:
 - Results are aggregated at the end for a comprehensive report
 
 Author: joelebla@cisco.com
-Version: 1.0.29 (August 21, 2026)
+Version: 1.0.30 (November 9, 2026)
 """
 
 import re
@@ -32,6 +32,83 @@ import argparse
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# The optional NDO add-on is never inspected in default mode.
+NDO_ADDON_INTERFACE = 1
+NDO_SCRIPT_VERSION = "1.0.30-ndo-addon.1"
+_NDO_ADDON = None
+
+
+def _load_ndo_addon():
+    """Load only our sibling add-on, registering before dataclass execution."""
+    global _NDO_ADDON
+    if _NDO_ADDON is None:
+        import importlib.util
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ndo_preupgrade.py")
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                "Missing ndo_preupgrade.py: it must be in the same folder as "
+                "ND-Preupgrade-Validation.py. ND-only validation does not need it.")
+        spec = importlib.util.spec_from_file_location("ndo_preupgrade", path)
+        addon = importlib.util.module_from_spec(spec)
+        previous = sys.modules.get(spec.name)
+        sys.modules[spec.name] = addon
+        old_bytecode = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = True
+            spec.loader.exec_module(addon)
+            if (getattr(addon, "NDO_ADDON_INTERFACE", None) != NDO_ADDON_INTERFACE or
+                    getattr(addon, "NDO_SCRIPT_VERSION", None) != NDO_SCRIPT_VERSION):
+                raise RuntimeError(
+                    "ndo_preupgrade.py is from a different release than "
+                    "ND-Preupgrade-Validation.py; download both from the same release")
+            addon.bind_controller(sys.modules[__name__])
+        except BaseException:
+            if previous is None:
+                sys.modules.pop(spec.name, None)
+            else:
+                sys.modules[spec.name] = previous
+            raise
+        finally:
+            sys.dont_write_bytecode = old_bytecode
+        _NDO_ADDON = addon
+    return _NDO_ADDON
+
+
+# Inert unless the exact --ndo token is supplied.
+_NDO_CONTEXT = None
+
+def _run_bounded(cmd, timeout=120):
+    """Run a short SSH/SCP command in an isolated group; reap on timeout.
+
+    Return a CompletedProcess with byte output and code 124 on timeout. Discard
+    partial stderr on timeout so connection-refused retry logic cannot replay
+    an operation whose remote outcome is unknown.
+    """
+    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, _ = process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            stdout = b""
+        finally:
+            # Also kill descendants if the group leader exited during grace.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        stdout, _ = process.communicate()
+        stderr = "Command timed out after {}s".format(timeout).encode('utf-8')
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
+
 
 # Set up logging
 def setup_logging():
@@ -461,6 +538,39 @@ def check_system_resources():
     
     return resources
 
+# Upstream bug fix: ignore the platform-managed rescue container rootfs.
+_RESCUE_USER_ROOT_FILESYSTEM_PREFIX = "/dev/mapper/"
+_RESCUE_USER_ROOT_FILESYSTEM_SUFFIX = "-lxcsh--rescue--user"
+_RESCUE_USER_ROOT_MOUNT_POINTS = frozenset((
+    "/",
+    "/config/lxcsh/lxc/lxcsh-rescue-user/rootfs",
+))
+
+
+# Deliberate fix 6: ND 4.3 caps /logs/k8/kubelet by rotation (100 compressed files
+# plus the live log) at ~72-82% of its 1.9 GB volume, so the generic 80% gate flaps.
+# 4.2.1 plateaus at ~77% and keeps the base threshold; ND's own anomaly uses 90%.
+_KUBELET_LOG_MOUNT = "/logs/k8/kubelet"
+
+
+def _disk_usage_threshold(mount_point, nd_version):
+    """Return the failure threshold (percent) for one mount on this ND release."""
+    if mount_point == _KUBELET_LOG_MOUNT:
+        match = re.match(r"^\s*(\d+)\.(\d+)", str(nd_version or ""))
+        if match and (int(match.group(1)), int(match.group(2))) >= (4, 3):
+            return 90
+    return 80
+
+
+def _is_platform_managed_rescue_root(filesystem, mount_point):
+    """Identify the appliance-managed rescue shell, not an ND data volume."""
+    return (
+        filesystem.startswith(_RESCUE_USER_ROOT_FILESYSTEM_PREFIX)
+        and filesystem.endswith(_RESCUE_USER_ROOT_FILESYSTEM_SUFFIX)
+        and mount_point in _RESCUE_USER_ROOT_MOUNT_POINTS
+    )
+
+
 class NDNodeManager:
     """Manages Nexus Dashboard nodes and their information"""
 
@@ -469,6 +579,9 @@ class NDNodeManager:
         self.nd_ip = nd_ip
         self.username = username
         self.password = password
+        # sshpass -e reads SSHPASS from the inherited environment, so the
+        # password never appears in a command line (visible to all users via ps).
+        os.environ["SSHPASS"] = password or ""
         self.nodes = []
         # Preserve discovery results separately from ``self.nodes``. Later
         # validation stages narrow ``self.nodes`` when a node is ineligible,
@@ -512,9 +625,9 @@ class NDNodeManager:
         # SSH handles bare IPv6 addresses natively (user@2001:db8::1);
         # brackets are only needed for SCP and URLs.
         ssh_opts_str = " ".join(ssh_opts)
-        # Use SSHPASS environment variable method which is more reliable than -p flag
-        # This avoids issues with special characters in passwords and shell escaping
-        return f"SSHPASS={shlex.quote(self.password)} sshpass -e ssh {ssh_opts_str} {self.username}@{node_ip} \"{command}\""
+        # sshpass -e reads the password from the SSHPASS environment variable set
+        # in __init__; it must not be placed on the command line.
+        return f"sshpass -e ssh {ssh_opts_str} {self.username}@{node_ip} \"{command}\""
 
     def build_scp_command(self, local_file, node_ip, remote_file):
         """Centralized SCP command builder with connection multiplexing"""
@@ -533,7 +646,7 @@ class NDNodeManager:
         remote_spec = f"{self.username}@{scp_ip}:{remote_file}"
         # Use SSHPASS environment variable method which is more reliable than -p flag
         return (
-            f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} "
+            f"sshpass -e scp {ssh_opts_str} "
             f"{shlex.quote(str(local_file))} {shlex.quote(remote_spec)}"
         )
 
@@ -551,7 +664,7 @@ class NDNodeManager:
         scp_ip = bracket_ipv6(node_ip)
         remote_spec = f"{self.username}@{scp_ip}:{remote_file}"
         return (
-            f"SSHPASS={shlex.quote(self.password)} sshpass -e scp {ssh_opts_str} "
+            f"sshpass -e scp {ssh_opts_str} "
             f"{shlex.quote(remote_spec)} {shlex.quote(str(local_file))}"
         )
 
@@ -1084,6 +1197,8 @@ class NDNodeManager:
 
                 # Get mount point (last column)
                 mount_point = parts[5]
+                if _is_platform_managed_rescue_root(parts[0], mount_point):
+                    continue
 
                 # Skip /tmp/isomount* directories - these are temporary ISO mount points
                 # 100% usage is normal when an upgrade ISO is mounted
@@ -1097,8 +1212,8 @@ class NDNodeManager:
                     logger.debug(f"{node['name']}: Skipping {mount_point} (boot disk mount point)")
                     continue
 
-                # Check if usage >= 80%
-                if usage_pct >= 80:
+                # Check if usage >= threshold (80%; see _disk_usage_threshold)
+                if usage_pct >= _disk_usage_threshold(mount_point, getattr(self, "version", None)):
                     over_threshold.append((mount_point, usage_pct))
                     logger.warning(f"{node['name']}: {mount_point} is at {usage_pct}% usage")
 
@@ -1108,7 +1223,7 @@ class NDNodeManager:
                 error_msg = f"Found {len(over_threshold)} director{'y' if len(over_threshold) == 1 else 'ies'} over 80% usage"
                 return False, over_threshold, error_msg
 
-            logger.info(f"{node['name']}: All directories under 80% usage threshold")
+            logger.info(f"{node['name']}: All directories under the usage threshold (80%; /logs/k8/kubelet 90% on ND 4.3+)")
             return True, [], ""
 
         except subprocess.TimeoutExpired:
@@ -1174,8 +1289,8 @@ class NDNodeManager:
 
             logger.info("Getting Nexus Dashboard version")
             cmd = self.build_ssh_command(self.nd_ip, "acs version")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd)
+            stdout, stderr = process.stdout, process.stderr
 
             version = None
             if process.returncode == 0:
@@ -1196,8 +1311,8 @@ class NDNodeManager:
             # Try a direct approach for getting node information
             logger.info("Getting Nexus Dashboard node information")
             cmd = self.build_ssh_command(self.nd_ip, "acs show nodes")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd)
+            stdout, stderr = process.stdout, process.stderr
 
             node_output = ""
             if process.returncode == 0:
@@ -1512,8 +1627,8 @@ class TechSupportManager:
             # Match system-ts, all-ts, and plain ts files (ND 2.x uses '-ts-' without prefix)
             cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' -o -name '*-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
             
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd)
+            stdout, stderr = process.stdout, process.stderr
             
             output = stdout.decode('utf-8')
             
@@ -1568,8 +1683,8 @@ class TechSupportManager:
             # Match system-ts, all-ts, and plain ts files (ND 2.x uses '-ts-' without prefix)
             cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-*.tgz' -o -name '*-all-ts-*.tgz' -o -name '*-ts-*.tgz' \\) -type f -printf '%T@ %s %p\\n' | sort -nr")
             
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd)
+            stdout, stderr = process.stdout, process.stderr
             
             output = stdout.decode('utf-8')
             
@@ -1679,8 +1794,8 @@ class TechSupportManager:
             
             # Get current timestamp before generating tech support
             cmd_timestamp = self.node_manager.build_ssh_command(node['ip'], "date '+%Y-%m-%dT%H-%M-%S'")
-            process = subprocess.Popen(cmd_timestamp, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd_timestamp)
+            stdout, stderr = process.stdout, process.stderr
             
             if process.returncode != 0:
                 logger.error(f"Failed to get timestamp on {node['name']}: {stderr.decode('utf-8')}")
@@ -1746,7 +1861,9 @@ class TechSupportManager:
             stale_check_interval = 5  # Once size stops increasing, verify every 5 seconds
             max_stale_checks = 3  # Maximum consecutive checks with no size increase (at 5-second intervals = 15 seconds total)
             max_retry_attempts = 40  # Maximum retries when file exists and is growing (40 * 30s = 20 minutes)
-            max_initial_attempts = 5  # Maximum retries if file never appears (5 * 30s = 2.5 minutes)
+            # Upstream bug fix: ND 4.3.1 publishes the archive only after 2-5 minutes
+            # ("TS collection may take 15-20 minutes"), so 2.5 minutes failed live.
+            max_initial_attempts = 20  # Maximum retries if file never appears (20 * 30s = 10 minutes)
             
             logger.info(f"Waiting for tech support generation to complete on {node['name']}...")
             # Don't print to console - we'll show status when file is detected
@@ -1754,8 +1871,8 @@ class TechSupportManager:
             # Record all existing tech support files to detect new ones
             # Match system-ts, all-ts, and plain ts files for this node (ND 2.x uses '-ts-' without prefix)
             cmd_existing = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '*-system-ts-{node['name']}*' -o -name '*-all-ts-{node['name']}*' -o -name '*-ts-{node['name']}*' \\) -name '*.tgz' -type f -printf '%T@ %p\\n'")
-            process = subprocess.Popen(cmd_existing, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd_existing)
+            stdout, stderr = process.stdout, process.stderr
             
             existing_tech_support_files = []
             if process.returncode == 0:
@@ -1800,8 +1917,8 @@ class TechSupportManager:
                 
                 # Get the current date part for identifying today's tech supports
                 cmd_date = self.node_manager.build_ssh_command(node['ip'], "date '+%Y-%m-%d'")
-                process = subprocess.Popen(cmd_date, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
+                process = _run_bounded(cmd_date)
+                stdout, stderr = process.stdout, process.stderr
                 
                 if process.returncode != 0:
                     logger.warning(f"Failed to get current date on {node['name']} (retry {retry_number})")
@@ -1827,8 +1944,8 @@ class TechSupportManager:
                 # List all tech support files, sorted by timestamp (newest first)
                 cmd = self.node_manager.build_ssh_command(node['ip'], f"find {self.tech_dir} \\( -name '{ts_pattern}' -o -name '{ts_pattern_plain}' \\) -name '*.tgz' -type f -printf '%T@ %s %p\\n' | sort -nr")
                 logger.debug(f"Looking for tech support files with pattern: {ts_pattern} or {ts_pattern_plain}")
-                process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
+                process = _run_bounded(cmd)
+                stdout, stderr = process.stdout, process.stderr
                 
                 if process.returncode != 0 or not stdout:
                     logger.warning(f"Failed to list tech support files on {node['name']} (retry {retry_number})")
@@ -1918,8 +2035,8 @@ class TechSupportManager:
                                         time.sleep(stale_check_interval)
                                         
                                         cmd_size = self.node_manager.build_ssh_command(node['ip'], f"stat -c %s {filepath}")
-                                        process = subprocess.Popen(cmd_size, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                                        stdout, stderr = process.communicate()
+                                        process = _run_bounded(cmd_size)
+                                        stdout, stderr = process.stdout, process.stderr
                                         
                                         if process.returncode != 0:
                                             logger.warning(f"Failed to get file size for verification check {verify_check + 1} on {filepath}")
@@ -1976,8 +2093,8 @@ class TechSupportManager:
             
             # Verify the tech support exists and has non-zero size
             cmd = self.node_manager.build_ssh_command(node['ip'], f"test -s {found_tech_support} && echo 'exists' || echo 'not found'")
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd)
+            stdout, stderr = process.stdout, process.stderr
             
             if "exists" in stdout.decode('utf-8'):
                 print(f"{PASS} Tech support generated on {node['name']}: {found_tech_support}")
@@ -2034,14 +2151,16 @@ class WorkerScriptManager:
             script_path = f"{self.base_dir}/nd_worker.py"
             
             # Helper function to execute SSH command with retry logic
-            def execute_ssh_with_retry(cmd, description, retries=3, delay=2):
+            def execute_ssh_with_retry(cmd, description, retries=3, delay=2, timeout=120):
+                # All callers use the positive default retry count.
+                stdout = stderr = b""
                 for attempt in range(retries):
                     if attempt > 0:
                         logger.debug(f"Retry {attempt}/{retries-1} for: {description}")
                         time.sleep(delay * attempt)  # Increasing delay
                     
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout, stderr = process.communicate()
+                    process = _run_bounded(cmd, timeout=timeout)
+                    stdout, stderr = process.stdout, process.stderr
                     
                     if process.returncode == 0:
                         return True, stdout.decode('utf-8'), stderr.decode('utf-8')
@@ -2077,7 +2196,7 @@ class WorkerScriptManager:
                 # Step 2: Transfer file using SCP with connection multiplexing
                 logger.debug(f"Transferring worker script to {node['name']} using optimized SCP")
                 scp_cmd = self.node_manager.build_scp_command(temp_path, node['ip'], script_path)
-                success, stdout, stderr = execute_ssh_with_retry(scp_cmd, "transfer script")
+                success, stdout, stderr = execute_ssh_with_retry(scp_cmd, "transfer script", timeout=600)
                 
                 if not success:
                     logger.debug(f"SCP transfer failed for {node['name']}: {stderr}")
@@ -2113,14 +2232,16 @@ class WorkerScriptManager:
         
         try:
             # Helper function to execute SSH command with retry logic
-            def execute_ssh_with_retry(cmd, description, retries=3, delay=2):
+            def execute_ssh_with_retry(cmd, description, retries=3, delay=2, timeout=120):
+                # All callers use the positive default retry count.
+                stdout = stderr = b""
                 for attempt in range(retries):
                     if attempt > 0:
                         logger.debug(f"Retry {attempt}/{retries-1} for: {description}")
                         time.sleep(delay * attempt)  # Increasing delay
                     
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout, stderr = process.communicate()
+                    process = _run_bounded(cmd, timeout=timeout)
+                    stdout, stderr = process.stdout, process.stderr
                     
                     if process.returncode == 0:
                         return True, stdout.decode('utf-8'), stderr.decode('utf-8')
@@ -2170,7 +2291,7 @@ class WorkerScriptManager:
                 # Step 3: Transfer file using optimized SCP with connection multiplexing
                 logger.debug(f"Transferring worker script to {node['name']} using SCP")
                 scp_cmd = self.node_manager.build_scp_command(temp_path, node['ip'], script_path)
-                success, stdout, stderr = execute_ssh_with_retry(scp_cmd, "transfer file")
+                success, stdout, stderr = execute_ssh_with_retry(scp_cmd, "transfer file", timeout=600)
                 
                 if not success:
                     error = stderr
@@ -2192,7 +2313,7 @@ class WorkerScriptManager:
                     safe_temp_file.close()
                     
                     cat_cmd = f"cat {safe_temp_path} | {self.node_manager.build_ssh_command(node['ip'], f'cat > {script_path}')}"
-                    success, stdout, stderr = execute_ssh_with_retry(cat_cmd, "transfer file using cat")
+                    success, stdout, stderr = execute_ssh_with_retry(cat_cmd, "transfer file using cat", timeout=600)
                     
                     if not success:
                         logger.error(f"Failed to transfer script using cat: {stderr}")
@@ -2241,8 +2362,8 @@ class WorkerScriptManager:
                 logger.debug(f"Executing SSH command (masked): {masked_cmd}")
             
             # Execute the command
-            process = subprocess.Popen(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(full_cmd)
+            stdout, stderr = process.stdout, process.stderr
             
             # Return the output
             return stdout.decode('utf-8'), stderr.decode('utf-8'), process.returncode
@@ -2261,8 +2382,8 @@ class WorkerScriptManager:
             try:
                 # Use centralized SSH command builder
                 cmd = self.node_manager.build_ssh_command(node['ip'], f"which {interpreter} && {interpreter} --version")
-                process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
+                process = _run_bounded(cmd)
+                stdout, stderr = process.stdout, process.stderr
                 
                 if process.returncode == 0:
                     output = stdout.decode('utf-8').strip()
@@ -2302,14 +2423,16 @@ class WorkerScriptManager:
             masked_password = '********' if self.node_manager.password else ''
             
             # Helper function to execute SSH command with retry logic
-            def execute_ssh_with_retry(cmd, description, retries=3, delay=2):
+            def execute_ssh_with_retry(cmd, description, retries=3, delay=2, timeout=120):
+                # All callers use the positive default retry count.
+                stdout = stderr = b""
                 for attempt in range(retries):
                     if attempt > 0:
                         logger.debug(f"Retry {attempt}/{retries-1} for: {description}")
                         time.sleep(delay * attempt)  # Increasing delay
                     
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout, stderr = process.communicate()
+                    process = _run_bounded(cmd, timeout=timeout)
+                    stdout, stderr = process.stdout, process.stderr
                     
                     if process.returncode == 0:
                         return True, stdout.decode('utf-8'), stderr.decode('utf-8')
@@ -2371,11 +2494,13 @@ class WorkerScriptManager:
                 "progress": 0
             })
             
-            init_status_cmd = self.node_manager.build_ssh_command(node['ip'], f"mkdir -p {self.base_dir} && echo '{init_status}' > {self.base_dir}/{node['name']}_status.json") + " 2>/dev/null"
+            # Leftover results/log files would be read as completion once launch no longer blocks.
+            init_status_cmd = self.node_manager.build_ssh_command(node['ip'], f"mkdir -p {self.base_dir} && rm -f {self.base_dir}/{node['name']}_results.json {self.base_dir}/{node['name']}_output.log && echo '{init_status}' > {self.base_dir}/{node['name']}_status.json") + " 2>/dev/null"
             success, stdout, stderr = execute_ssh_with_retry(init_status_cmd, "setup initial status")
             
             if not success:
-                logger.warning(f"Failed to set initial status on {node['name']}: {stderr}")
+                logger.error(f"Failed to clear stale state and set initial status on {node['name']}: {stderr}")
+                return False
             
             # Add delay before Python test
             time.sleep(1)
@@ -2395,28 +2520,36 @@ class WorkerScriptManager:
             
             # Step 5: Execute the worker script with retry logic
             logger.debug(f"Executing worker script on {node['name']}")
-            cmd = self.node_manager.build_ssh_command(node['ip'], f"cd {self.base_dir} && echo '[Starting worker script at $(date)]' > {node['name']}_output.log 2>&1 && echo 'Executing: {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} {node['name']}' >> {node['name']}_output.log 2>&1 && nohup {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} {node['name']} >> {node['name']}_output.log 2>&1 & echo $!")
+            ndo_worker_env = "env ND_PREUPGRADE_COLLECT_NDO=1 " if _NDO_CONTEXT else ""
+            # The remote command sits in local double quotes; escape $! so the remote shell expands it.
+            cmd = self.node_manager.build_ssh_command(node['ip'], f"cd {self.base_dir} && echo '[Starting worker script at $(date)]' > {node['name']}_output.log 2>&1 && echo 'Executing: {python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} {node['name']}' >> {node['name']}_output.log 2>&1 && {{ setsid nohup {ndo_worker_env}{python_cmd} -u {script_path} {operation} {tech_support_path} {nd_version} {node['name']} < /dev/null >> {node['name']}_output.log 2>&1 & echo \\$!; }}")
             success, stdout, stderr = execute_ssh_with_retry(cmd, "execute worker script")
             
-            if not success:
-                logger.error(f"Failed to execute worker script on node {node['name']}: {stderr}")
-                
-                # Try to get more detailed error information with retry
-                time.sleep(1)
-                detailed_error_cmd = self.node_manager.build_ssh_command(node['ip'], f"cd {self.base_dir} && cat {node['name']}_output.log 2>/dev/null || echo 'No output log found'")
-                success2, detailed_output, stderr2 = execute_ssh_with_retry(detailed_error_cmd, "get error details")
-                
-                if success2:
-                    logger.error(f"Detailed error output for {node['name']}: {detailed_output}")
-                return False
-            
-            # Get the process ID if available
             process_id = stdout.strip()
-            if process_id and process_id.isdigit():
-                logger.info(f"Worker script started on {node['name']} with PID {process_id}")
+            if not success or not process_id.isdigit():
+                # The initial status is controller-created: only subsequent
+                # worker progress or a launch log is evidence of startup.
+                status_path = shlex.quote(f"{self.base_dir}/{node['name']}_status.json")
+                log_path = shlex.quote(f"{self.base_dir}/{node['name']}_output.log")
+                probe = (f"if test -s {status_path}; then cat {status_path}; fi; "
+                         f"if test -s {log_path}; then echo WORKER_LOG_EXISTS; fi")
+                probe_cmd = self.node_manager.build_ssh_command(node['ip'], probe)
+                probe_ok, evidence, _ = execute_ssh_with_retry(
+                    probe_cmd, "verify uncertain worker launch", retries=1)
+                status_started = False
+                try:
+                    status = json.loads(evidence.split('WORKER_LOG_EXISTS')[0].strip())
+                    status_started = isinstance(status, dict) and status.get('status') not in (None, 'initializing')
+                except (ValueError, TypeError):
+                    pass
+                if not probe_ok or not (status_started or 'WORKER_LOG_EXISTS' in evidence):
+                    logger.error(f"Failed to execute worker script on node {node['name']}: {stderr}; no startup evidence")
+                    return False
+                logger.warning(f"Worker launch on {node['name']} returned no confirmed PID "
+                               f"({stderr or stdout}); status/log indicates startup; continuing")
             else:
-                logger.warning(f"Could not determine process ID for worker script on {node['name']}: {stdout}")
-            
+                logger.info(f"Worker script started on {node['name']} with PID {process_id}")
+
             # Add delay before checking log output
             time.sleep(3)
             
@@ -2627,12 +2760,10 @@ class WorkerScriptManager:
                         
                     return status_data
                 except json.JSONDecodeError as e:
+                    # A partial read is not completion ("Tech support extraction complete"
+                    # would match a substring test); the next poll re-reads the file.
                     logger.debug(f"Invalid JSON in status from node {node['name']}: {str(e)}")
-                    
-                    # Look for "complete" in the output as a fallback
-                    if "complete" in status_content.lower():
-                        logger.info(f"Found 'complete' in status output for {node['name']}, marking as complete")
-                        return {"status": "complete", "current_operation": "Complete (detected from output)", "progress": 100}
+                    return {"status": "running", "current_operation": "Status update in progress", "progress": 50}
             
             # If status file is missing or empty, return initializing
             if "STATUS_FILE:missing_or_empty" in output:
@@ -2681,6 +2812,7 @@ class WorkerScriptManager:
             
             # Retry mechanism to check for results file
             retry_attempts = 3
+            output = ""  # The fixed positive retry count always assigns this below.
             for attempt in range(retry_attempts):
                 with SSHCommand(self.node_manager, node, f"test -f {results_file} && echo 'exists' || echo 'not found'") as ssh:
                     output, _, _ = ssh.get_results(timeout=5)
@@ -2743,6 +2875,9 @@ class WorkerScriptManager:
                     # Create local directory for results if needed
                     os.makedirs(self.results_dir, exist_ok=True)
                     
+                    if _NDO_CONTEXT:
+                        _NDO_CONTEXT.collect_remote(self, node, results)
+
                     # Save the results locally
                     local_results_file = f"{self.results_dir}/{node['name']}_results.json"
                     results_file = file_manager.open(local_results_file, 'w')
@@ -2768,6 +2903,9 @@ class WorkerScriptManager:
                         # Create local directory for results if needed
                         os.makedirs(self.results_dir, exist_ok=True)
                         
+                        if _NDO_CONTEXT:
+                            _NDO_CONTEXT.collect_remote(self, node, results)
+
                         # Save the results locally
                         local_results_file = f"{self.results_dir}/{node['name']}_results.json"
                         results_file = file_manager.open(local_results_file, 'w')
@@ -2796,14 +2934,16 @@ class WorkerScriptManager:
         
         try:
             # Helper function to execute SSH command with retry logic
-            def execute_ssh_with_retry(cmd, description, retries=3, delay=2):
+            def execute_ssh_with_retry(cmd, description, retries=3, delay=2, timeout=120):
+                # All callers use the positive default retry count.
+                stdout = stderr = b""
                 for attempt in range(retries):
                     if attempt > 0:
                         logger.debug(f"Retry {attempt}/{retries-1} for: {description}")
                         time.sleep(delay * attempt)  # Increasing delay
                     
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout, stderr = process.communicate()
+                    process = _run_bounded(cmd, timeout=timeout)
+                    stdout, stderr = process.stdout, process.stderr
                     
                     if process.returncode == 0:
                         return True, stdout.decode('utf-8'), stderr.decode('utf-8')
@@ -2857,14 +2997,16 @@ class WorkerScriptManager:
         try:
             
             # Helper function to execute SSH command with retry logic
-            def execute_ssh_with_retry(cmd, description, retries=3, delay=2):
+            def execute_ssh_with_retry(cmd, description, retries=3, delay=2, timeout=120):
+                # All callers use the positive default retry count.
+                stdout = stderr = b""
                 for attempt in range(retries):
                     if attempt > 0:
                         logger.debug(f"Retry {attempt}/{retries-1} for: {description}")
                         time.sleep(delay * attempt)  # Increasing delay
                     
-                    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    stdout, stderr = process.communicate(timeout=30)
+                    process = _run_bounded(cmd, timeout=timeout)
+                    stdout, stderr = process.stdout, process.stderr
                     
                     if process.returncode == 0:
                         return True, stdout.decode('utf-8'), stderr.decode('utf-8')
@@ -2906,7 +3048,7 @@ def get_worker_script_content():
             logger.warning(f"Primary worker script not found at {worker_script_path}, looking for alternatives")
             
             # Look for other Python files in the directory
-            candidate_files = [f for f in os.listdir(script_dir) if f.endswith('.py') and f != os.path.basename(__file__)]
+            candidate_files = [f for f in os.listdir(script_dir) if f.endswith('.py') and f not in (os.path.basename(__file__), 'ndo_preupgrade.py')]
             logger.debug(f"Found {len(candidate_files)} candidate Python files: {candidate_files}")
             
             # Check each file for "Worker script" in the first 10 lines
@@ -4116,8 +4258,18 @@ def _run_worker_locally(node_name, local_ts_path, nd_version, operation, staging
         with open(log_file, "w") as log_stream:
             log_stream.write(f"[Starting local worker at {datetime.now().isoformat()}]\n")
             log_stream.flush()
+            # The worker never uses SSH: do not hand it the rescue-user password.
+            worker_env = os.environ.copy()
+            worker_env.pop("SSHPASS", None)
+            if _NDO_CONTEXT:
+                worker_env["ND_PREUPGRADE_COLLECT_NDO"] = "1"
+            else:
+                # Never let an inherited variable enable NDO collection without --ndo.
+                worker_env.pop("ND_PREUPGRADE_COLLECT_NDO", None)
+            ndo_worker_kwargs = {"env": worker_env}
             process = subprocess.Popen(
                 argv,
+                **ndo_worker_kwargs,
                 cwd=worker_cwd,
                 stdin=subprocess.DEVNULL,
                 stdout=log_stream,
@@ -4247,6 +4399,8 @@ def _collect_local_worker_results(node_name, staging_dir, results_dir):
                 )
                 return None
         os.makedirs(results_dir, exist_ok=True)
+        if _NDO_CONTEXT:
+            _NDO_CONTEXT.collect_local(staging_dir, results_dir, data)
         dest = os.path.join(results_dir, f"{node_name}_results.json")
         with open(dest, 'w') as f:
             json.dump(data, f, indent=2)
@@ -4358,7 +4512,7 @@ def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_u
                 print(f"\n{WARNING} Authentication failed using domain 'DefaultAuth'.")
                 print("  Your ND may be configured with a non-default login domain (e.g. LDAP, TACACS+).")
                 print("  Contact your ND administrator for the configured login domain name.")
-                print("  Tip: Re-run with --domain/--api-username/--api-password flags to skip these prompts next time.")
+                print("  Tip: Re-run with --domain/--api-username and the ND_API_PASSWORD environment variable to skip these prompts next time.")
                 retry_domain = input("  Enter login domain (or press Enter to skip): ").strip()
                 if retry_domain:
                     _u = input(f"  Enter API username for domain '{retry_domain}' [admin]: ").strip()
@@ -4367,6 +4521,9 @@ def _run_api_checks(node_manager, version, password, domain="DefaultAuth", api_u
                     _api_pass = _p if _p else password
                     api_client = NDAPIClient(node_manager.nd_ip, _api_user, _api_pass, domain=retry_domain)
                     auth_success, error_type, error_message = api_client.authenticate()
+
+        if _NDO_CONTEXT:
+            _NDO_CONTEXT.api_client = api_client
 
         if not auth_success:
             logger.error(f"[API] Authentication failed: {error_type} - {error_message}")
@@ -4541,6 +4698,9 @@ def process_all_nodes_local(node_manager, tech_choice, version=None, password=No
     tech_support_paths = {}  # node_name -> remote path on ND node
 
     if tech_choice == "1":
+        if _NDO_CONTEXT:
+            _NDO_CONTEXT.prepare_generation(tech_manager, nodes, version, NDAPIClient,
+                                            api_username, api_password or password, domain)
         print("Generating tech supports for all nodes in parallel.")
         failed_nodes = []
         with ThreadPoolExecutor(max_workers=max_concurrent_nodes) as executor:
@@ -5088,6 +5248,9 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
     
     if tech_choice == "1":
         # Generate new tech supports IN PARALLEL for all nodes
+        if _NDO_CONTEXT:
+            _NDO_CONTEXT.prepare_generation(tech_manager, nodes, version, NDAPIClient,
+                                            api_username, api_password or password, domain)
         print("Generating tech supports for all nodes in parallel.")
         
         # Track successful and failed nodes
@@ -5345,6 +5508,9 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             # Authenticate and get detailed error information
             auth_success, error_type, error_message = api_client.authenticate()
             
+            if _NDO_CONTEXT:
+                _NDO_CONTEXT.api_client = api_client
+
             if not auth_success:
                 logger.error(f"[API] Failed to authenticate API client: {error_type} - {error_message}")
 
@@ -5505,7 +5671,7 @@ def process_all_nodes(node_manager, tech_choice, version=None, password=None, de
             print(f"\n{WARNING} Authentication failed using domain 'DefaultAuth'.")
             print("  Your ND may be configured with a non-default login domain (e.g. LDAP, TACACS+).")
             print("  Contact your ND administrator for the configured login domain name.")
-            print("  Tip: Re-run with --domain/--api-username/--api-password flags to skip these prompts next time.")
+            print("  Tip: Re-run with --domain/--api-username and the ND_API_PASSWORD environment variable to skip these prompts next time.")
             _retry_domain = input("  Enter login domain (or press Enter to skip): ").strip()
             if _retry_domain:
                 effective_domain = _retry_domain
@@ -6713,14 +6879,165 @@ def check_reserved_tenant_names(api_client, version, deployment_mode=None):
         )
 
 
-def generate_report(all_results, version, overall_status, timing_info=None, skipped_nodes_info=None):
+def _aggregate_report_checks(all_results):
+    # Define the specific order of checks
+    check_order = [
+        "techsupport",
+        "version_check",
+        "node_status", 
+        "ping_check",
+        "subnet_check",
+        "persistent_ip_check",
+        "disk_space",
+        "storage_device_check",  # Storage check - cluster-level (after disk_space)
+        "pod_status", 
+        "system_health",
+        "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
+        "nxapi_cert_verify_state_check",  # API check - cluster-level (after telemetry)
+        "nxos_discovery_service",
+        "backup_failure_check",
+        "nameserver_duplicate_check",
+        "legacy_ndi_elasticsearch_check",
+        "ntp_auth_check",
+        "certificate_check",
+        "iso_check",
+        "lvm_pvs_check",
+        "atom0_nvme_check",
+        "atom0_vg_check",
+        "vnd_app_large_check"
+    ]
+    
+    # Organize by check type instead of by node
+    all_checks = {}
+    for node_name, node_results in all_results.items():
+        # Skip special _api_checks, _storage_checks, and _debug_info entries in main processing
+        if node_name.startswith("_"):
+            continue
+            
+        for check_name, check_result in node_results["checks"].items():
+            if check_name not in all_checks:
+                all_checks[check_name] = {
+                    "status": "PASS",
+                    "nodes": {},
+                    "explanation": None,
+                    "recommendation": None,
+                    "reference": None
+                }
+            
+            # Update overall check status
+            if check_result["status"] == "FAIL":
+                all_checks[check_name]["status"] = "FAIL"
+            elif check_result["status"] == "WARNING" and all_checks[check_name]["status"] != "FAIL":
+                all_checks[check_name]["status"] = "WARNING"
+                
+            # Store node's result for this check
+            all_checks[check_name]["nodes"][node_name] = check_result
+            
+            # Extract explanation, recommendation, and reference if present in details
+            if "details" in check_result and check_result["details"]:
+                for detail in check_result["details"]:
+                    if detail.strip().startswith("\n  Explanation:"):
+                        all_checks[check_name]["explanation"] = detail
+                    elif detail.strip().startswith("\n  Recommendation:"):
+                        all_checks[check_name]["recommendation"] = detail
+                    elif detail.strip().startswith("\n  Reference:"):
+                        all_checks[check_name]["reference"] = detail
+            
+            # ALSO check for explanation and recommendation at the top level
+            # This handles our modified checks that store these at the top level
+            # Only update explanation/recommendation if this node's status is FAIL, or if no explanation exists yet
+            should_update_explanation = (
+                check_result["status"] == "FAIL" or 
+                all_checks[check_name]["explanation"] is None
+            )
+            
+            if "explanation" in check_result and check_result["explanation"] and should_update_explanation:
+                explanation_text = f"\n  Explanation:\n  {check_result['explanation']}"
+                all_checks[check_name]["explanation"] = explanation_text
+                
+            if "recommendation" in check_result and check_result["recommendation"] and should_update_explanation:
+                recommendation_text = f"\n  Recommendation:\n  {check_result['recommendation']}"
+                all_checks[check_name]["recommendation"] = recommendation_text
+                
+            if "reference" in check_result and check_result["reference"] and should_update_explanation:
+                reference_text = f"\n  Reference:\n  {check_result['reference']}"
+                all_checks[check_name]["reference"] = reference_text
+    
+    # Handle API checks separately (cluster-level, not node-specific)
+    if "_api_checks" in all_results:
+        api_results = all_results["_api_checks"]
+        for check_name, check_result in api_results["checks"].items():
+            if check_name not in all_checks:
+                all_checks[check_name] = {
+                    "status": check_result["status"],
+                    "nodes": {},  # Empty for API checks
+                    "explanation": None,
+                    "recommendation": None,
+                    "reference": None
+                }
+            
+            # Store as cluster-level check (no specific node)
+            all_checks[check_name]["nodes"]["API Check"] = check_result
+            
+            # Extract top-level explanation, recommendation, and reference
+            if check_result.get("explanation"):
+                all_checks[check_name]["explanation"] = f"\n  Explanation:\n  {check_result['explanation']}"
+            if check_result.get("recommendation"):
+                all_checks[check_name]["recommendation"] = f"\n  Recommendation:\n  {check_result['recommendation']}"
+            if check_result.get("reference"):
+                all_checks[check_name]["reference"] = f"\n  Reference:\n  {check_result['reference']}"
+    
+    # Handle Storage Device checks separately (cluster-level, similar to API checks)
+    if "_storage_checks" in all_results:
+        storage_results = all_results["_storage_checks"]
+        for check_name, check_result in storage_results["checks"].items():
+            if check_name not in all_checks:
+                all_checks[check_name] = {
+                    "status": check_result["status"],
+                    "nodes": {},  # Empty for storage checks
+                    "explanation": None,
+                    "recommendation": None,
+                    "reference": None
+                }
+            
+            # Store as cluster-level check (no specific node)
+            all_checks[check_name]["nodes"]["Storage Check"] = check_result
+            
+            # Extract top-level explanation, recommendation, and reference
+            if check_result.get("explanation"):
+                all_checks[check_name]["explanation"] = f"\n  Explanation:\n  {check_result['explanation']}"
+            if check_result.get("recommendation"):
+                all_checks[check_name]["recommendation"] = f"\n  Recommendation:\n  {check_result['recommendation']}"
+            if check_result.get("reference"):
+                all_checks[check_name]["reference"] = f"\n  Reference:\n  {check_result['reference']}"
+    
+    # Order the checks according to our defined sequence
+    ordered_checks = []
+    
+    # First add checks in our defined order
+    for check in check_order:
+        if check in all_checks:
+            ordered_checks.append(check)
+    
+    # Then add any checks not in our predefined list (if any)
+    for check in all_checks:
+        if check not in ordered_checks:
+            ordered_checks.append(check)
+    
+    return all_checks, ordered_checks
+
+
+def generate_report(all_results, version, overall_status, timing_info=None, skipped_nodes_info=None, ndo=None, results_dir=None):
     """Generate a final report based on aggregated results with clear check-by-check output"""
-    print_section("Pre-upgrade Validation Report")
+    if _NDO_CONTEXT and ndo is None:
+        _NDO_CONTEXT.report_args = (all_results, version, overall_status, timing_info, skipped_nodes_info)
+        return
+    print_section("NDO PRE-UPGRADE VALIDATION REPORT (offline)" if ndo is not None and ndo.get("mode") == "offline" else "NEXUS DASHBOARD + NDO PRE-UPGRADE VALIDATION REPORT" if ndo is not None else "Pre-upgrade Validation Report")
     
     # Use MultipleFileManager to handle all file resources
     with MultipleFileManager() as file_manager:
         # Create output directory
-        results_dir = os.path.join(os.getcwd(), "final-results")
+        results_dir = results_dir or os.path.join(os.getcwd(), "final-results")
         os.makedirs(results_dir, exist_ok=True)
         
         # Open the summary report file
@@ -6730,7 +7047,7 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         details_file = file_manager.open(os.path.join(results_dir, "validation_details.json"), 'w')
         
         # Write header to summary file
-        summary_file.write("NEXUS DASHBOARD PRE-UPGRADE VALIDATION REPORT\n")
+        summary_file.write(("NDO PRE-UPGRADE VALIDATION REPORT (offline)" if ndo is not None and ndo.get("mode") == "offline" else "NEXUS DASHBOARD + NDO PRE-UPGRADE VALIDATION REPORT" if ndo is not None else "NEXUS DASHBOARD PRE-UPGRADE VALIDATION REPORT") + "\n")
         summary_file.write("="*50 + "\n\n")
         
         # Display timing information if available
@@ -6761,10 +7078,15 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             print(version_info, end="")
             summary_file.write(version_info)
             
-        timestamp = f"Report generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        timestamp = ("Report generated on: " + datetime.now(_NDO_ADDON._ndo_ndo_integration__timezone.utc).strftime('%Y-%m-%d %H:%M UTC') + "\n\n") if ndo is not None else f"Report generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         print(timestamp, end="")
         summary_file.write(timestamp)
         
+        if ndo is not None:
+            for line in _NDO_ADDON._ndo_unified__header(ndo):
+                print(line)
+                summary_file.write(line + "\n")
+
         # Add skipped nodes section if there were any
         if skipped_nodes_info and skipped_nodes_info.get('disk_space_issues'):
             disk_space_issues = skipped_nodes_info['disk_space_issues']
@@ -6857,160 +7179,39 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         FAIL_TXT = "FAIL"
         WARNING_TXT = "WARNING"
         
-        # Define the specific order of checks
-        check_order = [
-            "techsupport",
-            "version_check",
-            "node_status", 
-            "ping_check",
-            "subnet_check",
-            "persistent_ip_check",
-            "disk_space",
-            "storage_device_check",  # Storage check - cluster-level (after disk_space)
-            "pod_status", 
-            "system_health",
-            "telemetry_inband_epg_check",  # API check - cluster-level (after system_health)
-            "nxapi_cert_verify_state_check",  # API check - cluster-level (after telemetry)
-            "nxos_discovery_service",
-            "backup_failure_check",
-            "nameserver_duplicate_check",
-            "legacy_ndi_elasticsearch_check",
-            "ntp_auth_check",
-            "certificate_check",
-            "iso_check",
-            "lvm_pvs_check",
-            "atom0_nvme_check",
-            "atom0_vg_check",
-            "vnd_app_large_check"
-        ]
-        
-        # Organize by check type instead of by node
-        all_checks = {}
-        for node_name, node_results in all_results.items():
-            # Skip special _api_checks, _storage_checks, and _debug_info entries in main processing
-            if node_name.startswith("_"):
-                continue
-                
-            for check_name, check_result in node_results["checks"].items():
-                if check_name not in all_checks:
-                    all_checks[check_name] = {
-                        "status": "PASS",
-                        "nodes": {},
-                        "explanation": None,
-                        "recommendation": None,
-                        "reference": None
-                    }
-                
-                # Update overall check status
-                if check_result["status"] == "FAIL":
-                    all_checks[check_name]["status"] = "FAIL"
-                elif check_result["status"] == "WARNING" and all_checks[check_name]["status"] != "FAIL":
-                    all_checks[check_name]["status"] = "WARNING"
-                    
-                # Store node's result for this check
-                all_checks[check_name]["nodes"][node_name] = check_result
-                
-                # Extract explanation, recommendation, and reference if present in details
-                if "details" in check_result and check_result["details"]:
-                    for detail in check_result["details"]:
-                        if detail.strip().startswith("\n  Explanation:"):
-                            all_checks[check_name]["explanation"] = detail
-                        elif detail.strip().startswith("\n  Recommendation:"):
-                            all_checks[check_name]["recommendation"] = detail
-                        elif detail.strip().startswith("\n  Reference:"):
-                            all_checks[check_name]["reference"] = detail
-                
-                # ALSO check for explanation and recommendation at the top level
-                # This handles our modified checks that store these at the top level
-                # Only update explanation/recommendation if this node's status is FAIL, or if no explanation exists yet
-                should_update_explanation = (
-                    check_result["status"] == "FAIL" or 
-                    all_checks[check_name]["explanation"] is None
-                )
-                
-                if "explanation" in check_result and check_result["explanation"] and should_update_explanation:
-                    explanation_text = f"\n  Explanation:\n  {check_result['explanation']}"
-                    all_checks[check_name]["explanation"] = explanation_text
-                    
-                if "recommendation" in check_result and check_result["recommendation"] and should_update_explanation:
-                    recommendation_text = f"\n  Recommendation:\n  {check_result['recommendation']}"
-                    all_checks[check_name]["recommendation"] = recommendation_text
-                    
-                if "reference" in check_result and check_result["reference"] and should_update_explanation:
-                    reference_text = f"\n  Reference:\n  {check_result['reference']}"
-                    all_checks[check_name]["reference"] = reference_text
-        
-        # Handle API checks separately (cluster-level, not node-specific)
-        if "_api_checks" in all_results:
-            api_results = all_results["_api_checks"]
-            for check_name, check_result in api_results["checks"].items():
-                if check_name not in all_checks:
-                    all_checks[check_name] = {
-                        "status": check_result["status"],
-                        "nodes": {},  # Empty for API checks
-                        "explanation": None,
-                        "recommendation": None,
-                        "reference": None
-                    }
-                
-                # Store as cluster-level check (no specific node)
-                all_checks[check_name]["nodes"]["API Check"] = check_result
-                
-                # Extract top-level explanation, recommendation, and reference
-                if check_result.get("explanation"):
-                    all_checks[check_name]["explanation"] = f"\n  Explanation:\n  {check_result['explanation']}"
-                if check_result.get("recommendation"):
-                    all_checks[check_name]["recommendation"] = f"\n  Recommendation:\n  {check_result['recommendation']}"
-                if check_result.get("reference"):
-                    all_checks[check_name]["reference"] = f"\n  Reference:\n  {check_result['reference']}"
-        
-        # Handle Storage Device checks separately (cluster-level, similar to API checks)
-        if "_storage_checks" in all_results:
-            storage_results = all_results["_storage_checks"]
-            for check_name, check_result in storage_results["checks"].items():
-                if check_name not in all_checks:
-                    all_checks[check_name] = {
-                        "status": check_result["status"],
-                        "nodes": {},  # Empty for storage checks
-                        "explanation": None,
-                        "recommendation": None,
-                        "reference": None
-                    }
-                
-                # Store as cluster-level check (no specific node)
-                all_checks[check_name]["nodes"]["Storage Check"] = check_result
-                
-                # Extract top-level explanation, recommendation, and reference
-                if check_result.get("explanation"):
-                    all_checks[check_name]["explanation"] = f"\n  Explanation:\n  {check_result['explanation']}"
-                if check_result.get("recommendation"):
-                    all_checks[check_name]["recommendation"] = f"\n  Recommendation:\n  {check_result['recommendation']}"
-                if check_result.get("reference"):
-                    all_checks[check_name]["reference"] = f"\n  Reference:\n  {check_result['reference']}"
-        
-        # Order the checks according to our defined sequence
-        ordered_checks = []
-        
-        # First add checks in our defined order
-        for check in check_order:
-            if check in all_checks:
-                ordered_checks.append(check)
-        
-        # Then add any checks not in our predefined list (if any)
-        for check in all_checks:
-            if check not in ordered_checks:
-                ordered_checks.append(check)
-        
+        all_checks, ordered_checks = _aggregate_report_checks(all_results)
+        ndo_rows = {}
+        if ndo is not None:
+            ndo_rows = _NDO_ADDON._ndo_unified__rows(ndo)
+            for key, row in ndo_rows.items():
+                all_checks[key] = row
+                ordered_checks.append(key)
+
         # Write the detailed JSON data
-        json.dump(all_checks, details_file)
+        if ndo is None:
+            json.dump(all_checks, details_file)
+        else:
+            payload = {key: value for key, value in all_checks.items() if key not in ndo_rows}
+            ndo = dict(ndo)
+            ndo['upgrade_route'] = _NDO_ADDON._ndo_unified__route(ndo)
+            ndo['findings'] = [finding for row in ndo_rows.values() for finding in row.get('findings', [])]
+            ndo['summary'] = {status.lower(): sum(row['status'] == status for row in all_checks.values()) for status in ('PASS', 'WARNING', 'FAIL')}
+            ndo["checks"] = [dict(all_checks[key], number=ordered_checks.index(key) + 1) for key in ndo_rows]
+            ndo["status"] = 'FAIL' if any(row['status'] == 'FAIL' for row in ndo_rows.values()) else 'WARNING' if any(row['status'] == 'WARNING' for row in ndo_rows.values()) else 'PASS'
+            ndo["coverage"] = "incomplete" if any(row.get("coverage") == "incomplete" for row in ndo_rows.values()) else "complete"
+            payload["ndo"] = _NDO_ADDON._ndo_unified__normalize(ndo)
+            json.dump(payload, details_file)
+            with file_manager.open(os.path.join(results_dir, "ndo-findings.txt"), "w") as findings_file:
+                findings_file.write("\n".join(_NDO_ADDON._ndo_unified__finding_lines(ndo_rows, limit=None)) + "\n")
         
         # Display each check result
+        ndo_block_ended_blank = False
         for i, check_name in enumerate(ordered_checks, 1):
             check_info = all_checks[check_name]
             check_status = check_info["status"]
             
             # Format check name for display
-            display_name = check_name.replace("_", " ").title()
+            display_name = check_info.get("name", check_name.replace("_", " ").title())
             
             # Determine the status indicator for console
             if check_status == "FAIL":
@@ -7023,6 +7224,10 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                 status_indicator = PASS
                 status_indicator_txt = PASS_TXT
             
+            if check_info.get("coverage") == "incomplete" and check_status != "FAIL":
+                status_indicator = f"{WARNING} - COULD NOT FULLY EVALUATE"
+                status_indicator_txt = "WARNING - COULD NOT FULLY EVALUATE"
+
             # Display check header with right-aligned status for console
             console_line = f"[Check {i:2d}/{len(ordered_checks):2d}] {display_name}..."
             right_padding = 80 - len(display_name) - 15
@@ -7034,6 +7239,17 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
             summary_line += f"{' ' * right_padding}{status_indicator_txt}\n"
             summary_file.write(summary_line)
             
+            ndo_block_ended_blank = False
+            if ndo is not None and check_name in ndo_rows:
+                ndo_lines = _NDO_ADDON._ndo_unified__row_lines(check_info, limit=5)
+                for line in ndo_lines:
+                    print(line)
+                    summary_file.write(line + "\n")
+                if ndo_lines and not (check_status != "PASS" and check_info["nodes"]):
+                    print("")
+                    summary_file.write("\n")
+                    ndo_block_ended_blank = True
+
             # Only show details if check is not PASS
             if check_status != "PASS" and check_info["nodes"]:
                 node_indent = "  "  # 2 spaces indent for Node column
@@ -7129,16 +7345,21 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
                 
                 print("")  # Add blank line after details
                 summary_file.write("\n")  # Add blank line to summary
+                ndo_block_ended_blank = True
         
         # Generate summary section
-        print("")  # First blank line after last check
-        print("")  # Second blank line after last check
+        if ndo is None:
+            print("")  # First blank line after last check
+            print("")  # Preserve default-mode spacing
+        elif not ndo_block_ended_blank:
+            print("")
         print("="*80)
         print("REPORT SUMMARY")
         print("="*80)
         print("")
         
-        summary_file.write("\n")  # Extra blank line in summary file
+        if ndo is None or not ndo_block_ended_blank:
+            summary_file.write("\n")  # Extra blank line in summary file
         summary_file.write("="*80 + "\n")
         summary_file.write("REPORT SUMMARY\n")
         summary_file.write("="*80 + "\n")
@@ -7159,10 +7380,18 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         summary_file.write(f"WARNING - ATTENTION REQUIRED : {warning_count}\n")
         summary_file.write(f"FAIL - UPGRADE FAILURE!!{' '*5}: {fail_count}\n")
         
+        if ndo is not None:
+            for line in _NDO_ADDON._ndo_unified__footer(all_checks, ordered_checks, ndo):
+                print(line)
+                summary_file.write(line + "\n")
+
         # Final success message about where results are stored
         print(f"\nDetailed results are available in {results_dir}/\n")
         summary_file.write(f"\nDetailed results are available in {results_dir}/\n")
     
+    if _NDO_CONTEXT or ndo is not None:
+        return  # Bundle after combined reports exist in NDO mode.
+
     # Create .tgz bundle (debug log is already in final-results/ via logging handler)
     import tarfile
     
@@ -7190,8 +7419,79 @@ def generate_report(all_results, version, overall_status, timing_info=None, skip
         logger.exception("Detailed traceback for bundle creation failure:")
         print(f"Warning: Could not create results bundle: {str(e)}\n")
 
+def _positive_int(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _controller_parser():
+    parser = argparse.ArgumentParser(description="Nexus Dashboard Pre-upgrade Validation Script")
+    parser.add_argument("--ndip", help="IP address or hostname of the Nexus Dashboard")
+    parser.add_argument("-p", "--password", help="Password for rescue-user (deprecated: visible to other local users; prefer the prompt or the ND_RESCUE_PASSWORD environment variable)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging to console and preserve temp files")
+    parser.add_argument("--domain", default=None, help="Login domain for ND API authentication (default: DefaultAuth). Use if your ND is configured with a non-default login domain (e.g. LDAP, TACACS+).")
+    parser.add_argument("--api-username", default=None, dest="api_username", help="Username for ND API authentication (default: admin). Use with --domain when the API account differs from 'admin'.")
+    parser.add_argument("--api-password", default=None, dest="api_password", help="Password for ND API authentication (deprecated: visible to other local users; prefer the prompt or the ND_API_PASSWORD environment variable). Defaults to the rescue-user password if not specified.")
+    parser.add_argument("-b", "--bash", action="store_true", help="Run in GitBash/Windows mode (no sshpass)")
+    parser.add_argument("--diagnose", action="store_true", help="Run diagnostic tests only (check Python interpreters and worker script execution)")
+
+    if "--ndo" in sys.argv[1:]:
+        parser.add_argument("--ndo", action="store_true", help="Enable combined ND/NDO validation")
+        parser.add_argument("--ndo-max-backup-bytes", type=_positive_int, default=10 * 1024**3, help="Largest NDO backup accepted, in bytes (default: 10 GiB)")
+        parser.add_argument("--ndo-bundle-backup-max-bytes", type=_positive_int, default=1024**3, help="Largest NDO backup copied into the results bundle, in bytes (default: 1 GiB)")
+        parser.add_argument("--ndo-all-defect-checks", action="store_true", help="Diagnostic: evaluate every NDO configuration check regardless of the detected release")
+        modes = parser.add_mutually_exclusive_group()
+        modes.add_argument("--tech-support", "--techsupport", dest="tech_support",
+                            help="Validate a local NDO backup or techsupport without connecting to ND")
+        parser.add_argument("--source-release", help="Offline source release override, e.g. NDO 4.4.3")
+        modes.add_argument("--extract-backup", metavar="PATH", help="Extract a backup from techsupport")
+        modes.add_argument("--convert-backup", metavar="PATH", help="Convert a legacy MSO/NDO backup")
+        modes.add_argument("--mongodump-to-json", metavar="ARCHIVE", help="Export a native mongodump archive to JSON")
+        modes.add_argument("--check-backup", "--backup", metavar="PATH", help="Run the standalone NDO validation suite")
+        modes.add_argument("--check-defects", metavar="PATH", help="Run standalone NDO configuration defect checks")
+        parser.add_argument("--output-dir", help="Output directory for extraction, conversion or standalone checks")
+        parser.add_argument("--name", help="Display name for a converted backup")
+        parser.add_argument("--validation-only", action="store_true", help="Convert only to validation JSON")
+        parser.add_argument("--run-ndo-checks", action="store_true", help="Run NDO checks after conversion")
+        parser.add_argument("--max-input-bytes", type=_positive_int, help="--convert-backup: largest input accepted, in bytes")
+        parser.add_argument("--max-expanded-bytes", type=_positive_int, help="--convert-backup: largest expanded data accepted, in bytes")
+        parser.add_argument("--max-uncompressed-bytes", type=_positive_int, help="--check-backup/--check-defects: largest uncompressed backup accepted, in bytes")
+        parser.add_argument("--json-mode", choices=("relaxed", "canonical"), help="--mongodump-to-json: MongoDB Extended JSON style (default: relaxed)")
+        parser.add_argument("output_tar", nargs="?", help="Explicit mongodump JSON tar output path (original positional option)")
+
+
+    return parser
+
+
 def main():
     """Main function for the ND validation script"""
+
+    # Reject offline-only options before legacy environment probes as well.
+    if "--ndo" not in sys.argv[1:] and any(
+            token.split("=", 1)[0] in ("--tech-support", "--techsupport", "--source-release")
+            for token in sys.argv[1:]):
+        _controller_parser().parse_args()
+
+    # Offline dispatch precedes logging, environment probes, credentials and SSH.
+    if "--ndo" in sys.argv[1:]:
+        parser = _controller_parser()
+        args = parser.parse_args()
+        if sys.version_info < (3, 8):
+            print("--ndo requires Python 3.8 or newer", file=sys.stderr)
+            return 1
+        try:
+            addon = _load_ndo_addon()
+        except (ImportError, OSError, RuntimeError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        dispatched = addon._ndo_dispatch(parser, args)
+        if dispatched is not None:
+            return dispatched
 
     # Set up logging first
     global logger
@@ -7234,17 +7534,19 @@ def main():
         return 1
 
     # Continue with main function execution
-    parser = argparse.ArgumentParser(description="Nexus Dashboard Pre-upgrade Validation Script")
-    parser.add_argument("--ndip", help="IP address or hostname of the Nexus Dashboard")
-    parser.add_argument("-p", "--password", help="Password for rescue-user")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging to console and preserve temp files")
-    parser.add_argument("--domain", default=None, help="Login domain for ND API authentication (default: DefaultAuth). Use if your ND is configured with a non-default login domain (e.g. LDAP, TACACS+).")
-    parser.add_argument("--api-username", default=None, dest="api_username", help="Username for ND API authentication (default: admin). Use with --domain when the API account differs from 'admin'.")
-    parser.add_argument("--api-password", default=None, dest="api_password", help="Password for ND API authentication. Defaults to the rescue-user password if not specified.")
-    parser.add_argument("-b", "--bash", action="store_true", help="Run in GitBash/Windows mode (no sshpass)")
-    parser.add_argument("--diagnose", action="store_true", help="Run diagnostic tests only (check Python interpreters and worker script execution)")
-
+    parser = _controller_parser()
     args = parser.parse_args()
+    global _NDO_CONTEXT
+    _NDO_CONTEXT = None
+    if "--ndo" in sys.argv[1:]:
+        try:
+            if sys.version_info < (3, 8):
+                raise RuntimeError("--ndo requires Python 3.8 or newer")
+            IntegrationContext = _NDO_ADDON._ndo_ndo_integration__IntegrationContext
+            _NDO_CONTEXT = IntegrationContext(args)
+        except (ImportError, RuntimeError) as error:
+            print("NDO initialization failed: {}".format(error))
+            return 1
 
     print("Nexus Dashboard Pre-upgrade Validation Script")
     print(f"Running validation checks on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -7265,8 +7567,18 @@ def main():
             print("Please enter a valid IPv4/IPv6 address or hostname (e.g., 192.168.1.1, 2001:db8::1, or nd.example.com)")
             return 1
 
-    # Get password
+    # Get password. Command-line passwords are visible to every local user
+    # (process list) and land in shell history, so they still work but warn.
+    _argv_password_warning = ("WARNING: {} on the command line is deprecated: other local users "
+                              "can read it from the process list, and it is saved in shell history. "
+                              "Use the prompt or the {} environment variable instead.")
+    env_rescue_password = os.environ.pop("ND_RESCUE_PASSWORD", None)
+    env_api_password = os.environ.pop("ND_API_PASSWORD", None)
     password = args.password
+    if password:
+        print(_argv_password_warning.format("-p/--password", "ND_RESCUE_PASSWORD"), file=sys.stderr)
+    elif env_rescue_password:
+        password = env_rescue_password
     if not password:
         password = getpass.getpass("Enter password for rescue-user: ")
 
@@ -7274,11 +7586,15 @@ def main():
     # The API account (e.g. an LDAP/TACACS+ user) may differ from rescue-user.
     api_username = args.api_username or "admin"
     api_password = args.api_password or None
+    if api_password:
+        print(_argv_password_warning.format("--api-password", "ND_API_PASSWORD"), file=sys.stderr)
+    elif env_api_password:
+        api_password = env_api_password
     if args.domain and args.domain != "DefaultAuth":
         if not args.api_username:
             _u = input(f"Enter API username for domain '{args.domain}' [admin]: ").strip()
             api_username = _u if _u else "admin"
-        if not args.api_password:
+        if not api_password:
             _p = getpass.getpass(f"Enter API password for '{api_username}@{args.domain}' (press Enter to use rescue-user password): ")
             api_password = _p if _p else None
 
@@ -7308,8 +7624,8 @@ def main():
 
             # Use node_manager's SSH command builder which includes legacy mode if needed
             cmd = node_manager.build_ssh_command(nd_ip, "acs version") + " 2>/dev/null"
-            process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            stdout, stderr = process.communicate()
+            process = _run_bounded(cmd)
+            stdout, stderr = process.stdout, process.stderr
 
             if process.returncode == 0:
                 output = stdout.decode('utf-8')
@@ -7580,7 +7896,7 @@ def main():
         if nodes_with_space_issues:
             print(f"\n{FAIL} Disk Space Issues Detected")
             print("="*80)
-            print("The following nodes have directories with usage >= 80%:\n")
+            print("The following nodes have directories at or above the usage threshold (80%; /logs/k8/kubelet 90% on ND 4.3+):\n")
 
             for issue in nodes_with_space_issues:
                 node = issue['node']
@@ -7662,7 +7978,7 @@ def main():
                 else:
                     print("Please enter 'y' for yes or 'n' for no.")
         else:
-            print(f"\n{PASS} All {len(nodes)} nodes are active and have healthy disk space (<80% usage).")
+            print(f"\n{PASS} All {len(nodes)} nodes are active and have healthy disk space (below the 80% usage threshold; /logs/k8/kubelet 90% on ND 4.3+).")
             print(f"{PASS} All nodes are ready for validation.")
             active_nodes = nodes
 
@@ -7715,6 +8031,14 @@ def main():
                 warning_message += f"\nTemporary files remain in {debug_info['base_dir']} on each node for debugging purposes."
                 print(warning_message)
 
+        if _NDO_CONTEXT:
+            if not results:
+                return 1
+            return _NDO_CONTEXT.finalize(
+                node_manager, version, results, NDAPIClient,
+                api_username or "admin", api_password or password,
+                args.domain or "DefaultAuth"
+            )
         return 0 if results else 1
 
     except Exception as e:
@@ -7775,8 +8099,8 @@ def run_diagnostic_mode(node_manager, nodes):
                 import shlex
                 cmd = node_manager.build_ssh_command(node['ip'], "cd /tmp/ndpreupgradecheck && python3 -c 'print(\\\"Python test successful\\\")' 2>&1 || python -c 'print(\\\"Python test successful\\\")' 2>&1 || python2 -c 'print(\\\"Python test successful\\\")' 2>&1")
                 
-                process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
+                process = _run_bounded(cmd)
+                stdout, stderr = process.stdout, process.stderr
                 output = stdout.decode('utf-8') + stderr.decode('utf-8')
                 
                 if "Python test successful" in output:
@@ -7790,8 +8114,8 @@ def run_diagnostic_mode(node_manager, nodes):
                 print(f"  Testing worker script syntax...")
                 syntax_cmd = node_manager.build_ssh_command(node['ip'], "cd /tmp/ndpreupgradecheck && python3 -m py_compile nd_worker.py 2>&1 || python -m py_compile nd_worker.py 2>&1 || python2 -m py_compile nd_worker.py 2>&1")
                 
-                process = subprocess.Popen(syntax_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stdout, stderr = process.communicate()
+                process = _run_bounded(syntax_cmd)
+                stdout, stderr = process.stdout, process.stderr
                 syntax_output = stdout.decode('utf-8') + stderr.decode('utf-8')
                 
                 if not syntax_output.strip() or "Compiled successfully" in syntax_output:
